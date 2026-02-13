@@ -5,6 +5,7 @@ import fitz  # pymupdf
 from openai import OpenAI
 from dotenv import load_dotenv
 from types import SimpleNamespace
+from datetime import datetime
 
 # Add PageIndex to path to allow imports
 base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -98,6 +99,107 @@ def format_toc(nodes, indent=0):
             toc_text += format_toc(node['nodes'], indent + 1)
     return toc_text
 
+def ensure_node_ids(structure):
+    try:
+        from pageindex import utils as pi_utils
+    except Exception:
+        return structure
+    found = False
+    def walk(node):
+        nonlocal found
+        if isinstance(node, dict):
+            if node.get('node_id') is not None:
+                found = True
+                return
+            for child in node.get('nodes', []):
+                walk(child)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+    walk(structure)
+    if not found:
+        pi_utils.write_node_id(structure)
+    return structure
+
+def simplify_tree(structure):
+    if isinstance(structure, dict):
+        simplified = {}
+        if 'title' in structure:
+            simplified['title'] = structure['title']
+        if 'node_id' in structure:
+            simplified['node_id'] = structure['node_id']
+        if 'summary' in structure:
+            simplified['summary'] = structure['summary']
+        if structure.get('nodes'):
+            simplified['nodes'] = simplify_tree(structure['nodes'])
+        return simplified
+    if isinstance(structure, list):
+        return [simplify_tree(item) for item in structure]
+    return structure
+
+def build_node_index(structure):
+    node_map = {}
+    def walk(node):
+        if isinstance(node, dict):
+            node_id = node.get('node_id')
+            if node_id is not None:
+                node_map[str(node_id)] = node
+            for child in node.get('nodes', []):
+                walk(child)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+    walk(structure)
+    return node_map
+
+def get_relevant_nodes(question, tree_for_reasoning):
+    if not client:
+        print("OpenAI client not initialized.")
+        return []
+    try:
+        from pageindex import utils as pi_utils
+    except Exception:
+        pi_utils = None
+    prompt = f"""
+        You are given a question and a tree structure of a document.
+        Each node contains a node id, node title, and a corresponding summary.
+        Your task is to find all nodes that are likely to contain the answer to the question.
+
+        Question: {question}
+
+        Document tree structure:
+        {json.dumps(tree_for_reasoning, indent=2, ensure_ascii=False)}
+
+        Please reply in the following JSON format:
+        {{
+            "thinking": "<Your thinking process on which nodes are relevant to the question>",
+            "node_list": ["node_id_1", "node_id_2", "..."]
+        }}
+        Directly return the final JSON structure. Do not output anything else.
+        """
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0
+        )
+        content = response.choices[0].message.content
+        if not content:
+            return []
+        if pi_utils:
+            result = pi_utils.extract_json(content)
+        else:
+            result = json.loads(content)
+        if isinstance(result, dict) and isinstance(result.get('node_list'), list):
+            return [str(n) for n in result['node_list'] if n is not None]
+        return []
+    except Exception as e:
+        print(f"Error getting relevant nodes: {e}")
+        return []
+
 def get_relevant_pages(question, toc_text):
     if not client:
         print("OpenAI client not initialized.")
@@ -172,6 +274,20 @@ def extract_text_from_pdf(pdf_path, pages):
         print(f"Error reading PDF: {e}")
         return ""
 
+def ensure_logs_dir(base_dir):
+    logs_dir = os.path.join(base_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    return logs_dir
+
+def write_qa_log(logs_dir, record):
+    try:
+        date_tag = datetime.now().strftime("%Y%m%d")
+        log_path = os.path.join(logs_dir, f"qa_{date_tag}.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"Failed to write log: {e}")
+
 def generate_answer(question, context):
     if not client:
         return "Error: OpenAI client not initialized."
@@ -231,6 +347,7 @@ def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     pdf_dir = os.path.join(base_dir, "PageIndex", "tests", "pdfs")
     results_dir = os.path.join(base_dir, "PageIndex", "tests", "results")
+    logs_dir = ensure_logs_dir(base_dir)
     
     # Ensure directories exist
     os.makedirs(results_dir, exist_ok=True)
@@ -266,7 +383,14 @@ def main():
         print(f"Error loading structure JSON: {e}")
         return
 
-    toc_text = format_toc(data.get('structure', []))
+    structure = data.get('structure', [])
+    if not structure:
+        print("Structure is empty.")
+        return
+    ensure_node_ids(structure)
+    toc_text = format_toc(structure)
+    tree_for_reasoning = simplify_tree(structure)
+    node_map = build_node_index(structure)
     
     print("\n" + "="*50)
     print("Welcome to PageIndex Q&A (Powered by Qwen-Plus)")
@@ -286,19 +410,93 @@ def main():
         if not question:
             continue
 
-        print("\nThinking (Retrieving relevant pages)...")
-        pages = get_relevant_pages(question, toc_text)
-        print(f"Identified relevant pages: {pages}")
-        
-        if not pages:
-            print("Could not find relevant pages based on TOC.")
-            continue
-            
-        print("Reading content...")
-        context = extract_text_from_pdf(pdf_path, pages)
+        print("\nThinking (Reasoning over tree)...")
+        mode = "tree"
+        node_ids = []
+        pages = []
+        selected_nodes = []
+        node_ids = get_relevant_nodes(question, tree_for_reasoning)
+        if not node_ids:
+            print("Node reasoning failed. Falling back to TOC pages.")
+            mode = "toc_fallback"
+            pages = get_relevant_pages(question, toc_text)
+            if not pages:
+                print("Could not find relevant pages based on TOC.")
+                write_qa_log(logs_dir, {
+                    "timestamp": datetime.now().isoformat(),
+                    "document": selected_pdf_name,
+                    "question": question,
+                    "mode": mode,
+                    "node_ids": [],
+                    "pages": [],
+                    "answer": "",
+                    "status": "no_pages"
+                })
+                continue
+            print(f"Identified relevant pages: {pages}")
+            print("Reading content...")
+            context = extract_text_from_pdf(pdf_path, pages)
+        else:
+            selected_nodes = [node_map.get(nid) for nid in node_ids if node_map.get(nid)]
+            if not selected_nodes:
+                print("No valid nodes found. Falling back to TOC pages.")
+                mode = "toc_fallback"
+                pages = get_relevant_pages(question, toc_text)
+                if not pages:
+                    print("Could not find relevant pages based on TOC.")
+                    write_qa_log(logs_dir, {
+                        "timestamp": datetime.now().isoformat(),
+                        "document": selected_pdf_name,
+                        "question": question,
+                        "mode": mode,
+                        "node_ids": node_ids,
+                        "pages": [],
+                        "answer": "",
+                        "status": "no_pages"
+                    })
+                    continue
+                print(f"Identified relevant pages: {pages}")
+                print("Reading content...")
+                context = extract_text_from_pdf(pdf_path, pages)
+            else:
+                print("Identified relevant nodes:")
+                for node in selected_nodes:
+                    print(f"- {node.get('title', 'Untitled')} (Pages: {node.get('start_index', '?')}-{node.get('end_index', '?')})")
+                seen_pages = set()
+                pages = []
+                for node in selected_nodes:
+                    start_page = node.get('start_index')
+                    end_page = node.get('end_index')
+                    if start_page is None or end_page is None:
+                        continue
+                    for page in range(start_page, end_page + 1):
+                        if page not in seen_pages:
+                            seen_pages.add(page)
+                            pages.append(page)
+                print("Reading content...")
+                context = extract_text_from_pdf(pdf_path, pages)
         
         print("Generating answer...")
         answer = generate_answer(question, context)
+        write_qa_log(logs_dir, {
+            "timestamp": datetime.now().isoformat(),
+            "document": selected_pdf_name,
+            "question": question,
+            "mode": mode,
+            "node_ids": node_ids,
+            "nodes": [
+                {
+                    "node_id": node.get("node_id"),
+                    "title": node.get("title"),
+                    "start_index": node.get("start_index"),
+                    "end_index": node.get("end_index")
+                } for node in selected_nodes
+            ],
+            "pages": pages,
+            "context": context,
+            "answer": answer,
+            "status": "ok"
+        })
         
         print("\nAnswer:")
         print(answer)

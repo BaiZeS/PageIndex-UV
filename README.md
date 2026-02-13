@@ -8,9 +8,10 @@
 
 #### 核心步骤：
 1.  **加载 (Loading)**: 使用标准 `json.load()` 读取生成的结构化文件。
-2.  **瘦身 (Pruning)**: 为了适应 LLM 上下文窗口，检索阶段通常只保留节点的 `title`、`summary` 和 `node_id`，暂时移除大段的 `text` 内容。
-3.  **推理 (Reasoning)**: 将用户的 Query 与 瘦身后的树状结构 一同输入 LLM。LLM 不仅仅是匹配关键词，而是理解文档结构和摘要，推断出哪些节点可能包含答案。
-4.  **定位与生成 (Retrieval & Generation)**: 获取 LLM 推荐的 `node_id` 列表，从原始索引中提取对应的完整文本，作为上下文生成最终答案。
+2.  **简化 (Simplify)**: 推理阶段只保留节点的 `title`、`summary`、`node_id` 和层级结构，减少上下文成本。
+3.  **推理 (Reasoning)**: 将用户问题与简化后的树结构输入 LLM，返回相关节点 `node_id` 列表。
+4.  **定位与生成 (Retrieval & Generation)**: 根据命中节点的 `start_index/end_index` 抽取 PDF 页文本作为上下文，再生成答案。
+5.  **兜底 (Fallback)**: 若树推理失败或无命中节点，回退到 TOC 页码推理并抽取页文本。
 
 这种方式比传统的 Chunking + Vector Search 更精准，因为它保留了文档的上下文逻辑结构。
 
@@ -18,13 +19,40 @@
 
 ```python
 import json
-from pageindex import utils
 
-# 1. 加载并瘦身索引 (Pruning)
-# 移除 'text' 字段，仅保留结构和摘要，大幅减少 Token 消耗
-tree_without_text = utils.remove_fields(full_tree.copy(), fields=['text'])
+def simplify_tree(structure):
+    if isinstance(structure, dict):
+        node = {}
+        if 'title' in structure:
+            node['title'] = structure['title']
+        if 'node_id' in structure:
+            node['node_id'] = structure['node_id']
+        if 'summary' in structure:
+            node['summary'] = structure['summary']
+        if structure.get('nodes'):
+            node['nodes'] = simplify_tree(structure['nodes'])
+        return node
+    if isinstance(structure, list):
+        return [simplify_tree(item) for item in structure]
+    return structure
 
-# 2. 构建推理 Prompt (Reasoning)
+def build_node_index(structure):
+    node_map = {}
+    def walk(node):
+        if isinstance(node, dict):
+            node_id = node.get('node_id')
+            if node_id is not None:
+                node_map[str(node_id)] = node
+            for child in node.get('nodes', []):
+                walk(child)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+    walk(structure)
+    return node_map
+
+tree_without_text = simplify_tree(full_tree)
+
 search_prompt = f"""
 You are given a question and a tree structure of a document.
 Each node contains a node id, node title, and a corresponding summary.
@@ -33,25 +61,21 @@ Your task is to find all nodes that are likely to contain the answer to the ques
 Question: {user_query}
 
 Document tree structure:
-{json.dumps(tree_without_text, indent=2)}
+{json.dumps(tree_without_text, indent=2, ensure_ascii=False)}
 
 Please reply in the following JSON format:
 {{
     "thinking": "<Your thinking process on which nodes are relevant to the question>",
-    "node_list": ["node_id_1", "node_id_2", ...]
+    "node_list": ["node_id_1", "node_id_2", "..."]
 }}
+Directly return the final JSON structure. Do not output anything else.
 """
 
-# 3. LLM 推理与定位
 response = await call_llm(search_prompt)
 result = json.loads(response)
 
-# 4. 检索完整内容 (Retrieval)
-node_map = utils.create_node_mapping(full_tree)
-context = "\n\n".join([node_map[nid]['text'] for nid in result['node_list']])
-
-# 5. 生成最终回答
-final_answer = await call_llm(f"Context:\n{context}\n\nQuestion: {user_query}")
+node_map = build_node_index(full_tree)
+hit_nodes = [node_map[nid] for nid in result['node_list'] if nid in node_map]
 ```
 
 ## 🛠️ 技术栈
@@ -208,9 +232,9 @@ uv run main.py
 2.  **自动索引**: 若所选文件未建立索引，将自动调用 PageIndex 生成结构化数据 (`_structure.json`)。
 3.  **智能问答**: 进入交互式 Q&A 模式：
     *   **User**: 输入自然语言问题。
-    *   **TOC Loading**: 系统将 JSON 索引格式化为文本（包含章节标题、页码范围及摘要），并**直接注入到 Prompt 上下文**中。
-    *   **Reasoning**: LLM 结合注入的目录树（TOC）进行推理，定位最相关的物理页码。
-    *   **Retrieval**: 精确提取对应页面的文本内容。
+    *   **Tree Reasoning**: 基于简化的树结构（title/summary/node_id）进行节点级推理。
+    *   **Node Retrieval**: 根据命中节点的 `start_index/end_index` 抽取 PDF 页面文本。
+    *   **Fallback**: 若节点推理失败，回退到 TOC 页码推理并抽取对应页面。
     *   **Answer**: 生成最终回答。
 
 **方式二：命令行工具 (CLI)**
