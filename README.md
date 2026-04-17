@@ -2,7 +2,7 @@
 
 ## 项目简介
 
-**PageIndex-UV** 是 [PageIndex](https://github.com/VectifyAI/PageIndex) 框架的一个本地化、轻量级实现，使用现代化的 Python 工具链进行管理。本项目专注于**文档结构化索引构建**，旨在通过非向量化（Vectorless）、基于推理（Reasoning-based）的方式处理长文档（PDF/Markdown）。
+**PageIndex-UV** 是一个基于 [PageIndex](https://github.com/VectifyAI/PageIndex) 思想的文档结构化索引与推理问答工具，使用现代化的 Python 工具链进行管理。本项目专注于**非向量化（Vectorless）、基于推理（Reasoning-based）**的方式处理长文档（PDF/Markdown），所有核心代码内联在仓库中，无需外部子模块。
 
 通过解析文档的自然层级结构（目录树），结合 LLM 的推理能力，本工具能够生成带有摘要、页码映射和层级关系的 JSON 索引，为后续的 RAG（检索增强生成）任务提供高精度的上下文定位支持。
 
@@ -16,7 +16,7 @@
 
 ### 多文档检索 (Multi-Document RAG)
 
-在单文档模式的基础上，`main.py` 现已支持**多文档联合问答**。该模式借鉴了 [MemPalace](https://github.com/xxx/mempalace) 的分层检索思想，采用 **L1 → L2 → L3 三层检索 + Token 预算控制** 的架构，解决了传统多文档方案中常见的上下文爆炸和双重 LLM 筛选问题。
+在单文档模式的基础上，`main.py` 现已支持**多文档联合问答**。该模式采用 **L1 → L2 → L3 三层检索 + Token 预算控制** 的架构，解决了传统多文档方案中常见的上下文爆炸和双重 LLM 筛选问题。
 
 ```
 User Question
@@ -177,13 +177,15 @@ graph TD
 2.  **配置环境变量**:
     在项目根目录创建 `.env` 文件，填入你的 API Key：
     ```ini
-    # 使用 DashScope (Qwen)
+    # 使用 DashScope (Qwen) —— 模型名直接写 DashScope 侧名称，无需 provider 前缀
     DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxx
     OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
     MODEL_NAME=qwen-plus
 
     # 或者使用 OpenAI
     # OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
+    # OPENAI_BASE_URL=https://api.openai.com/v1
+    # MODEL_NAME=gpt-4o
     ```
 
 3.  **安装依赖**:
