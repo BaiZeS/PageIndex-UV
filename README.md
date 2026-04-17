@@ -58,11 +58,11 @@ User Question
     *   `PyPDF2`: PDF 文件操作辅助。
 *   **LLM 交互**:
     *   `OpenAI SDK`: 标准化的 LLM 接口调用。
-    *   `litellm`: 统一的多模型后端调用接口（同时提供 Token 计数）。
     *   支持多模型后端：OpenAI GPT 系列、阿里云 DashScope (Qwen) 等兼容 OpenAI 协议的模型。
 *   **配置与工具**:
     *   `python-dotenv`: 环境变量管理。
     *   `PyYAML`: 配置文件处理。
+    *   `tiktoken`: Token 计数与管理。
 
 ---
 
