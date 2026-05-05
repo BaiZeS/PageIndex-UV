@@ -1,0 +1,24 @@
+services:
+  pageindex:
+    build: .
+    container_name: pageindex-uv
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - API_KEY=${API_KEY:-changeme}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - MODEL_NAME=${MODEL_NAME:-qwen-plus}
+      - HOST=0.0.0.0
+      - PORT=3000
+      - WORKSPACE=/app/data/workspace
+      - DB_PATH=/app/data/index.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

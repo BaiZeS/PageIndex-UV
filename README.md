@@ -59,10 +59,15 @@ User Question
 *   **LLM 交互**:
     *   `OpenAI SDK`: 标准化的 LLM 接口调用。
     *   支持多模型后端：OpenAI GPT 系列、阿里云 DashScope (Qwen) 等兼容 OpenAI 协议的模型。
+*   **服务化 (MCP)**:
+    *   `mcp`: Model Context Protocol SDK，对外暴露标准化 Agent 接口。
+    *   `starlette` + `uvicorn`: 轻量级 ASGI Web 框架和服务器，承载 SSE 传输和 HTTP 端点。
+    *   `python-multipart`: 处理文件上传的 multipart/form-data 解析。
 *   **配置与工具**:
     *   `python-dotenv`: 环境变量管理。
     *   `PyYAML`: 配置文件处理。
     *   `tiktoken`: Token 计数与管理。
+    *   `jieba`: 中文分词，用于标签提取和元数据匹配。
 
 ---
 
@@ -77,9 +82,14 @@ User Question
 │   │   └── utils.py           # 通用工具函数 (API 调用, Token 计数等)
 │   ├── cookbook/              # Jupyter Notebook 示例
 │   └── run_pageindex.py       # 命令行工具入口
+├── deploy/                    # 部署配置
+│   └── mcp-config.json        # Claude Desktop MCP 配置模板
 ├── logs/                      # 运行日志和输出结果
 ├── db.py                      # SQLite 缓存层（节点、页面、文档元数据）
 ├── main.py                    # 交互式问答主入口（支持单文档 / 多文档模式）
+├── server.py                  # MCP 服务主文件（SSE + API Key 认证）
+├── Dockerfile                 # Docker 镜像构建
+├── docker-compose.yml         # Docker Compose 服务定义
 ├── pyproject.toml             # 项目元数据与依赖配置
 ├── uv.lock                    # 依赖锁定文件
 └── .env                       # 环境变量配置文件
@@ -92,6 +102,7 @@ User Question
     *   `nodes` 表：扁平化存储每个节点的 `node_id`、`title`、`summary`、`start_index`、`end_index` 和 `parent_node_id`。`insert_nodes` 接收调用方准备好的扁平记录列表，避免在持久化层遍历树结构。
     *   `pages` 表：存储每页的预提取文本内容，后续查询直接通过 SQL 读取，无需重新打开 PDF。`insert_pages` 接收调用方提取好的 `(doc_id, page_number, content)` 记录列表。
 *   **`main.py`**: 重构后的交互式问答入口。集成了 SQLite 缓存，首次索引后会将数据写入 `pageindex.db`，后续运行直接加载缓存，显著提升速度。启动时可选 **单文档模式 (s)** 或 **多文档模式 (m)**。内部复用了统一的 LLM JSON 调用器、节点到页面的转换助手，并在多文档模式下预缓存每棵树的 JSON 字符串，避免重复序列化。
+*   **`server.py`**: MCP 服务主文件。基于 Starlette + uvicorn 构建，对外暴露 SSE 传输的 MCP 协议端点，同时提供独立的 HTTP `/upload` 文件上传接口和 `/health` 健康检查。内置 API Key 认证（`X-API-Key` Header）和 CORS 中间件，支持 Docker 容器化部署。
 
 ---
 
@@ -303,6 +314,118 @@ CREATE TABLE pages (
     content TEXT NOT NULL,
     UNIQUE(doc_id, page_number)
 );
+```
+
+---
+
+## MCP 服务部署
+
+PageIndex-UV 可通过 **MCP (Model Context Protocol)** 对外提供标准化服务接口，支持 Claude Desktop、Cursor 等 Agent 工具直接调用 RAG 检索能力。
+
+### 部署方式
+
+#### Docker Compose (推荐)
+
+```bash
+# 1. 构建并启动
+docker compose up -d
+
+# 2. 查看日志
+docker compose logs -f
+
+# 3. 停止
+docker compose down
+```
+
+**环境变量配置** (`.env` 或 `docker-compose.yml`):
+
+```ini
+# API 认证 (必须)
+API_KEY=your-secure-api-key
+
+# LLM 配置
+DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxx
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MODEL_NAME=qwen-plus
+
+# 服务监听
+HOST=0.0.0.0
+PORT=3000
+
+# 数据持久化路径 (容器内)
+WORKSPACE=/app/data/workspace
+DB_PATH=/app/data/index.db
+```
+
+数据通过 volume 挂载持久化：`./data:/app/data`
+
+#### 本地开发运行
+
+```bash
+# 安装 MCP 依赖
+uv sync
+
+# 启动服务
+API_KEY=testkey python server.py
+```
+
+### 服务接口
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/health` | GET | 健康检查，返回文档数量 |
+| `/upload` | POST | 上传 PDF/Markdown 文件并索引 (multipart/form-data) |
+| `/sse` | GET | MCP SSE 连接端点 |
+| `/messages/` | POST | MCP JSON-RPC 消息通道 |
+
+**认证**: 所有端点 (除 `/health` 外) 需在请求头携带 `X-API-Key`。
+
+### MCP 工具 (Agent 可调用的功能)
+
+| 工具名 | 参数 | 功能 |
+|--------|------|------|
+| `search` | `query: str`, `top_k: int = 3` | 核心 RAG 检索，返回答案 + 置信度 + 来源 |
+| `list_documents` | 无 | 列出所有已索引文档 |
+| `get_document` | `doc_id: str` | 获取指定文档的元数据和结构 |
+| `delete_document` | `doc_id: str` | 删除文档及其索引 |
+
+### MCP 资源配置 (Claude Desktop)
+
+将以下配置添加到 Claude Desktop 的 MCP 配置中:
+
+**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "pageindex-uv": {
+      "type": "sse",
+      "url": "http://localhost:3000/sse",
+      "headers": {
+        "X-API-Key": "your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+### 文件上传示例
+
+```bash
+curl -X POST \
+  -F "file=@document.pdf" \
+  -H "X-API-Key: your-api-key-here" \
+  http://localhost:3000/upload
+```
+
+响应:
+```json
+{
+  "success": true,
+  "doc_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "mode": "pdf",
+  "filename": "document.pdf"
+}
 ```
 
 ---

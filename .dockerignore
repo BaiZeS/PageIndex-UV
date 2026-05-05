@@ -1,0 +1,41 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Env & secrets
+.env
+*.env
+
+# Data (mounted as volume)
+data/
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs not needed in image
+docs/mempalace/
+PageIndex/tests/results/
+
+# Tests (optional, can include if you want tests in image)
+# PageIndex/tests/
+
+# Misc
+=2.8.0
+*.lock
