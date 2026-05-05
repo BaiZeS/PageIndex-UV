@@ -123,10 +123,18 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
             if db is None:
                 return [types.TextContent(type="text", text=json.dumps({"documents": []}, ensure_ascii=False))]
 
+            c = get_client()
             docs = []
             for doc in db.get_all_documents():
+                db_id = str(doc.get("id", ""))
+                # Map DB id back to UUID if possible
+                doc_id = db_id
+                for uuid, mapped_db_id in c._uuid_to_db.items():
+                    if str(mapped_db_id) == db_id:
+                        doc_id = uuid
+                        break
                 docs.append({
-                    "id": doc.get("id"),
+                    "id": doc_id,
                     "name": doc.get("pdf_name", ""),
                     "description": doc.get("doc_description", ""),
                 })

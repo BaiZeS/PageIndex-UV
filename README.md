@@ -4,6 +4,10 @@
 
 **PageIndex-UV** 是一个基于 [PageIndex](https://github.com/VectifyAI/PageIndex) 思想的文档结构化索引与推理问答工具，使用现代化的 Python 工具链进行管理。本项目专注于**非向量化（Vectorless）、基于推理（Reasoning-based）**的方式处理长文档（PDF/Markdown），所有核心代码内联在仓库中，无需外部子模块。
 
+项目提供两种使用方式：
+1. **本地交互式终端** (`main.py`)：启动后直接进入多文档问答，通过 `/add` `/doc` `/list` 等命令管理文档和提问。
+2. **MCP 标准化服务** (`server.py`)：通过 Model Context Protocol (SSE 传输) 对外暴露 RAG 检索能力，支持 Claude Desktop、Cursor 等 Agent 工具直接调用，同时提供 HTTP 文件上传接口。
+
 通过解析文档的自然层级结构（目录树），结合 LLM 的推理能力，本工具能够生成带有摘要、页码映射和层级关系的 JSON 索引，为后续的 RAG（检索增强生成）任务提供高精度的上下文定位支持。
 
 ### 核心步骤
@@ -374,15 +378,19 @@ DB_PATH=/app/data/index.db
 
 数据通过 volume 挂载持久化：`./data:/app/data`
 
+> **注意**: MCP 服务（`server.py`）本身也需要 LLM API Key 来执行检索和生成答案。除了上表中的 `API_KEY`（用于 HTTP 请求认证），还必须在环境变量中提供 LLM 配置：`DASHSCOPE_API_KEY`（或 `OPENAI_API_KEY`）、`OPENAI_BASE_URL`、`MODEL_NAME`。docker-compose.yml 中已包含这些变量。
+
 #### 本地开发运行
 
 ```bash
-# 安装 MCP 依赖
+# 安装依赖
 uv sync
 
-# 启动服务
-API_KEY=testkey python server.py
+# 启动 MCP 服务
+API_KEY=testkey uv run python server.py
 ```
+
+server.py 启动后会加载现有的 `pageindex.db`（如有），因此本地已索引的文档数据会保留。
 
 ### 服务接口
 
@@ -426,9 +434,18 @@ API_KEY=testkey python server.py
 
 ### 文件上传示例
 
+支持 PDF 和 Markdown 文件：
+
 ```bash
+# 上传 PDF
 curl -X POST \
   -F "file=@document.pdf" \
+  -H "X-API-Key: your-api-key-here" \
+  http://localhost:3000/upload
+
+# 上传 Markdown
+curl -X POST \
+  -F "file=@document.md" \
   -H "X-API-Key: your-api-key-here" \
   http://localhost:3000/upload
 ```
