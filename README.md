@@ -86,7 +86,7 @@ User Question
 │   └── mcp-config.json        # Claude Desktop MCP 配置模板
 ├── logs/                      # 运行日志和输出结果
 ├── db.py                      # SQLite 缓存层（节点、页面、文档元数据）
-├── main.py                    # 交互式问答主入口（支持单文档 / 多文档模式）
+├── main.py                    # 交互式问答主入口（统一多文档入口，命令驱动文档管理）
 ├── server.py                  # MCP 服务主文件（SSE + API Key 认证）
 ├── Dockerfile                 # Docker 镜像构建
 ├── docker-compose.yml         # Docker Compose 服务定义
@@ -101,7 +101,7 @@ User Question
     *   `documents` 表：记录每个 PDF 的文件名、路径、简化后的树结构 JSON 和文档描述 `doc_description`。
     *   `nodes` 表：扁平化存储每个节点的 `node_id`、`title`、`summary`、`start_index`、`end_index` 和 `parent_node_id`。`insert_nodes` 接收调用方准备好的扁平记录列表，避免在持久化层遍历树结构。
     *   `pages` 表：存储每页的预提取文本内容，后续查询直接通过 SQL 读取，无需重新打开 PDF。`insert_pages` 接收调用方提取好的 `(doc_id, page_number, content)` 记录列表。
-*   **`main.py`**: 重构后的交互式问答入口。集成了 SQLite 缓存，首次索引后会将数据写入 `pageindex.db`，后续运行直接加载缓存，显著提升速度。启动时可选 **单文档模式 (s)** 或 **多文档模式 (m)**。内部复用了统一的 LLM JSON 调用器、节点到页面的转换助手，并在多文档模式下预缓存每棵树的 JSON 字符串，避免重复序列化。
+*   **`main.py`**: 交互式问答入口。启动后直接进入多文档问答提示符，所有已缓存文档自动作为知识库。通过 `/add` 命令索引新文档，`/doc` 命令聚焦单文档，`/list` 查看文档列表。内部复用了统一的 LLM JSON 调用器、节点到页面的转换助手，并预缓存每棵树的 JSON 字符串加速 L1 文档筛选。
 *   **`server.py`**: MCP 服务主文件。基于 Starlette + uvicorn 构建，对外暴露 SSE 传输的 MCP 协议端点，同时提供独立的 HTTP `/upload` 文件上传接口和 `/health` 健康检查。内置 API Key 认证（`X-API-Key` Header）和 CORS 中间件，支持 Docker 容器化部署。
 
 ---
@@ -206,39 +206,54 @@ graph TD
 
 ### 运行
 
-#### 方式一：交互式问答 Demo (推荐)
+#### 交互式问答 Demo (推荐)
 
-`main.py` 提供了一个完整的**交互式演示**，集成了索引生成、SQLite 缓存和基于推理的检索问答（Reasoning-based RAG）。
+`main.py` 启动后直接进入**多文档问答**提示符，所有已索引文档自动作为知识库。
 
 ```bash
 uv run main.py
 ```
 
-启动后会提示选择模式：
+启动后界面：
 
 ```
-Select mode:
-  (s) Single-document Q&A
-  (m) Multi-document Q&A
-Mode [s/m]:
+==================================================
+PageIndex-UV Multi-Document Q&A
+Powered by qwen-plus
+==================================================
+Cached documents (3):
+  1. 如何客开一个档案.pdf (...)
+  2. 前端脚本入门必读.pdf (...)
+  3. 业务流入门.pdf (...)
+--------------------------------------------------
+
+> 什么是低代码开发平台？
+...
 ```
 
-**单文档模式 (s)**：
-1.  **文件选择**: 自动扫描 `PageIndex/tests/pdfs` 目录下的 PDF 文件供选择。
-2.  **自动索引**: 若所选文件未建立索引，将自动调用 PageIndex 生成结构化数据 (`_structure.json`)，并写入 `pageindex.db`。
-3.  **智能问答**: 进入交互式 Q&A 模式：
-    *   **User**: 输入自然语言问题。
-    *   **Tree Reasoning**: 基于简化的树结构（title/summary/node_id）进行节点级推理。
-    *   **Node Retrieval**: 根据命中节点的 `start_index/end_index` 直接从 SQLite `pages` 表读取页面文本。
-    *   **Fallback**: 若节点推理失败，回退到 TOC 页码推理并从 SQLite 读取对应页面。
-    *   **Answer**: 生成最终回答。
-4.  **加速体验**: 首次索引后，再次选择同一文件将跳过 PDF 解析，直接从 SQLite 加载，响应速度显著提升。
+**直接提问**: 输入任意自然语言问题，系统自动执行 L1（文档筛选）→ L2（逐文档节点推理）→ L3（上下文合并+Token 截断）→ 生成跨文档答案。用户无需预先知道哪个文档包含答案。
 
-**多文档模式 (m)**：
-1.  **前提**: 需要先在单文档模式下处理至少一个 PDF，使其被缓存到 `pageindex.db` 中。
-2.  **直接进入问答**: 无需选择具体文件，系统会列出所有已缓存的文档。
-3.  **分层检索**: 输入问题后，系统自动执行 L1（文档筛选）→ L2（逐文档节点推理）→ L3（上下文合并+Token 截断）→ 生成跨文档答案。
-4.  **日志记录**: 多文档问答日志保存在 `logs/qa_multidoc_YYYYMMDD.jsonl` 中，包含命中文档、截断标志和每文档 Token 用量。
+**命令一览**：
+
+| 命令 | 说明 |
+|------|------|
+| `/add <pdf路径>` | 索引新文档。支持相对路径（自动在 `PageIndex/tests/pdfs` 中查找）或绝对路径 |
+| `/doc <编号>` | 临时聚焦单文档，进入子循环深入问答。输入 `..` 返回多文档模式 |
+| `/list` | 列出所有已缓存文档 |
+| `/help` | 显示帮助 |
+| `q` 或 `/quit` | 退出 |
+
+**索引新文档示例**：
+```
+> /add PageIndex/tests/pdfs/业务流入门.pdf
+Indexing 业务流入门.pdf...
+Indexed successfully.
+
+> 业务流推单和拉单有什么区别？
+...
+```
+
+**日志记录**: 问答日志保存在 `logs/qa_multidoc_YYYYMMDD.jsonl` 中，包含命中文档、截断标志和每文档 Token 用量。
 
 #### 方式二：命令行工具 (CLI)
 

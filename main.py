@@ -41,8 +41,6 @@ except Exception as e:
 # Multi-doc context budget
 MAX_CONTEXT_TOKENS = 16000
 
-MODE_SINGLE = 's'
-MODE_MULTI = 'm'
 REASONING_TREE = 'tree'
 REASONING_TOC = 'toc_fallback'
 
@@ -297,31 +295,6 @@ def list_pdfs(directory):
     ])
 
 
-def select_pdf(pdf_dir):
-    pdfs = list_pdfs(pdf_dir)
-    if not pdfs:
-        print(f"No PDF files found in {pdf_dir}")
-        return None
-
-    print("\nAvailable Documents:")
-    for i, pdf in enumerate(pdfs, 1):
-        print(f"{i}. {pdf}")
-
-    while True:
-        try:
-            choice = input("\nSelect a document by number (or 'q' to quit): ").strip()
-            if choice.lower() in ('q', 'quit', 'exit'):
-                return None
-
-            idx = int(choice) - 1
-            if 0 <= idx < len(pdfs):
-                return pdfs[idx]
-            else:
-                print("Invalid number. Please try again.")
-        except ValueError:
-            print("Please enter a valid number.")
-
-
 def _fallback_to_toc(question, toc_text, db, doc_id, log_f, selected_pdf_name, mode, node_ids):
     pages = get_relevant_pages(question, toc_text)
     if not pages:
@@ -346,6 +319,132 @@ def _fallback_to_toc(question, toc_text, db, doc_id, log_f, selected_pdf_name, m
 # ---------------------------------------------------------------------------
 # Multi-document retrieval helpers
 # ---------------------------------------------------------------------------
+
+def _build_multidoc_context(db):
+    """Build lightweight doc info list and tree JSON cache from DB."""
+    all_docs = db.get_all_documents()
+    docs_info = []
+    doc_lookup = {}
+    doc_tree_json = {}
+    for doc in all_docs:
+        doc_id = doc['id']
+        doc_lookup[doc_id] = doc
+        top_nodes = db.get_top_level_nodes(doc_id)
+        top_sections = [n.get('title') for n in top_nodes if n.get('title')]
+        description = doc.get('doc_description') or ""
+        if not description and top_nodes:
+            description = " ".join([n.get('summary', '') for n in top_nodes[:3] if n.get('summary')])
+        docs_info.append({
+            "doc_id": str(doc_id),
+            "doc_name": doc['pdf_name'],
+            "description": description,
+            "top_level_sections": top_sections
+        })
+        tree_json = doc.get('tree_json')
+        if tree_json:
+            tree = json.loads(tree_json)
+            doc_tree_json[doc_id] = json.dumps(tree, indent=2, ensure_ascii=False)
+    return docs_info, doc_lookup, doc_tree_json
+
+
+def answer_multidoc(question, db, docs_info, doc_lookup, doc_tree_json, log_f):
+    """Execute one multi-document Q&A. Returns (answer, status_dict) or (None, None)."""
+    # L1: Document selection
+    print("\nThinking (Selecting relevant documents)...")
+    relevant_doc_ids = get_relevant_documents_for_multidoc(question, docs_info)
+    if not relevant_doc_ids:
+        print("No relevant documents found for this question.")
+        return None, {"status": "no_docs"}
+
+    relevant_docs = [doc_lookup[int(did)] for did in relevant_doc_ids if int(did) in doc_lookup]
+    if not relevant_docs:
+        print("No valid documents found after filtering.")
+        return None, {"status": "no_valid_docs"}
+
+    print(f"Selected {len(relevant_docs)} document(s): " + ", ".join([d['pdf_name'] for d in relevant_docs]))
+
+    # L2: Per-document node recall
+    all_selected_nodes = []
+    doc_nodes_map = {}
+    for doc in relevant_docs:
+        doc_id = doc['id']
+        tree_json_str = doc_tree_json.get(doc_id)
+        if not tree_json_str:
+            print(f"Skipping {doc['pdf_name']}: no cached tree structure.")
+            continue
+
+        print(f"Thinking (Nodes in {doc['pdf_name']})...")
+        node_ids = get_relevant_nodes(question, tree_json_str)
+        if not node_ids:
+            print(f"  No relevant nodes in {doc['pdf_name']}")
+            continue
+
+        node_ids = node_ids[:5]
+        selected_nodes = db.get_nodes_by_ids(doc_id, node_ids)
+        if selected_nodes:
+            doc_nodes_map[doc_id] = selected_nodes
+            all_selected_nodes.extend(selected_nodes)
+            print(f"  Found {len(selected_nodes)} node(s) in {doc['pdf_name']}")
+
+    # L3: Context extraction with token budget
+    context_parts = []
+    remaining_tokens = MAX_CONTEXT_TOKENS
+    overall_truncated = False
+    context_log = []
+
+    for doc in relevant_docs:
+        doc_id = doc['id']
+        selected_nodes = doc_nodes_map.get(doc_id, [])
+        if not selected_nodes:
+            continue
+
+        pages = pages_from_nodes(selected_nodes)
+        seen = set(pages)
+
+        if not pages:
+            continue
+
+        ctx_text, used, truncated = build_context_with_budget(
+            db, doc_id, pages, doc['pdf_name'], remaining_tokens
+        )
+        if ctx_text:
+            context_parts.append(ctx_text)
+            remaining_tokens -= used
+            context_log.append({
+                "doc_id": doc_id,
+                "doc_name": doc['pdf_name'],
+                "pages": sorted(seen),
+                "tokens": used,
+                "truncated": truncated
+            })
+        if truncated:
+            overall_truncated = True
+
+    if not context_parts:
+        print("No relevant context found in any document.")
+        return None, {"status": "no_context"}
+
+    full_context = "\n".join(context_parts)
+    if overall_truncated:
+        full_context += "\n\n[Note: Some content was truncated to fit context budget.]"
+
+    print("Generating answer...")
+    answer = generate_answer(question, full_context)
+
+    write_qa_log(log_f, {
+        "timestamp": datetime.now().isoformat(),
+        "mode": "multidoc",
+        "question": question,
+        "relevant_docs": [d['pdf_name'] for d in relevant_docs],
+        "relevant_doc_ids": relevant_doc_ids,
+        "truncated": overall_truncated,
+        "context_details": context_log,
+        "answer": answer,
+        "status": "ok"
+    })
+
+    return answer, {"status": "ok", "truncated": overall_truncated}
+
 
 def get_relevant_documents_for_multidoc(question, docs_info):
     """L1: Select top-K relevant documents from a list of doc metadata."""
@@ -392,153 +491,113 @@ def build_context_with_budget(db, doc_id, pages, doc_name, remaining_tokens):
     return "".join(parts), used, truncated
 
 
-def run_multidoc_mode(db, logs_dir, log_f):
-    """Multi-document Q&A loop using L1 -> L2 -> L3 layered retrieval."""
-    all_docs = db.get_all_documents()
-    if not all_docs:
-        print("No cached documents found. Please process at least one PDF in single-doc mode first.")
-        return
+# ---------------------------------------------------------------------------
+# Unified helpers
+# ---------------------------------------------------------------------------
 
-    print("\n" + "=" * 50)
-    print("Welcome to PageIndex Multi-Doc Q&A")
-    print(f"Loaded {len(all_docs)} cached document(s):")
-    for doc in all_docs:
-        desc = doc.get('doc_description') or ''
-        print(f"- {doc['pdf_name']}" + (f" ({desc[:60]}...)" if desc else ""))
-    print("=" * 50)
-
-    # Pre-build a lightweight doc info list for L1 and cache tree JSON strings
-    docs_info = []
-    doc_lookup = {}
-    doc_tree_json = {}
-    for doc in all_docs:
-        doc_id = doc['id']
-        doc_lookup[doc_id] = doc
-        top_nodes = db.get_top_level_nodes(doc_id)
-        top_sections = [n.get('title') for n in top_nodes if n.get('title')]
-        description = doc.get('doc_description') or ""
-        if not description and top_nodes:
-            description = " ".join([n.get('summary', '') for n in top_nodes[:3] if n.get('summary')])
-        docs_info.append({
-            "doc_id": str(doc_id),
-            "doc_name": doc['pdf_name'],
-            "description": description,
-            "top_level_sections": top_sections
-        })
-        tree_json = doc.get('tree_json')
-        if tree_json:
-            tree = json.loads(tree_json)
-            doc_tree_json[doc_id] = json.dumps(tree, indent=2, ensure_ascii=False)
-
-    while True:
+def index_pdf(db, pdf_path, json_path, selected_pdf_name):
+    """Index a PDF into the database. Returns doc dict or None."""
+    if not os.path.exists(json_path):
+        data = generate_structure(pdf_path, json_path)
+        if not data:
+            print("Failed to generate structure.")
+            return None
+    else:
+        print(f"Loading structure from {json_path}...")
         try:
-            question = input("\nAsk a question (or 'q' to quit): ").strip()
-        except EOFError:
-            break
+            data = load_structure(json_path)
+        except Exception as e:
+            print(f"Error loading structure JSON: {e}")
+            return None
 
-        if question.lower() in ('q', 'quit', 'exit'):
-            break
-        if not question:
-            continue
+    structure = data.get('structure', [])
+    if not structure:
+        print("Structure is empty.")
+        return None
+    ensure_node_ids(structure)
 
-        # L1: Document selection
-        print("\nThinking (Selecting relevant documents)...")
-        relevant_doc_ids = get_relevant_documents_for_multidoc(question, docs_info)
-        if not relevant_doc_ids:
-            print("No relevant documents found for this question.")
-            continue
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-        relevant_docs = [doc_lookup[int(did)] for did in relevant_doc_ids if int(did) in doc_lookup]
-        if not relevant_docs:
-            print("No valid documents found after filtering.")
-            continue
+    doc_description = data.get('doc_description', '')
+    doc_id = db.insert_document(selected_pdf_name, pdf_path, doc_description=doc_description)
+    db.insert_nodes(doc_id, _flatten_nodes(structure, doc_id))
+    db.insert_pages(doc_id, _extract_page_records(pdf_path, doc_id))
 
-        print(f"Selected {len(relevant_docs)} document(s): " + ", ".join([d['pdf_name'] for d in relevant_docs]))
+    tree_for_reasoning = create_clean_structure_for_description(structure)
+    db.update_document_tree(doc_id, json.dumps(tree_for_reasoning, ensure_ascii=False))
+    return db.get_document_by_name(selected_pdf_name)
 
-        # L2: Per-document node recall
-        all_selected_nodes = []
-        doc_nodes_map = {}
-        for doc in relevant_docs:
-            doc_id = doc['id']
-            tree_json_str = doc_tree_json.get(doc_id)
-            if not tree_json_str:
-                print(f"Skipping {doc['pdf_name']}: no cached tree structure.")
-                continue
 
-            print(f"Thinking (Nodes in {doc['pdf_name']})...")
-            node_ids = get_relevant_nodes(question, tree_json_str)
-            if not node_ids:
-                print(f"  No relevant nodes in {doc['pdf_name']}")
-                continue
-
-            # Limit to top 5 nodes per doc
-            node_ids = node_ids[:5]
-            selected_nodes = db.get_nodes_by_ids(doc_id, node_ids)
-            if selected_nodes:
-                doc_nodes_map[doc_id] = selected_nodes
-                all_selected_nodes.extend(selected_nodes)
-                print(f"  Found {len(selected_nodes)} node(s) in {doc['pdf_name']}")
-
-        # L3: Context extraction with token budget
-        context_parts = []
-        remaining_tokens = MAX_CONTEXT_TOKENS
-        overall_truncated = False
-        context_log = []
-
-        for doc in relevant_docs:
-            doc_id = doc['id']
-            selected_nodes = doc_nodes_map.get(doc_id, [])
-            if not selected_nodes:
-                continue
-
-            pages = pages_from_nodes(selected_nodes)
-            seen = set(pages)
-
-            if not pages:
-                continue
-
-            ctx_text, used, truncated = build_context_with_budget(
-                db, doc_id, pages, doc['pdf_name'], remaining_tokens
+def answer_single_doc(question, db, doc_id, tree_json_str, toc_text, selected_pdf_name, log_f):
+    """Execute one single-document Q&A. Returns answer string or None."""
+    print("\nThinking (Reasoning over tree)...")
+    mode = REASONING_TREE
+    selected_nodes = []
+    node_ids = get_relevant_nodes(question, tree_json_str)
+    if not node_ids:
+        print("Node reasoning failed. Falling back to TOC pages.")
+        mode = REASONING_TOC
+        pages, context = _fallback_to_toc(
+            question, toc_text, db, doc_id, log_f,
+            selected_pdf_name, mode, []
+        )
+        if context is None:
+            return None
+    else:
+        selected_nodes = db.get_nodes_by_ids(doc_id, node_ids)
+        if not selected_nodes:
+            print("No valid nodes found. Falling back to TOC pages.")
+            mode = REASONING_TOC
+            pages, context = _fallback_to_toc(
+                question, toc_text, db, doc_id, log_f,
+                selected_pdf_name, mode, node_ids
             )
-            if ctx_text:
-                context_parts.append(ctx_text)
-                remaining_tokens -= used
-                context_log.append({
-                    "doc_id": doc_id,
-                    "doc_name": doc['pdf_name'],
-                    "pages": sorted(seen),
-                    "tokens": used,
-                    "truncated": truncated
-                })
-            if truncated:
-                overall_truncated = True
+            if context is None:
+                return None
+        else:
+            print("Identified relevant nodes:")
+            for node in selected_nodes:
+                print(f"- {node.get('title', 'Untitled')} (Pages: {node.get('start_index', '?')}-{node.get('end_index', '?')})")
+            pages = pages_from_nodes(selected_nodes)
+            print("Reading content...")
+            context = extract_text_from_db(db, doc_id, pages)
 
-        if not context_parts:
-            print("No relevant context found in any document.")
-            continue
+    print("Generating answer...")
+    answer = generate_answer(question, context)
+    write_qa_log(log_f, {
+        "timestamp": datetime.now().isoformat(),
+        "document": selected_pdf_name,
+        "question": question,
+        "mode": mode,
+        "node_ids": node_ids,
+        "nodes": [
+            {
+                "node_id": node.get("node_id"),
+                "title": node.get("title"),
+                "start_index": node.get("start_index"),
+                "end_index": node.get("end_index")
+            } for node in selected_nodes
+        ],
+        "pages": pages,
+        "context": context,
+        "answer": answer,
+        "status": "ok"
+    })
+    return answer
 
-        full_context = "\n".join(context_parts)
-        if overall_truncated:
-            full_context += "\n\n[Note: Some content was truncated to fit context budget.]"
 
-        print("Generating answer...")
-        answer = generate_answer(question, full_context)
+def _print_help():
+    print("""
+Commands:
+  /add <pdf_path>   Index a new PDF document
+  /doc <number>    Focus on a single document (type '..' to return)
+  /list             List all indexed documents
+  /help             Show this help message
+  /quit  or  q      Exit the program
 
-        write_qa_log(log_f, {
-            "timestamp": datetime.now().isoformat(),
-            "mode": "multidoc",
-            "question": question,
-            "relevant_docs": [d['pdf_name'] for d in relevant_docs],
-            "relevant_doc_ids": relevant_doc_ids,
-            "truncated": overall_truncated,
-            "context_details": context_log,
-            "answer": answer,
-            "status": "ok"
-        })
-
-        print("\nAnswer:")
-        print(answer)
-        print("-" * 50)
+Any other input is treated as a question and answered using multi-document RAG.
+""")
 
 
 # ---------------------------------------------------------------------------
@@ -556,108 +615,25 @@ def main():
 
     db = PageIndexDB(db_path)
 
-    # Mode selection
-    print("\nSelect mode:")
-    print("  (s) Single-document Q&A")
-    print("  (m) Multi-document Q&A")
-    mode_choice = input("Mode [s/m]: ").strip().lower()
-    if mode_choice == MODE_MULTI:
-        date_tag = datetime.now().strftime("%Y%m%d")
-        log_path = os.path.join(logs_dir, f"qa_multidoc_{date_tag}.jsonl")
-        try:
-            log_f = open(log_path, "a", encoding="utf-8")
-        except OSError as e:
-            print(f"Error opening log file {log_path}: {e}")
-            db.close()
-            return
-        try:
-            run_multidoc_mode(db, logs_dir, log_f)
-        finally:
-            log_f.close()
-            db.close()
-        return
-
-    # Single-document mode (original behavior)
-    selected_pdf_name = select_pdf(pdf_dir)
-    if not selected_pdf_name:
-        db.close()
-        return
-
-    pdf_path = os.path.join(pdf_dir, selected_pdf_name)
-    json_filename = os.path.splitext(selected_pdf_name)[0] + "_structure.json"
-    json_path = os.path.join(results_dir, json_filename)
-
-    print(f"\nSelected: {selected_pdf_name}")
-
-    if not os.path.exists(pdf_path):
-        print(f"Error: PDF not found at {pdf_path}")
-        db.close()
-        return
-
-    doc = db.get_document_by_name(selected_pdf_name)
-
-    if not doc:
-        if not os.path.exists(json_path):
-            data = generate_structure(pdf_path, json_path)
-            if not data:
-                print("Failed to generate structure. Exiting.")
-                db.close()
-                return
-        else:
-            print(f"Loading structure from {json_path}...")
-            try:
-                data = load_structure(json_path)
-            except Exception as e:
-                print(f"Error loading structure JSON: {e}")
-                db.close()
-                return
-
-        structure = data.get('structure', [])
-        if not structure:
-            print("Structure is empty.")
-            db.close()
-            return
-        ensure_node_ids(structure)
-
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-        doc_description = data.get('doc_description', '')
-        doc_id = db.insert_document(selected_pdf_name, pdf_path, doc_description=doc_description)
-        db.insert_nodes(doc_id, _flatten_nodes(structure, doc_id))
-        db.insert_pages(doc_id, _extract_page_records(pdf_path, doc_id))
-
-        tree_for_reasoning = create_clean_structure_for_description(structure)
-        db.update_document_tree(doc_id, json.dumps(tree_for_reasoning, ensure_ascii=False))
-        doc = db.get_document_by_name(selected_pdf_name)
-    else:
-        doc_id = doc['id']
-        tree_json = doc.get('tree_json')
-        if tree_json:
-            tree_for_reasoning = json.loads(tree_json)
-        else:
-            print(f"Loading structure from {json_path}...")
-            try:
-                data = load_structure(json_path)
-            except Exception as e:
-                print(f"Error loading structure JSON: {e}")
-                db.close()
-                return
-            structure = data.get('structure', [])
-            tree_for_reasoning = create_clean_structure_for_description(structure)
-
-    # Build TOC text from tree for fallback logic
-    toc_text = format_toc(tree_for_reasoning)
-
-    tree_json_str = json.dumps(tree_for_reasoning, indent=2, ensure_ascii=False)
-
+    # Print welcome and cached docs
+    all_docs = db.get_all_documents()
     print("\n" + "=" * 50)
-    print("Welcome to PageIndex Q&A (Powered by Qwen-Plus)")
-    print(f"Document: {selected_pdf_name}")
+    print("PageIndex-UV Multi-Document Q&A")
+    print(f"Powered by {MODEL_NAME}")
     print("=" * 50)
+    if all_docs:
+        print(f"Cached documents ({len(all_docs)}):")
+        for i, doc in enumerate(all_docs, 1):
+            desc = doc.get('doc_description') or ''
+            print(f"  {i}. {doc['pdf_name']}" + (f" ({desc[:50]}...)" if desc else ""))
+    else:
+        print("No cached documents found.")
+        print("Use `/add <pdf_path>` to index a document first.")
+    print("-" * 50)
 
+    # Open multi-doc log (always used for main loop)
     date_tag = datetime.now().strftime("%Y%m%d")
-    log_path = os.path.join(logs_dir, f"qa_{date_tag}.jsonl")
+    log_path = os.path.join(logs_dir, f"qa_multidoc_{date_tag}.jsonl")
     try:
         log_f = open(log_path, "a", encoding="utf-8")
     except OSError as e:
@@ -665,76 +641,143 @@ def main():
         db.close()
         return
 
+    # Pre-build multi-doc context if docs exist
+    docs_info, doc_lookup, doc_tree_json = _build_multidoc_context(db) if all_docs else ([], {}, {})
+
     try:
         while True:
             try:
-                question = input("\nAsk a question (or 'q' to quit): ").strip()
+                user_input = input("\n> ").strip()
             except EOFError:
                 break
 
-            if question.lower() in ('q', 'quit', 'exit'):
-                break
-
-            if not question:
+            if not user_input:
                 continue
 
-            print("\nThinking (Reasoning over tree)...")
-            mode = REASONING_TREE
-            selected_nodes = []
-            node_ids = get_relevant_nodes(question, tree_json_str)
-            if not node_ids:
-                print("Node reasoning failed. Falling back to TOC pages.")
-                mode = REASONING_TOC
-                pages, context = _fallback_to_toc(
-                    question, toc_text, db, doc_id, log_f,
-                    selected_pdf_name, mode, []
-                )
-                if context is None:
-                    continue
-            else:
-                selected_nodes = db.get_nodes_by_ids(doc_id, node_ids)
-                if not selected_nodes:
-                    print("No valid nodes found. Falling back to TOC pages.")
-                    mode = REASONING_TOC
-                    pages, context = _fallback_to_toc(
-                        question, toc_text, db, doc_id, log_f,
-                        selected_pdf_name, mode, node_ids
-                    )
-                    if context is None:
-                        continue
+            # Command dispatch
+            if user_input.lower() in ('q', 'quit', 'exit', '/quit'):
+                break
+
+            if user_input == '/help':
+                _print_help()
+                continue
+
+            if user_input == '/list':
+                all_docs = db.get_all_documents()
+                if not all_docs:
+                    print("No cached documents.")
                 else:
-                    print("Identified relevant nodes:")
-                    for node in selected_nodes:
-                        print(f"- {node.get('title', 'Untitled')} (Pages: {node.get('start_index', '?')}-{node.get('end_index', '?')})")
-                    pages = pages_from_nodes(selected_nodes)
-                    print("Reading content...")
-                    context = extract_text_from_db(db, doc_id, pages)
+                    print(f"\nCached documents ({len(all_docs)}):")
+                    for i, doc in enumerate(all_docs, 1):
+                        desc = doc.get('doc_description') or ''
+                        print(f"  {i}. {doc['pdf_name']}" + (f" ({desc[:50]}...)" if desc else ""))
+                    docs_info, doc_lookup, doc_tree_json = _build_multidoc_context(db)
+                continue
 
-            print("Generating answer...")
-            answer = generate_answer(question, context)
-            write_qa_log(log_f, {
-                "timestamp": datetime.now().isoformat(),
-                "document": selected_pdf_name,
-                "question": question,
-                "mode": mode,
-                "node_ids": node_ids,
-                "nodes": [
-                    {
-                        "node_id": node.get("node_id"),
-                        "title": node.get("title"),
-                        "start_index": node.get("start_index"),
-                        "end_index": node.get("end_index")
-                    } for node in selected_nodes
-                ],
-                "pages": pages,
-                "context": context,
-                "answer": answer,
-                "status": "ok"
-            })
+            if user_input.startswith('/add '):
+                pdf_path = user_input[5:].strip()
+                # Support bare filename by looking in pdf_dir
+                if not os.path.isabs(pdf_path) and not os.path.exists(pdf_path):
+                    candidate = os.path.join(pdf_dir, pdf_path)
+                    if os.path.exists(candidate):
+                        pdf_path = candidate
 
-            print("\nAnswer:")
-            print(answer)
-            print("-" * 50)
+                if not os.path.exists(pdf_path):
+                    print(f"File not found: {pdf_path}")
+                    continue
+
+                selected_pdf_name = os.path.basename(pdf_path)
+                json_filename = os.path.splitext(selected_pdf_name)[0] + "_structure.json"
+                json_path = os.path.join(results_dir, json_filename)
+
+                doc = db.get_document_by_name(selected_pdf_name)
+                if doc:
+                    print(f"'{selected_pdf_name}' is already indexed.")
+                    continue
+
+                print(f"Indexing {selected_pdf_name}...")
+                doc = index_pdf(db, pdf_path, json_path, selected_pdf_name)
+                if doc:
+                    print(f"Indexed successfully: {selected_pdf_name}")
+                    # Refresh multi-doc context
+                    docs_info, doc_lookup, doc_tree_json = _build_multidoc_context(db)
+                continue
+
+            if user_input.startswith('/doc '):
+                parts = user_input.split(None, 1)
+                if len(parts) < 2:
+                    print("Usage: /doc <document_number>")
+                    continue
+                try:
+                    doc_idx = int(parts[1]) - 1
+                except ValueError:
+                    print("Please provide a valid document number.")
+                    continue
+
+                all_docs = db.get_all_documents()
+                if not all_docs or doc_idx < 0 or doc_idx >= len(all_docs):
+                    print("Invalid document number.")
+                    continue
+
+                doc = all_docs[doc_idx]
+                doc_id = doc['id']
+                selected_pdf_name = doc['pdf_name']
+                pdf_path = doc.get('pdf_path', os.path.join(pdf_dir, selected_pdf_name))
+                json_filename = os.path.splitext(selected_pdf_name)[0] + "_structure.json"
+                json_path = os.path.join(results_dir, json_filename)
+
+                # Ensure tree structure is available
+                tree_json = doc.get('tree_json')
+                if tree_json:
+                    tree_for_reasoning = json.loads(tree_json)
+                else:
+                    if os.path.exists(json_path):
+                        data = load_structure(json_path)
+                        structure = data.get('structure', [])
+                        tree_for_reasoning = create_clean_structure_for_description(structure)
+                        db.update_document_tree(doc_id, json.dumps(tree_for_reasoning, ensure_ascii=False))
+                    else:
+                        print(f"Structure file not found for {selected_pdf_name}. Re-indexing...")
+                        doc = index_pdf(db, pdf_path, json_path, selected_pdf_name)
+                        if not doc:
+                            continue
+                        tree_for_reasoning = json.loads(doc['tree_json'])
+
+                toc_text = format_toc(tree_for_reasoning)
+                tree_json_str = json.dumps(tree_for_reasoning, indent=2, ensure_ascii=False)
+
+                print("\n" + "=" * 50)
+                print(f"Focusing on: {selected_pdf_name}")
+                print("Type '..' to return to multi-document mode.")
+                print("=" * 50)
+
+                while True:
+                    try:
+                        q = input("  > ").strip()
+                    except EOFError:
+                        break
+                    if q in ('..', '...'):
+                        break
+                    if q.lower() in ('q', 'quit', 'exit'):
+                        return
+                    if not q:
+                        continue
+
+                    answer = answer_single_doc(q, db, doc_id, tree_json_str, toc_text, selected_pdf_name, log_f)
+                    if answer is not None:
+                        print(f"\n  Answer:\n  {answer}\n  {'-' * 46}")
+                continue
+
+            # Default: treat as multi-document question
+            if not all_docs:
+                print("No documents indexed. Use `/add <pdf_path>` first.")
+                continue
+
+            answer, _ = answer_multidoc(user_input, db, docs_info, doc_lookup, doc_tree_json, log_f)
+            if answer is not None:
+                print("\nAnswer:")
+                print(answer)
+                print("-" * 50)
     finally:
         log_f.close()
         db.close()
