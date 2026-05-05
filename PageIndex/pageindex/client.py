@@ -1,3 +1,4 @@
+import logging
 import os
 import uuid
 import json
@@ -10,7 +11,19 @@ import PyPDF2
 from .page_index import page_index
 from .page_index_md import md_to_tree
 from .retrieve import get_document, get_document_structure, get_page_content
-from .utils import ConfigLoader, remove_fields
+from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, create_node_mapping
+from .closet_index import ClosetIndex
+
+# Optional: db.py lives at project root; gracefully degrade if unavailable.
+try:
+    from db import PageIndexDB
+except ImportError:
+    PageIndexDB = None  # type: ignore[misc,assignment]
+
+try:
+    from .agentic.router import AgenticRouter
+except ImportError:
+    AgenticRouter = None  # type: ignore[misc,assignment]
 
 META_INDEX = "_meta.json"
 
@@ -29,7 +42,7 @@ class PageIndexClient:
 
     For agent-based QA, see examples/agentic_vectorless_rag_demo.py.
     """
-    def __init__(self, api_key: str = None, model: str = None, retrieve_model: str = None, workspace: str = None):
+    def __init__(self, api_key: str = None, model: str = None, retrieve_model: str = None, workspace: str = None, db_path: str = None):
         if api_key:
             os.environ["OPENAI_API_KEY"] = api_key
         elif not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
@@ -49,6 +62,18 @@ class PageIndexClient:
         if self.workspace:
             self._load_workspace()
 
+        # Optional persistent layer for agentic retrieval
+        self.db = None
+        self.closet_index = None
+        self.router = None
+        self._uuid_to_db: dict[str, int] = {}
+
+        if db_path and PageIndexDB:
+            self.db = PageIndexDB(db_path)
+            self.closet_index = ClosetIndex(self.db, self.model)
+            if AgenticRouter:
+                self.router = AgenticRouter(self, self.model)
+
     def index(self, file_path: str, mode: str = "auto") -> str:
         """Index a document. Returns a document_id."""
         # Persist a canonical absolute path so workspace reloads do not
@@ -64,7 +89,7 @@ class PageIndexClient:
         is_md = ext in ['.md', '.markdown']
 
         if mode == "pdf" or (mode == "auto" and is_pdf):
-            print(f"Indexing PDF: {file_path}")
+            logging.info("Indexing PDF: %s", file_path)
             result = page_index(
                 doc=file_path,
                 model=self.model,
@@ -92,7 +117,7 @@ class PageIndexClient:
             }
 
         elif mode == "md" or (mode == "auto" and is_md):
-            print(f"Indexing Markdown: {file_path}")
+            logging.info("Indexing Markdown: %s", file_path)
             coro = md_to_tree(
                 md_path=file_path,
                 if_thinning=False,
@@ -121,7 +146,39 @@ class PageIndexClient:
         else:
             raise ValueError(f"Unsupported file format for: {file_path}")
 
-        print(f"Indexing complete. Document ID: {doc_id}")
+        # Persist metadata to db for agentic retrieval
+        doc = self.documents[doc_id]
+        if self.db:
+            try:
+                db_doc_id = self.db.insert_document(
+                    pdf_name=doc.get('doc_name', ''),
+                    pdf_path=file_path,
+                    doc_description=doc.get('doc_description', '')
+                )
+                self._uuid_to_db[doc_id] = db_doc_id
+                if self.closet_index and doc.get('structure'):
+                    self.closet_index.add_document(
+                        db_doc_id,
+                        doc.get('doc_name', ''),
+                        doc.get('doc_description', ''),
+                        doc['structure']
+                    )
+            except Exception as e:
+                logging.warning("Failed to persist to db: %s", e)
+
+        logging.info("Indexing complete. Document ID: %s", doc_id)
+        if self.closet_index and doc_id in self._uuid_to_db:
+            db_id = self._uuid_to_db[doc_id]
+            doc = self.documents.get(doc_id, {})
+            try:
+                self.closet_index.add_document(
+                    db_id,
+                    doc.get("doc_name", ""),
+                    doc.get("doc_description", ""),
+                    doc.get("structure", [])
+                )
+            except Exception as e:
+                logging.warning("Failed to index closet tags: %s", e)
         if self.workspace:
             self._save_doc(doc_id)
         return doc_id
@@ -148,7 +205,7 @@ class PageIndexClient:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as e:
-            print(f"Warning: corrupt {Path(path).name}: {e}")
+            logging.warning("Corrupt %s: %s", Path(path).name, e)
             return None
 
     def _save_doc(self, doc_id: str):
@@ -179,7 +236,7 @@ class PageIndexClient:
         """Read and validate _meta.json, returning None on any corruption."""
         meta = self._read_json(self.workspace / META_INDEX)
         if meta is not None and not isinstance(meta, dict):
-            print(f"Warning: {META_INDEX} is not a JSON object, ignoring")
+            logging.warning("%s is not a JSON object, ignoring", META_INDEX)
             return None
         return meta
 
@@ -195,7 +252,7 @@ class PageIndexClient:
         if meta is None:
             meta = self._rebuild_meta()
             if meta:
-                print(f"Loaded {len(meta)} document(s) from workspace (legacy mode).")
+                logging.info("Loaded %d document(s) from workspace (legacy mode).", len(meta))
         for doc_id, entry in meta.items():
             doc = dict(entry, id=doc_id)
             if doc.get('path') and not os.path.isabs(doc['path']):
@@ -229,3 +286,150 @@ class PageIndexClient:
         if self.workspace:
             self._ensure_doc_loaded(doc_id)
         return get_page_content(self.documents, doc_id, pages)
+
+    def close(self):
+        """Close database connection and release resources."""
+        if self.db is not None:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.db = None
+
+    # ------------------------------------------------------------------
+    # Search (single- and multi-document)
+    # ------------------------------------------------------------------
+
+    async def search(self, query: str, top_k: int = 3) -> dict:
+        """Search across indexed documents.
+
+        Single-document mode skips the agentic router and performs direct
+        tree reasoning.  Multi-document mode runs the full
+        Plan -> Route -> Act -> Verify pipeline.
+        """
+        if len(self.documents) == 1:
+            doc_id = list(self.documents.keys())[0]
+            return await self._search_single(query, doc_id)
+
+        if self.router:
+            return await self.router.search(query, top_k)
+
+        return {
+            "query": query,
+            "mode": "multi",
+            "answer": (
+                "Router not available. Initialise PageIndexClient with db_path="
+                "to enable multi-document search."
+            ),
+            "confidence": "unknown",
+            "matched_docs": [],
+            "selected_nodes": [],
+            "pages": [],
+        }
+
+    async def _search_single(self, query: str, doc_id: str) -> dict:
+        """Direct tree search for a single document (zero router overhead)."""
+        if self.workspace:
+            self._ensure_doc_loaded(doc_id)
+
+        doc = self.documents.get(doc_id)
+        if not doc:
+            return {
+                "query": query,
+                "mode": "single",
+                "answer": "Document not found.",
+                "confidence": "unknown",
+                "matched_docs": [],
+                "selected_nodes": [],
+                "pages": [],
+            }
+
+        structure = doc.get("structure", [])
+        if not structure:
+            return {
+                "query": query,
+                "mode": "single",
+                "answer": "No document structure available.",
+                "confidence": "unknown",
+                "matched_docs": [],
+                "selected_nodes": [],
+                "pages": [],
+            }
+
+        # Lazy-import main.py helpers (project root must be on sys.path)
+        try:
+            import main as _main
+            get_relevant_nodes = _main.get_relevant_nodes
+            pages_from_nodes = _main.pages_from_nodes
+            generate_answer = _main.generate_answer
+        except ImportError:
+            return {
+                "query": query,
+                "mode": "single",
+                "answer": "Search backend not available.",
+                "confidence": "unknown",
+                "matched_docs": [],
+                "selected_nodes": [],
+                "pages": [],
+            }
+
+        tree_json = json.dumps(structure, ensure_ascii=False)
+        node_ids = get_relevant_nodes(query, tree_json)
+        if not node_ids:
+            return {
+                "query": query,
+                "mode": "single",
+                "answer": "No relevant sections found.",
+                "confidence": "low",
+                "matched_docs": [{"doc_id": doc_id, "score": 1.0}],
+                "selected_nodes": [],
+                "pages": [],
+            }
+
+        mapping = create_node_mapping(structure)
+        selected = [mapping.get(nid) for nid in node_ids if nid in mapping]
+        selected = [n for n in selected if n]
+        if not selected:
+            return {
+                "query": query,
+                "mode": "single",
+                "answer": "No valid sections found.",
+                "confidence": "low",
+                "matched_docs": [{"doc_id": doc_id, "score": 1.0}],
+                "selected_nodes": [],
+                "pages": [],
+            }
+
+        pages = pages_from_nodes(selected)
+
+        # Assemble context
+        ctx_parts = [f"\n=== Document: {doc.get('doc_name', '')} ===\n"]
+        if doc.get("type") == "pdf" and doc.get("pages"):
+            page_map = {p["page"]: p["content"] for p in doc["pages"]}
+            for p in sorted(set(pages)):
+                text = page_map.get(p, "")
+                if text:
+                    ctx_parts.append(f"\n--- Page {p} ---\n{text}")
+        elif doc.get("type") == "md":
+            for node in selected:
+                txt = node.get("text", "")
+                if txt:
+                    ctx_parts.append(
+                        f"\n--- {node.get('title', '')} ---\n{txt}"
+                    )
+
+        context = "".join(ctx_parts)
+        answer = generate_answer(query, context)
+
+        return {
+            "query": query,
+            "mode": "single",
+            "answer": answer,
+            "confidence": "high",
+            "matched_docs": [{"doc_id": doc_id, "score": 1.0}],
+            "selected_nodes": [
+                {"node_id": n.get("node_id"), "title": n.get("title")}
+                for n in selected
+            ],
+            "pages": [{"doc_id": doc_id, "pages": sorted(set(pages))}],
+        }

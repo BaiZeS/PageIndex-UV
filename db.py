@@ -55,6 +55,18 @@ class PageIndexDB:
                     content TEXT NOT NULL,
                     UNIQUE(doc_id, page_number)
                 );
+
+                CREATE TABLE IF NOT EXISTS closet_tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    tag_text TEXT NOT NULL,
+                    tag_token TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    source TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_closet_tags_token
+                    ON closet_tags(doc_id, tag_token);
                 """
             )
             # Migrate: add doc_description if missing
@@ -200,3 +212,62 @@ class PageIndexDB:
             rows = conn.execute(sql, (doc_id, *chunk)).fetchall()
             results.extend(rows)
         return [(r["page_number"], r["content"]) for r in results]
+    def ensure_closet_schema(self):
+        # closet_tags is already created by ensure_schema(); keep this method
+        # for callers that explicitly want to ensure the closet schema.
+        pass
+
+    def insert_closet_tags(self, doc_id, records):
+        if not records:
+            return
+        with self._connect() as conn:
+            conn.execute("DELETE FROM closet_tags WHERE doc_id = ?", (doc_id,))
+            chunk = []
+            for record in records:
+                chunk.append(record)
+                if len(chunk) >= 50:
+                    conn.executemany(
+                        """
+                        INSERT INTO closet_tags (doc_id, tag_text, tag_token, confidence, source)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        chunk,
+                    )
+                    chunk = []
+            if chunk:
+                conn.executemany(
+                    """
+                    INSERT INTO closet_tags (doc_id, tag_text, tag_token, confidence, source)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    chunk,
+                )
+
+    def delete_closet_tags(self, doc_id):
+        with self._connect() as conn:
+            conn.execute("DELETE FROM closet_tags WHERE doc_id = ?", (doc_id,))
+
+    def match_closet_tags(self, tokens, top_k=5):
+        if not tokens:
+            return []
+        results = []
+        conn = self._connect()
+        for i in range(0, len(tokens), SQLITE_MAX_VARIABLE_NUMBER):
+            chunk = tokens[i:i + SQLITE_MAX_VARIABLE_NUMBER]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = f"""
+                SELECT doc_id, SUM(confidence) AS score
+                FROM closet_tags
+                WHERE tag_token IN ({placeholders})
+                GROUP BY doc_id
+            """
+            rows = conn.execute(sql, chunk).fetchall()
+            results.extend(rows)
+        # Merge results from multiple chunks: re-aggregate scores by doc_id
+        merged = {}
+        for r in results:
+            merged[r["doc_id"]] = merged.get(r["doc_id"], 0) + r["score"]
+        # Sort by score descending, take top_k
+        sorted_docs = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        return sorted_docs
+

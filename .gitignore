@@ -6,3 +6,7 @@ PageIndex/tests/pdfs/
 *.pdf
 logs/
 *.db
+.env
+.venv/
+PageIndex/tests/results/
+docs/mempalace/
