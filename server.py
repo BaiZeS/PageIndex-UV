@@ -8,6 +8,7 @@ with API Key authentication and file upload endpoint.
 import os
 import sys
 import json
+import uuid
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -294,8 +295,47 @@ async def health_endpoint(request: Request) -> Response:
     return JSONResponse({"status": "ok", "documents": doc_count})
 
 
+# Global semaphore to limit concurrent indexing during batch uploads
+_UPLOAD_SEMAPHORE = asyncio.Semaphore(3)
+
+
+def _determine_mode(filename: str) -> str:
+    """Determine indexing mode from filename extension."""
+    name_lower = filename.lower()
+    if name_lower.endswith(".pdf"):
+        return "pdf"
+    elif name_lower.endswith(".md") or name_lower.endswith(".markdown"):
+        return "md"
+    return "auto"
+
+
+async def _index_one_file(temp_path: Path, filename: str) -> dict:
+    """Index a single file with concurrency limiting.
+
+    Returns a result dict with filename, success, and either doc_id or error.
+    """
+    mode = _determine_mode(filename)
+    try:
+        async with _UPLOAD_SEMAPHORE:
+            doc_id = await asyncio.to_thread(
+                get_client().index, str(temp_path), mode=mode
+            )
+        return {
+            "filename": filename,
+            "success": True,
+            "doc_id": doc_id,
+        }
+    except Exception as e:
+        logger.exception("Indexing failed for %s", filename)
+        return {
+            "filename": filename,
+            "success": False,
+            "error": str(e),
+        }
+
+
 async def upload_endpoint(request: Request) -> Response:
-    """Upload a PDF or Markdown file and index it."""
+    """Upload PDF or Markdown files and index them (batch upload supported)."""
     try:
         import multipart
     except ImportError:
@@ -311,37 +351,69 @@ async def upload_endpoint(request: Request) -> Response:
         logger.exception("Failed to parse multipart form")
         return JSONResponse({"error": f"Failed to parse form: {e}"}, status_code=400)
 
-    file_field = form.get("file")
-    if file_field is None:
-        return JSONResponse({"error": "Missing 'file' field"}, status_code=400)
+    # Collect all file fields (support "file" and "files[]")
+    raw_files = form.get("file")
+    if raw_files is None:
+        raw_files = form.get("files[]")
 
-    # Save to temp location (use client's actual workspace)
+    if raw_files is None:
+        return JSONResponse(
+            {"error": "Missing 'file' or 'files[]' field"}, status_code=400
+        )
+
+    # Normalize to a list regardless of single or multiple uploads
+    if not isinstance(raw_files, list):
+        raw_files = [raw_files]
+
+    if len(raw_files) == 0:
+        return JSONResponse({"error": "No files provided"}, status_code=400)
+
+    # Prepare upload directory
     upload_dir = Path(get_client().workspace) / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
-    temp_path = upload_dir / file_field.filename
-    content = await file_field.read()
-    temp_path.write_bytes(content)
 
-    # Determine mode from filename
-    mode = "auto"
-    filename = str(file_field.filename).lower()
-    if filename.endswith(".pdf"):
-        mode = "pdf"
-    elif filename.endswith(".md") or filename.endswith(".markdown"):
-        mode = "md"
+    # Save all files to temp locations first
+    temp_paths: list[tuple[Path, str]] = []
+    for file_field in raw_files:
+        # Sanitize to basename only to prevent path traversal
+        safe_name = Path(file_field.filename).name
+        # Use UUID prefix to prevent filename collisions between concurrent uploads
+        unique_name = f"{uuid.uuid4().hex}_{safe_name}"
+        temp_path = upload_dir / unique_name
+        content = await file_field.read()
+        await asyncio.to_thread(temp_path.write_bytes, content)
+        temp_paths.append((temp_path, safe_name))
 
-    # Index the document
-    try:
-        doc_id = get_client().index(str(temp_path), mode=mode)
-        return JSONResponse({
-            "success": True,
-            "doc_id": doc_id,
-            "mode": mode,
-            "filename": file_field.filename,
-        })
-    except Exception as e:
-        logger.exception("Indexing failed")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    # Process indexing concurrently with semaphore limiting
+    tasks = [
+        _index_one_file(temp_path, filename)
+        for temp_path, filename in temp_paths
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Normalize any unexpected exceptions into error results
+    normalized_results: list[dict] = []
+    for idx, res in enumerate(results):
+        filename = temp_paths[idx][1]
+        if isinstance(res, Exception):
+            logger.exception("Unexpected error indexing %s", filename)
+            normalized_results.append({
+                "filename": filename,
+                "success": False,
+                "error": str(res),
+            })
+        else:
+            normalized_results.append(res)
+
+    succeeded = sum(1 for r in normalized_results if r.get("success"))
+    failed = len(normalized_results) - succeeded
+
+    return JSONResponse({
+        "results": normalized_results,
+        "total": len(normalized_results),
+        "succeeded": succeeded,
+        "failed": failed,
+    })
 
 
 # ---------------------------------------------------------------------------

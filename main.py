@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+import glob
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from dotenv import load_dotenv
 from types import SimpleNamespace
@@ -293,6 +295,107 @@ def list_pdfs(directory):
         entry.name for entry in os.scandir(directory)
         if entry.is_file() and entry.name.lower().endswith('.pdf')
     ])
+
+
+# ---------------------------------------------------------------------------
+# Batch upload helpers for /add command
+# ---------------------------------------------------------------------------
+
+_ALLOWED_EXTENSIONS = ('.pdf', '.md', '.markdown')
+
+
+def _resolve_upload_paths(raw_path, pdf_dir):
+    """Resolve a raw path into a list of file paths.
+
+    Supports:
+      - Single file
+      - Glob pattern (contains * or ?)
+      - Directory (recursively collects .pdf, .md, .markdown)
+    """
+    # Try pdf_dir resolution for relative bare paths first
+    if not os.path.isabs(raw_path) and not os.path.exists(raw_path):
+        candidate = os.path.join(pdf_dir, raw_path)
+        if os.path.exists(candidate):
+            raw_path = candidate
+
+    if os.path.isdir(raw_path):
+        files = []
+        for root, _dirs, filenames in os.walk(raw_path):
+            for name in filenames:
+                if name.lower().endswith(_ALLOWED_EXTENSIONS):
+                    files.append(os.path.join(root, name))
+        return sorted(files)
+
+    if '*' in raw_path or '?' in raw_path:
+        matched = glob.glob(raw_path)
+        return sorted([
+            f for f in matched
+            if os.path.isfile(f) and f.lower().endswith(_ALLOWED_EXTENSIONS)
+        ])
+
+    # Single file: validate existence and extension
+    if not os.path.exists(raw_path):
+        return []
+    if not raw_path.lower().endswith(_ALLOWED_EXTENSIONS):
+        return []
+    return [raw_path]
+
+
+def _index_files_batch(db_path, file_paths, results_dir):
+    """Index a list of files concurrently with max 3 workers.
+
+    Each worker creates its own DB connection to avoid SQLite thread-safety issues.
+    Prints per-file progress and a final summary.
+    Returns True if at least one file was newly indexed successfully.
+    """
+    total = len(file_paths)
+    print(f"Indexing {total} file(s)...")
+
+    def _index_one(path):
+        filename = os.path.basename(path)
+        json_filename = os.path.splitext(filename)[0] + "_structure.json"
+        json_path = os.path.join(results_dir, json_filename)
+
+        # Create a fresh DB connection per thread to avoid SQLite thread checks
+        db = PageIndexDB(db_path)
+        doc = db.get_document_by_name(filename)
+        if doc:
+            db.close()
+            return filename, 'skipped', None
+
+        try:
+            doc = index_pdf(db, path, json_path, filename)
+            db.close()
+            if doc:
+                return filename, 'ok', doc['id']
+            else:
+                return filename, 'error', 'index_pdf returned None'
+        except Exception as exc:
+            db.close()
+            return filename, 'error', str(exc)
+
+    succeeded = 0
+    failed = 0
+    skipped = 0
+    any_new = False
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(_index_one, path) for path in file_paths]
+        for idx, future in enumerate(as_completed(futures), start=1):
+            filename, status, detail = future.result()
+            if status == 'ok':
+                print(f"[{idx}/{total}] {filename}... OK (doc_id={detail})")
+                succeeded += 1
+                any_new = True
+            elif status == 'skipped':
+                print(f"[{idx}/{total}] {filename}... SKIPPED (already indexed)")
+                skipped += 1
+            else:
+                print(f"[{idx}/{total}] {filename}... ERROR: {detail}")
+                failed += 1
+
+    print(f"Done: {succeeded} succeeded, {failed} failed, {skipped} skipped.")
+    return any_new
 
 
 def _fallback_to_toc(question, toc_text, db, doc_id, log_f, selected_pdf_name, mode, node_ids):
@@ -675,31 +778,15 @@ def main():
                 continue
 
             if user_input.startswith('/add '):
-                pdf_path = user_input[5:].strip()
-                # Support bare filename by looking in pdf_dir
-                if not os.path.isabs(pdf_path) and not os.path.exists(pdf_path):
-                    candidate = os.path.join(pdf_dir, pdf_path)
-                    if os.path.exists(candidate):
-                        pdf_path = candidate
+                raw_path = user_input[5:].strip()
+                file_paths = _resolve_upload_paths(raw_path, pdf_dir)
 
-                if not os.path.exists(pdf_path):
-                    print(f"File not found: {pdf_path}")
+                if not file_paths:
+                    print(f"No matching files found: {raw_path}")
                     continue
 
-                selected_pdf_name = os.path.basename(pdf_path)
-                json_filename = os.path.splitext(selected_pdf_name)[0] + "_structure.json"
-                json_path = os.path.join(results_dir, json_filename)
-
-                doc = db.get_document_by_name(selected_pdf_name)
-                if doc:
-                    print(f"'{selected_pdf_name}' is already indexed.")
-                    continue
-
-                print(f"Indexing {selected_pdf_name}...")
-                doc = index_pdf(db, pdf_path, json_path, selected_pdf_name)
-                if doc:
-                    print(f"Indexed successfully: {selected_pdf_name}")
-                    # Refresh multi-doc context
+                any_new = _index_files_batch(db_path, file_paths, results_dir)
+                if any_new:
                     docs_info, doc_lookup, doc_tree_json = _build_multidoc_context(db)
                 continue
 
