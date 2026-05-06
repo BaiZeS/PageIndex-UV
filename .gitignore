@@ -10,3 +10,4 @@ logs/
 .venv/
 PageIndex/tests/results/
 docs/mempalace/
+.worktrees/
