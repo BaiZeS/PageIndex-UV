@@ -23,6 +23,10 @@ utils_mod = importlib.util.module_from_spec(utils_spec)
 sys.modules["pageindex.utils"] = utils_mod
 # utils.py may also have missing deps; stub out the names closet_index needs.
 utils_mod.llm_completion = lambda *a, **k: None
+async def _mock_llm_acompletion(*a, **k):
+    return None
+utils_mod.llm_acompletion = _mock_llm_acompletion
+utils_mod.count_tokens = lambda text, model=None: len(text or "") // 4
 utils_mod.extract_json = lambda *a, **k: None
 
 # Also need pageindex.closet_index for the _STOPWORDS import.
@@ -120,3 +124,68 @@ class TestKBIdentity:
         db.insert_document("new.pdf", "/tmp/new.pdf")
         identity2 = ki.get_identity()
         assert "new.pdf" in identity2
+
+
+SuperTreeIndex = super_tree_mod.SuperTreeIndex
+
+
+@pytest.fixture
+def super_tree_index():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    db = PageIndexDB(path)
+    client = MagicMock()
+    client._uuid_to_db = {}
+    client.documents = {}
+    client.closet_index = None
+    st = SuperTreeIndex(db, model="qwen-plus", client=client)
+    yield st, db, client
+    db.close()
+    os.unlink(path)
+
+
+class TestSuperTreeIndex:
+    def test_prefilter_empty_db(self, super_tree_index):
+        st, db, client = super_tree_index
+        result = st.prefilter("前端")
+        assert result == set()
+
+    def test_prefilter_with_keyword_match(self, super_tree_index):
+        st, db, client = super_tree_index
+        doc_id = db.insert_document("前端脚本.pdf", "/tmp/test.pdf",
+                                     doc_description="前端开发指南")
+        st.on_document_added(doc_id)
+        result = st.prefilter("前端")
+        assert doc_id in result
+
+    def test_build_super_tree_empty(self, super_tree_index):
+        st, db, client = super_tree_index
+        tree = st._build_super_tree([])
+        assert tree == {"documents": []}
+
+    def test_on_document_added_updates_keyword_index(self, super_tree_index):
+        st, db, client = super_tree_index
+        doc_id = db.insert_document("test.pdf", "/tmp/test.pdf")
+        st.on_document_added(doc_id)
+        results = st.keyword_index.search("test")
+        assert len(results) == 1
+
+    def test_on_document_removed_clears_index(self, super_tree_index):
+        st, db, client = super_tree_index
+        doc_id = db.insert_document("test.pdf", "/tmp/test.pdf")
+        st.on_document_added(doc_id)
+        st.on_document_removed(doc_id)
+        results = st.keyword_index.search("test")
+        assert len(results) == 0
+
+    @pytest.mark.asyncio
+    async def test_select_documents(self, super_tree_index):
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = '{"doc_ids": ["uuid-1"]}'
+            st, db, client = super_tree_index
+            client.documents = {"uuid-1": {"id": "uuid-1", "doc_name": "test.pdf"}}
+            client._uuid_to_db = {"uuid-1": 1}
+            db.insert_document("test.pdf", "/tmp/test.pdf")
+
+            result = await st.select_documents("test", {1})
+            assert "uuid-1" in result

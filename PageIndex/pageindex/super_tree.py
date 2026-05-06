@@ -113,3 +113,241 @@ class KBIdentity:
             text += " 等"
         self.db.set_kb_identity(text, len(docs))
         return text
+
+
+import asyncio
+from typing import Set, Dict
+
+from .utils import llm_acompletion, count_tokens
+
+
+class SuperTreeIndex:
+    """L0 dual-channel prefilter + L1 Super-Tree document selection."""
+
+    _MAX_TOP_NODES_PER_DOC = 8
+    _MAX_CANDIDATE_DOCS = 50
+    _MAX_SUPER_TREE_TOKENS = 6000
+    _SUMMARY_MAX_LEN = 100
+
+    def __init__(self, db, model: str, client):
+        self.db = db
+        self.model = model
+        self.client = client
+        self.keyword_index = KeywordIndex(db)
+        self.kb_identity = KBIdentity(db, model)
+        self._backfill_existing_docs()
+
+    # ------------------------------------------------------------------
+    # Lifecycle hooks
+    # ------------------------------------------------------------------
+    def on_document_added(self, db_doc_id: int) -> None:
+        doc = self.db.get_document_by_name(
+            next((d["pdf_name"] for d in self.db.get_all_documents() if d["id"] == db_doc_id), "")
+        )
+        if doc:
+            self.keyword_index.add_document(
+                db_doc_id, doc.get("pdf_name", ""), doc.get("doc_description", "")
+            )
+        self.kb_identity.invalidate()
+
+    def on_document_removed(self, db_doc_id: int) -> None:
+        self.keyword_index.remove_document(db_doc_id)
+        self.kb_identity.invalidate()
+
+    # ------------------------------------------------------------------
+    # L0: Dual-channel prefilter
+    # ------------------------------------------------------------------
+    def prefilter(self, query: str) -> Set[int]:
+        candidates: Set[int] = set()
+
+        # Channel A: tag matching (ClosetIndex)
+        if hasattr(self.client, "closet_index") and self.client.closet_index:
+            try:
+                tag_results = self.client.closet_index.search(query, top_k=20)
+                for doc_id, _ in tag_results:
+                    candidates.add(int(doc_id))
+            except Exception as e:
+                logging.warning("Tag matching failed: %s", e)
+
+        # Channel B: keyword inverted index
+        try:
+            keyword_results = self.keyword_index.search(query, top_k=20)
+            for doc_id, _ in keyword_results:
+                candidates.add(int(doc_id))
+        except Exception as e:
+            logging.warning("Keyword search failed: %s", e)
+
+        return candidates
+
+    def _truncate_candidates(self, candidates: Set[int]) -> list[int]:
+        if len(candidates) <= self._MAX_CANDIDATE_DOCS:
+            return list(candidates)
+
+        # Score by multi-channel match + confidence
+        scores: Dict[int, float] = {}
+        for doc_id in candidates:
+            scores[doc_id] = 0.0
+
+        # Boost for tag matches
+        if hasattr(self.client, "closet_index") and self.client.closet_index:
+            try:
+                tag_results = {int(did): score for did, score in
+                               self.client.closet_index.search("", top_k=100)}
+                for doc_id in candidates:
+                    if doc_id in tag_results:
+                        scores[doc_id] += tag_results[doc_id]
+            except Exception:
+                pass
+
+        # Boost for keyword matches
+        try:
+            kw_results = {int(did): score for did, score in
+                          self.keyword_index.search("", top_k=100)}
+            for doc_id in candidates:
+                if doc_id in kw_results:
+                    scores[doc_id] += kw_results[doc_id]
+        except Exception:
+            pass
+
+        sorted_docs = sorted(candidates, key=lambda d: scores.get(d, 0), reverse=True)
+        return sorted_docs[:self._MAX_CANDIDATE_DOCS]
+
+    # ------------------------------------------------------------------
+    # L1: Super-Tree document selection
+    # ------------------------------------------------------------------
+    async def select_documents(self, query: str, candidate_db_ids: Set[int]) -> list[str]:
+        if not candidate_db_ids:
+            return []
+
+        truncated = self._truncate_candidates(candidate_db_ids)
+        super_tree = self._build_super_tree(truncated)
+        kb_identity = self.kb_identity.get_identity()
+
+        # Token budget check
+        tree_json = json.dumps(super_tree, ensure_ascii=False)
+        total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
+        if total_tokens > self._MAX_SUPER_TREE_TOKENS:
+            logging.warning("Super-Tree exceeds token budget (%d), truncating docs", total_tokens)
+            while total_tokens > self._MAX_SUPER_TREE_TOKENS and len(super_tree["documents"]) > 5:
+                super_tree["documents"].pop()
+                tree_json = json.dumps(super_tree, ensure_ascii=False)
+                total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
+
+        prompt = f"""你是一个文档检索专家。给定以下用户问题、知识库概览和候选文档结构，请选出最可能包含答案的 3-5 个文档。
+
+[知识库概览]
+{kb_identity}
+
+[用户问题]
+{query}
+
+[候选文档结构]
+{tree_json}
+
+要求：
+1. 基于文档的顶层章节标题和摘要判断相关性
+2. 优先选择直接相关文档，次选间接相关文档
+3. 如果知识库概览显示没有相关主题，返回空列表
+
+返回JSON格式：
+{{
+  "thinking": "推理过程...",
+  "doc_ids": ["uuid-1", "uuid-2", ...]
+}}
+直接返回最终JSON结构，不要输出其他内容。"""
+
+        response = await llm_acompletion(self.model, prompt)
+        if not response:
+            return []
+
+        # Parse JSON response
+        try:
+            data = json.loads(response) if response.strip().startswith("{") else {}
+        except json.JSONDecodeError:
+            data = {}
+
+        if isinstance(data, dict):
+            doc_ids = data.get("doc_ids", [])
+        else:
+            doc_ids = []
+
+        # Map back to UUIDs
+        uuid_results = []
+        db_to_uuid = {v: k for k, v in getattr(self.client, "_uuid_to_db", {}).items()}
+        for doc_id in doc_ids:
+            if isinstance(doc_id, int):
+                uuid = db_to_uuid.get(doc_id)
+                if uuid:
+                    uuid_results.append(uuid)
+            elif isinstance(doc_id, str):
+                uuid_results.append(doc_id)
+        return uuid_results
+
+    # ------------------------------------------------------------------
+    # Super-Tree builder
+    # ------------------------------------------------------------------
+    def _build_super_tree(self, doc_ids: list[int]) -> Dict:
+        documents = []
+        db_to_uuid = {v: k for k, v in getattr(self.client, "_uuid_to_db", {}).items()}
+
+        for db_doc_id in doc_ids:
+            doc = next((d for d in self.db.get_all_documents() if d["id"] == db_doc_id), None)
+            if not doc:
+                continue
+
+            uuid = db_to_uuid.get(db_doc_id, str(db_doc_id))
+            top_nodes = self.db.get_top_level_nodes(db_doc_id)
+
+            # Sort by child count (more children = more structurally important)
+            nodes_with_children = []
+            for node in top_nodes:
+                children = self.db._connect().execute(
+                    "SELECT COUNT(*) FROM nodes WHERE parent_node_id = ?",
+                    (node.get("node_id"),),
+                ).fetchone()[0]
+                nodes_with_children.append((node, children))
+
+            nodes_with_children.sort(key=lambda x: x[1], reverse=True)
+            selected = nodes_with_children[:self._MAX_TOP_NODES_PER_DOC]
+
+            top_nodes_out = []
+            for node, _ in selected:
+                summary = node.get("summary", "") or ""
+                if len(summary) > self._SUMMARY_MAX_LEN:
+                    summary = summary[:self._SUMMARY_MAX_LEN] + "..."
+                top_nodes_out.append({
+                    "title": node.get("title", ""),
+                    "summary": summary,
+                })
+
+            documents.append({
+                "doc_id": uuid,
+                "db_id": db_doc_id,
+                "doc_name": doc.get("pdf_name", ""),
+                "description": doc.get("doc_description", ""),
+                "top_nodes": top_nodes_out,
+            })
+
+        return {"documents": documents}
+
+    # ------------------------------------------------------------------
+    # Backfill existing documents on first init
+    # ------------------------------------------------------------------
+    def _backfill_existing_docs(self) -> None:
+        try:
+            with self.db._connect() as conn:
+                row = conn.execute("SELECT COUNT(*) FROM doc_keywords").fetchone()
+                if row and row[0] > 0:
+                    return
+        except Exception:
+            return
+
+        for doc in self.db.get_all_documents():
+            try:
+                self.keyword_index.add_document(
+                    doc["id"],
+                    doc.get("pdf_name", ""),
+                    doc.get("doc_description", ""),
+                )
+            except Exception as e:
+                logging.warning("Backfill failed for doc %s: %s", doc.get("pdf_name"), e)
