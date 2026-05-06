@@ -157,6 +157,13 @@ class PageIndexDB:
         ).fetchone()
         return dict(row) if row else None
 
+    def get_document_by_id(self, doc_id):
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT * FROM documents WHERE id = ?", (doc_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
     def get_all_documents(self):
         conn = self._connect()
         rows = conn.execute("SELECT * FROM documents ORDER BY id").fetchall()

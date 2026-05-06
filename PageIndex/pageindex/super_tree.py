@@ -118,7 +118,7 @@ class KBIdentity:
 import asyncio
 from typing import Set, Dict
 
-from .utils import llm_acompletion, count_tokens
+from .utils import llm_acompletion, count_tokens, extract_json
 
 
 class SuperTreeIndex:
@@ -141,9 +141,7 @@ class SuperTreeIndex:
     # Lifecycle hooks
     # ------------------------------------------------------------------
     def on_document_added(self, db_doc_id: int) -> None:
-        doc = self.db.get_document_by_name(
-            next((d["pdf_name"] for d in self.db.get_all_documents() if d["id"] == db_doc_id), "")
-        )
+        doc = self.db.get_document_by_id(db_doc_id)
         if doc:
             self.keyword_index.add_document(
                 db_doc_id, doc.get("pdf_name", ""), doc.get("doc_description", "")
@@ -157,65 +155,42 @@ class SuperTreeIndex:
     # ------------------------------------------------------------------
     # L0: Dual-channel prefilter
     # ------------------------------------------------------------------
-    def prefilter(self, query: str) -> Set[int]:
-        candidates: Set[int] = set()
+    def prefilter(self, query: str) -> Dict[int, float]:
+        """Return candidate doc_ids with cumulative channel scores."""
+        scores: Dict[int, float] = {}
 
         # Channel A: tag matching (ClosetIndex)
         if hasattr(self.client, "closet_index") and self.client.closet_index:
             try:
                 tag_results = self.client.closet_index.search(query, top_k=20)
-                for doc_id, _ in tag_results:
-                    candidates.add(int(doc_id))
+                for doc_id, score in tag_results:
+                    scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(score)
             except Exception as e:
                 logging.warning("Tag matching failed: %s", e)
 
         # Channel B: keyword inverted index
         try:
             keyword_results = self.keyword_index.search(query, top_k=20)
-            for doc_id, _ in keyword_results:
-                candidates.add(int(doc_id))
+            for doc_id, score in keyword_results:
+                scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(score)
         except Exception as e:
             logging.warning("Keyword search failed: %s", e)
 
-        return candidates
+        return scores
 
-    def _truncate_candidates(self, candidates: Set[int]) -> list[int]:
-        if len(candidates) <= self._MAX_CANDIDATE_DOCS:
-            return list(candidates)
+    def _truncate_candidates(self, scores: Dict[int, float]) -> list[int]:
+        if len(scores) <= self._MAX_CANDIDATE_DOCS:
+            return list(scores.keys())
 
-        # Score by multi-channel match + confidence
-        scores: Dict[int, float] = {}
-        for doc_id in candidates:
-            scores[doc_id] = 0.0
-
-        # Boost for tag matches
-        if hasattr(self.client, "closet_index") and self.client.closet_index:
-            try:
-                tag_results = {int(did): score for did, score in
-                               self.client.closet_index.search("", top_k=100)}
-                for doc_id in candidates:
-                    if doc_id in tag_results:
-                        scores[doc_id] += tag_results[doc_id]
-            except Exception:
-                pass
-
-        # Boost for keyword matches
-        try:
-            kw_results = {int(did): score for did, score in
-                          self.keyword_index.search("", top_k=100)}
-            for doc_id in candidates:
-                if doc_id in kw_results:
-                    scores[doc_id] += kw_results[doc_id]
-        except Exception:
-            pass
-
-        sorted_docs = sorted(candidates, key=lambda d: scores.get(d, 0), reverse=True)
+        sorted_docs = sorted(
+            scores.keys(), key=lambda d: scores.get(d, 0.0), reverse=True
+        )
         return sorted_docs[:self._MAX_CANDIDATE_DOCS]
 
     # ------------------------------------------------------------------
     # L1: Super-Tree document selection
     # ------------------------------------------------------------------
-    async def select_documents(self, query: str, candidate_db_ids: Set[int]) -> list[str]:
+    async def select_documents(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
         if not candidate_db_ids:
             return []
 
@@ -260,16 +235,11 @@ class SuperTreeIndex:
         if not response:
             return []
 
-        # Parse JSON response
-        try:
-            data = json.loads(response) if response.strip().startswith("{") else {}
-        except json.JSONDecodeError:
+        # Parse JSON response (handles markdown code blocks, etc.)
+        data = extract_json(response)
+        if not isinstance(data, dict):
             data = {}
-
-        if isinstance(data, dict):
-            doc_ids = data.get("doc_ids", [])
-        else:
-            doc_ids = []
+        doc_ids = data.get("doc_ids", [])
 
         # Map back to UUIDs
         uuid_results = []
@@ -300,12 +270,13 @@ class SuperTreeIndex:
 
             # Sort by child count (more children = more structurally important)
             nodes_with_children = []
-            for node in top_nodes:
-                children = self.db._connect().execute(
-                    "SELECT COUNT(*) FROM nodes WHERE parent_node_id = ?",
-                    (node.get("node_id"),),
-                ).fetchone()[0]
-                nodes_with_children.append((node, children))
+            with self.db._connect() as conn:
+                for node in top_nodes:
+                    children = conn.execute(
+                        "SELECT COUNT(*) FROM nodes WHERE parent_node_id = ?",
+                        (node.get("node_id"),),
+                    ).fetchone()[0]
+                    nodes_with_children.append((node, children))
 
             nodes_with_children.sort(key=lambda x: x[1], reverse=True)
             selected = nodes_with_children[:self._MAX_TOP_NODES_PER_DOC]

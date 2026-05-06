@@ -173,18 +173,6 @@ class PageIndexClient:
                 logging.warning("Failed to persist to db: %s", e)
 
         logging.info("Indexing complete. Document ID: %s", doc_id)
-        if self.closet_index and doc_id in self._uuid_to_db:
-            db_id = self._uuid_to_db[doc_id]
-            doc = self.documents.get(doc_id, {})
-            try:
-                self.closet_index.add_document(
-                    db_id,
-                    doc.get("doc_name", ""),
-                    doc.get("doc_description", ""),
-                    doc.get("structure", [])
-                )
-            except Exception as e:
-                logging.warning("Failed to index closet tags: %s", e)
         if self.workspace:
             self._save_doc(doc_id)
         return doc_id

@@ -108,7 +108,7 @@ class TestSearchSuperTree:
     @pytest.mark.asyncio
     async def test_prefilter_returns_empty(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = set()
+        mock_st.prefilter.return_value = {}
         router.super_tree_index = mock_st
 
         result = await router._search_super_tree("test query", top_k=3)
@@ -119,7 +119,7 @@ class TestSearchSuperTree:
     @pytest.mark.asyncio
     async def test_select_documents_returns_empty(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {1, 2}
+        mock_st.prefilter.return_value = {1: 2.0, 2: 1.0}
         mock_st.select_documents = AsyncMock(return_value=[])
         router.super_tree_index = mock_st
 
@@ -127,12 +127,12 @@ class TestSearchSuperTree:
         assert result["answer"] == "Super-Tree selection returned no documents."
         assert result["confidence"] == "low"
         mock_st.prefilter.assert_called_once_with("test query")
-        mock_st.select_documents.assert_awaited_once_with("test query", {1, 2})
+        mock_st.select_documents.assert_awaited_once_with("test query", {1: 2.0, 2: 1.0})
 
     @pytest.mark.asyncio
     async def test_full_super_tree_path(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {1}
+        mock_st.prefilter.return_value = {1: 1.0}
         mock_st.select_documents = AsyncMock(return_value=["uuid-1"])
         router.super_tree_index = mock_st
 
@@ -165,7 +165,7 @@ class TestSearchSuperTree:
     @pytest.mark.asyncio
     async def test_act_phase_failure(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {1}
+        mock_st.prefilter.return_value = {1: 1.0}
         mock_st.select_documents = AsyncMock(return_value=["uuid-1"])
         router.super_tree_index = mock_st
 
@@ -179,7 +179,7 @@ class TestSearchSuperTree:
     @pytest.mark.asyncio
     async def test_verifier_refuse(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {1}
+        mock_st.prefilter.return_value = {1: 1.0}
         mock_st.select_documents = AsyncMock(return_value=["uuid-1"])
         router.super_tree_index = mock_st
 
@@ -206,7 +206,7 @@ class TestSearchRouting:
     @pytest.mark.asyncio
     async def test_uses_super_tree_when_available(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {1}
+        mock_st.prefilter.return_value = {1: 1.0}
         mock_st.select_documents = AsyncMock(return_value=["uuid-1"])
         router.super_tree_index = mock_st
 
@@ -224,8 +224,6 @@ class TestSearchRouting:
             result = await router.search("test query", top_k=3)
 
         assert result["answer"] == "ans"
-        # v2 should NOT have been called
-        router._search_v2 = AsyncMock()
 
     @pytest.mark.asyncio
     async def test_fallback_to_v2_on_super_tree_failure(self, router):

@@ -27,7 +27,13 @@ async def _mock_llm_acompletion(*a, **k):
     return None
 utils_mod.llm_acompletion = _mock_llm_acompletion
 utils_mod.count_tokens = lambda text, model=None: len(text or "") // 4
-utils_mod.extract_json = lambda *a, **k: None
+def _mock_extract_json(text):
+    import json
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+utils_mod.extract_json = _mock_extract_json
 
 # Also need pageindex.closet_index for the _STOPWORDS import.
 closet_spec = importlib.util.spec_from_file_location("pageindex.closet_index", super_tree_path / "closet_index.py")
@@ -148,7 +154,7 @@ class TestSuperTreeIndex:
     def test_prefilter_empty_db(self, super_tree_index):
         st, db, client = super_tree_index
         result = st.prefilter("前端")
-        assert result == set()
+        assert result == {}
 
     def test_prefilter_with_keyword_match(self, super_tree_index):
         st, db, client = super_tree_index
@@ -187,5 +193,5 @@ class TestSuperTreeIndex:
             client._uuid_to_db = {"uuid-1": 1}
             db.insert_document("test.pdf", "/tmp/test.pdf")
 
-            result = await st.select_documents("test", {1})
+            result = await st.select_documents("test", {1: 1.0})
             assert "uuid-1" in result
