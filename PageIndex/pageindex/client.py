@@ -13,6 +13,7 @@ from .page_index_md import md_to_tree
 from .retrieve import get_document, get_document_structure, get_page_content
 from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, create_node_mapping
 from .closet_index import ClosetIndex
+from .super_tree import SuperTreeIndex
 
 # Optional: db.py lives at project root; gracefully degrade if unavailable.
 try:
@@ -65,12 +66,14 @@ class PageIndexClient:
         # Optional persistent layer for agentic retrieval
         self.db = None
         self.closet_index = None
+        self.super_tree_index = None
         self.router = None
         self._uuid_to_db: dict[str, int] = {}
 
         if db_path and PageIndexDB:
             self.db = PageIndexDB(db_path)
             self.closet_index = ClosetIndex(self.db, self.model)
+            self.super_tree_index = SuperTreeIndex(self.db, self.model, self)
             if AgenticRouter:
                 self.router = AgenticRouter(self, self.model)
 
@@ -163,6 +166,9 @@ class PageIndexClient:
                         doc.get('doc_description', ''),
                         doc['structure']
                     )
+                # Index Super-Tree keywords
+                if hasattr(self, 'super_tree_index') and self.super_tree_index:
+                    self.super_tree_index.on_document_added(db_doc_id)
             except Exception as e:
                 logging.warning("Failed to persist to db: %s", e)
 

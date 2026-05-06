@@ -6,6 +6,7 @@ from typing import List, Tuple, Dict
 from .planner import RetrievalPlanner
 from .strategies import MetadataStrategy, SemanticsStrategy, DescriptionStrategy
 from .verifier import CRAGVerifier
+from ..super_tree import SuperTreeIndex
 
 
 class AgenticRouter:
@@ -23,6 +24,10 @@ class AgenticRouter:
 
         if hasattr(client, "closet_index") and client.closet_index:
             self.semantics_strategy = SemanticsStrategy(client.closet_index)
+
+        self.super_tree_index = None
+        if hasattr(client, "super_tree_index") and client.super_tree_index:
+            self.super_tree_index = client.super_tree_index
 
     # ------------------------------------------------------------------
     # Lazy import of main.py helpers (avoid circular deps at import time)
@@ -211,9 +216,125 @@ class AgenticRouter:
         return "\n\n".join(contexts), all_nodes, source_docs, len(all_nodes), doc_pages_map
 
     # ------------------------------------------------------------------
-    # Public search
+    # Super-Tree search
     # ------------------------------------------------------------------
-    async def search(self, query: str, top_k: int = 3) -> Dict:
+    async def _search_super_tree(self, query: str, top_k: int = 3) -> Dict:
+        """L0 prefilter → L1 Super-Tree selection → L2/L3 Act → Verify."""
+        # L0: Dual-channel prefilter
+        candidate_db_ids = self.super_tree_index.prefilter(query)
+        if not candidate_db_ids:
+            return {
+                "query": query,
+                "mode": "multi",
+                "answer": "No relevant documents found in prefilter.",
+                "confidence": "low",
+                "matched_docs": [],
+                "selected_nodes": [],
+                "pages": [],
+            }
+
+        # L1: Super-Tree LLM selection
+        selected_uuids = await self.super_tree_index.select_documents(query, candidate_db_ids)
+        if not selected_uuids:
+            return {
+                "query": query,
+                "mode": "multi",
+                "answer": "Super-Tree selection returned no documents.",
+                "confidence": "low",
+                "matched_docs": [],
+                "selected_nodes": [],
+                "pages": [],
+            }
+
+        # Build matched_docs with scores (all selected get score 1.0)
+        matched = [{"doc_id": doc_id, "score": 1.0} for doc_id in selected_uuids]
+
+        # L2/L3: Act — tree search on selected documents (reuse existing _act_tree_search)
+        try:
+            ctx, nodes, src_docs, cov_nodes, doc_pages_map = await self._act_tree_search(
+                query, selected_uuids
+            )
+        except Exception as e:
+            logging.warning("Act phase failed: %s", e)
+            return {
+                "query": query,
+                "mode": "multi",
+                "answer": f"Failed to retrieve content: {e}",
+                "confidence": "unknown",
+                "matched_docs": matched,
+                "selected_nodes": [],
+                "pages": [],
+            }
+
+        if not ctx:
+            return {
+                "query": query,
+                "mode": "multi",
+                "answer": "No relevant content found.",
+                "confidence": "low",
+                "matched_docs": matched,
+                "selected_nodes": [],
+                "pages": [],
+            }
+
+        # Generate answer
+        funcs = self._load_main_funcs()
+        generate_answer = funcs.get("generate_answer")
+        if not generate_answer:
+            return {
+                "query": query,
+                "mode": "multi",
+                "answer": "Answer generation not available.",
+                "confidence": "unknown",
+                "matched_docs": matched,
+                "selected_nodes": [],
+                "pages": [],
+            }
+
+        answer = generate_answer(query, ctx)
+
+        # Verify
+        v = await asyncio.to_thread(
+            self.verifier.verify, answer, ctx, query, src_docs, cov_nodes
+        )
+        if v.action == "refuse":
+            return {
+                "query": query,
+                "mode": "multi",
+                "answer": "I don't know.",
+                "confidence": "low",
+                "matched_docs": matched,
+                "selected_nodes": [
+                    {"node_id": n.get("node_id"), "title": n.get("title")}
+                    for n in nodes
+                ],
+                "pages": [
+                    {"doc_id": d, "pages": p}
+                    for d, p in doc_pages_map.items()
+                ],
+            }
+
+        conf = "high" if v.action == "answer" else "medium"
+        return {
+            "query": query,
+            "mode": "multi",
+            "answer": answer,
+            "confidence": conf,
+            "matched_docs": matched,
+            "selected_nodes": [
+                {"node_id": n.get("node_id"), "title": n.get("title")}
+                for n in nodes
+            ],
+            "pages": [
+                {"doc_id": d, "pages": p}
+                for d, p in doc_pages_map.items()
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # v2 search (Plan -> Route -> Act -> Verify)
+    # ------------------------------------------------------------------
+    async def _search_v2(self, query: str, top_k: int = 3) -> Dict:
         # Plan
         plan = await self.planner.plan(query)
 
@@ -390,3 +511,15 @@ class AgenticRouter:
                 for d, p in doc_pages_map.items()
             ],
         }
+
+    # ------------------------------------------------------------------
+    # Public search
+    # ------------------------------------------------------------------
+    async def search(self, query: str, top_k: int = 3) -> Dict:
+        """Try Super-Tree first, fallback to v2 on any failure."""
+        if self.super_tree_index:
+            try:
+                return await self._search_super_tree(query, top_k)
+            except Exception as e:
+                logging.warning("Super-Tree search failed, falling back to v2: %s", e)
+        return await self._search_v2(query, top_k)
