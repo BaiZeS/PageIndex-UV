@@ -67,6 +67,21 @@ class PageIndexDB:
 
                 CREATE INDEX IF NOT EXISTS idx_closet_tags_token
                     ON closet_tags(doc_id, tag_token);
+
+                CREATE TABLE IF NOT EXISTS doc_keywords (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    keyword TEXT NOT NULL,
+                    field TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_doc_keywords ON doc_keywords(keyword, doc_id);
+
+                CREATE TABLE IF NOT EXISTS kb_identity (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    identity_text TEXT NOT NULL,
+                    doc_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
             # Migrate: add doc_description if missing
@@ -139,6 +154,13 @@ class PageIndexDB:
         conn = self._connect()
         row = conn.execute(
             "SELECT * FROM documents WHERE pdf_name = ?", (pdf_name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_document_by_id(self, doc_id):
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT * FROM documents WHERE id = ?", (doc_id,)
         ).fetchone()
         return dict(row) if row else None
 
@@ -270,4 +292,69 @@ class PageIndexDB:
         # Sort by score descending, take top_k
         sorted_docs = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:top_k]
         return sorted_docs
+
+    def insert_doc_keywords(self, doc_id, records):
+        if not records:
+            return
+        with self._connect() as conn:
+            conn.execute("DELETE FROM doc_keywords WHERE doc_id = ?", (doc_id,))
+            chunk = []
+            for record in records:
+                chunk.append(record)
+                if len(chunk) >= 50:
+                    conn.executemany(
+                        "INSERT INTO doc_keywords (doc_id, keyword, field) VALUES (?, ?, ?)",
+                        chunk,
+                    )
+                    chunk = []
+            if chunk:
+                conn.executemany(
+                    "INSERT INTO doc_keywords (doc_id, keyword, field) VALUES (?, ?, ?)",
+                    chunk,
+                )
+
+    def delete_doc_keywords(self, doc_id):
+        with self._connect() as conn:
+            conn.execute("DELETE FROM doc_keywords WHERE doc_id = ?", (doc_id,))
+
+    def match_doc_keywords(self, tokens, top_k=10):
+        if not tokens:
+            return []
+        results = []
+        conn = self._connect()
+        for i in range(0, len(tokens), SQLITE_MAX_VARIABLE_NUMBER):
+            chunk = tokens[i:i + SQLITE_MAX_VARIABLE_NUMBER]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = f"""
+                SELECT doc_id, COUNT(*) AS score
+                FROM doc_keywords
+                WHERE keyword IN ({placeholders})
+                GROUP BY doc_id
+            """
+            rows = conn.execute(sql, chunk).fetchall()
+            results.extend(rows)
+        merged = {}
+        for r in results:
+            merged[r["doc_id"]] = merged.get(r["doc_id"], 0) + r["score"]
+        sorted_docs = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        return sorted_docs
+
+    def set_kb_identity(self, identity_text, doc_count):
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO kb_identity (id, identity_text, doc_count, updated_at)
+                VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    identity_text = excluded.identity_text,
+                    doc_count = excluded.doc_count,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (identity_text, doc_count),
+            )
+
+    def get_kb_identity(self):
+        conn = self._connect()
+        row = conn.execute("SELECT identity_text FROM kb_identity WHERE id = 1").fetchone()
+        return row["identity_text"] if row else None
 

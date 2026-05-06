@@ -20,21 +20,27 @@
 
 ### 多文档检索 (Multi-Document RAG)
 
-在单文档模式的基础上，`main.py` 现已支持**多文档联合问答**。该模式采用 **L1 → L2 → L3 三层检索 + Token 预算控制** 的架构，解决了传统多文档方案中常见的上下文爆炸和双重 LLM 筛选问题。
+在单文档模式的基础上，`main.py` 现已支持**多文档联合问答**。该模式采用 **Super-Tree Retrieval v3 架构**：L0 双通道预过滤 → L1 Super-Tree LLM 选档 → L2/L3 树推理与上下文提取，解决了传统多文档方案中常见的上下文爆炸和双重 LLM 筛选问题。
 
 ```
 User Question
     │
     ▼
-┌─────────────────┐  L1: 文档目录层 (Doc Catalog)
-│ 文档筛选         │  → 从 SQLite `documents` 读取所有文档元数据
-│ Top-K 选择       │  → LLM 轻量筛选，最多选出 3 个最相关文档
+┌─────────────────┐  L0: 双通道预过滤 (Dual-Channel Prefilter)
+│ 候选文档召回     │  → Channel A: ClosetIndex 语义标签匹配
+│ (SuperTreeIndex) │  → Channel B: KeywordIndex jieba 倒排索引
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐  L1: Super-Tree 文档选择 (Doc Selection)
+│ LLM 推理选档     │  → 基于 mini-TOC + KB Identity 上下文
+│ (SuperTreeIndex) │  → 6000 tokens 预算，最多 50 候选 → 3-5 精选
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐  L2: 节点召回层 (Node Recall)
 │ 逐文档树推理     │  → 对每个命中文档独立调用树推理
-│ Top-N 节点/文档  │  → 避免一次性把所有文档的树塞进一个 prompt
+│ (AgenticRouter)  │  → 避免一次性把所有文档的树塞进一个 prompt
 └────────┬────────┘
          │
          ▼
@@ -46,6 +52,11 @@ User Question
          ▼
     Answer Generation
 ```
+
+**架构特点**：
+- **零向量依赖**：纯结构化数据（JSON 树 + jieba 分词 + SQLite），无需 Embedding 或向量数据库
+- **自动降级**：L1 Super-Tree 失败时自动回退到 v2 三策略并行路由（Metadata + Semantics + Description + RRF 融合）
+- **KB Identity**：懒加载的知识库整体摘要，为 LLM 选档提供全局上下文
 
 这种方式比传统的 Chunking + Vector Search 更精准，因为它保留了文档的上下文逻辑结构。同时，通过 SQLite 缓存页面内容，避免了每次查询都重新解析 PDF，大幅提升了问答响应速度。
 
@@ -83,13 +94,21 @@ User Question
 │   ├── pageindex/             # 核心包
 │   │   ├── page_index.py      # PDF 结构化索引生成逻辑
 │   │   ├── page_index_md.py   # Markdown 结构化索引生成逻辑
+│   │   ├── closet_index.py    # Closet 语义标签索引（jieba + SQLite 倒排）
+│   │   ├── super_tree.py      # Super-Tree 检索：KeywordIndex + KBIdentity + SuperTreeIndex
+│   │   ├── client.py          # PageIndexClient（单/多文档检索统一入口）
+│   │   ├── agentic/           # Agentic 多策略路由（v2 备用路径）
+│   │   │   ├── router.py      # AgenticRouter：Plan→Route→Act→Verify
+│   │   │   ├── planner.py     # RetrievalPlanner：Query 分析 + HyDE
+│   │   │   ├── strategies.py  # 三策略：Metadata / Semantics / Description
+│   │   │   └── verifier.py    # CRAGVerifier：置信度验证 + 三阈值路由
 │   │   └── utils.py           # 通用工具函数 (API 调用, Token 计数等)
 │   ├── cookbook/              # Jupyter Notebook 示例
 │   └── run_pageindex.py       # 命令行工具入口
 ├── deploy/                    # 部署配置
 │   └── mcp-config.json        # Claude Desktop MCP 配置模板
 ├── logs/                      # 运行日志和输出结果
-├── db.py                      # SQLite 缓存层（节点、页面、文档元数据）
+├── db.py                      # SQLite 缓存层（节点、页面、文档元数据、关键词、KB 摘要）
 ├── main.py                    # 交互式问答主入口（统一多文档入口，命令驱动文档管理）
 ├── server.py                  # MCP 服务主文件（SSE + API Key 认证）
 ├── Dockerfile                 # Docker 镜像构建
@@ -101,10 +120,19 @@ User Question
 
 ### 关键文件说明
 
-*   **`db.py`**: 新增的 SQLite 持久化层。包含 `PageIndexDB` 类，负责：
+*   **`db.py`**: SQLite 持久化层。包含 `PageIndexDB` 类，负责：
     *   `documents` 表：记录每个 PDF 的文件名、路径、简化后的树结构 JSON 和文档描述 `doc_description`。
-    *   `nodes` 表：扁平化存储每个节点的 `node_id`、`title`、`summary`、`start_index`、`end_index` 和 `parent_node_id`。`insert_nodes` 接收调用方准备好的扁平记录列表，避免在持久化层遍历树结构。
-    *   `pages` 表：存储每页的预提取文本内容，后续查询直接通过 SQL 读取，无需重新打开 PDF。`insert_pages` 接收调用方提取好的 `(doc_id, page_number, content)` 记录列表。
+    *   `nodes` 表：扁平化存储每个节点的 `node_id`、`title`、`summary`、`start_index`、`end_index` 和 `parent_node_id`。
+    *   `pages` 表：存储每页的预提取文本内容，后续查询直接通过 SQL 读取，无需重新打开 PDF。
+    *   `closet_tags` 表：语义标签倒排索引，用于 Semantics 策略的文档召回。
+    *   `doc_keywords` 表：jieba 分词后的关键词倒排索引，用于 Super-Tree L0 预过滤的 Channel B。
+    *   `kb_identity` 表：知识库整体摘要缓存（单行），为 Super-Tree L1 提供全局上下文。
+*   **`super_tree.py`**: Super-Tree Retrieval v3 核心实现，包含三个类：
+    *   `KeywordIndex`: jieba 中文分词 + SQLite 倒排索引，索引文档名和描述。
+    *   `KBIdentity`: 懒加载的知识库整体摘要，LLM 生成（基于文档名和顶层章节），失败时回退到文档列表拼接。
+    *   `SuperTreeIndex`: L0 双通道预过滤（ClosetIndex + KeywordIndex）+ L1 LLM 文档选择（基于 mini-TOC 和 KB Identity）。
+*   **`agentic/router.py`**: Agentic 多策略路由（v2 备用路径）。`AgenticRouter.search()` 优先尝试 Super-Tree，失败时自动回退到 Plan→Route→Act→Verify 三策略并行路由。
+*   **`client.py`**: `PageIndexClient` 统一入口。初始化时自动创建 `ClosetIndex`、`SuperTreeIndex` 和 `AgenticRouter`；`index()` 完成后自动触发关键词索引和语义标签索引。
 *   **`main.py`**: 交互式问答入口。启动后直接进入多文档问答提示符，所有已缓存文档自动作为知识库。通过 `/add` 命令索引新文档，`/doc` 命令聚焦单文档，`/list` 查看文档列表。内部复用了统一的 LLM JSON 调用器、节点到页面的转换助手，并预缓存每棵树的 JSON 字符串加速 L1 文档筛选。
 *   **`server.py`**: MCP 服务主文件。基于 Starlette + uvicorn 构建，对外暴露 SSE 传输的 MCP 协议端点，同时提供独立的 HTTP `/upload` 文件上传接口和 `/health` 健康检查。内置 API Key 认证（`X-API-Key` Header）和 CORS 中间件，支持 Docker 容器化部署。
 
@@ -157,11 +185,17 @@ graph TD
 
 ### 2. 多文档检索原理 (Multi-Document Retrieval)
 
-多文档模式通过三层检索和严格的 Token 预算控制，实现了可扩展的跨文档问答：
+多文档模式通过 **Super-Tree Retrieval v3** 四层检索和严格的 Token 预算控制，实现了可扩展的跨文档问答：
 
-*   **L1 文档目录层 (Doc Catalog)**: 启动时只读取 SQLite `documents` 表的元数据，无需加载任何 PDF。LLM 根据用户问题和每个文档的名称、描述、顶层章节标题，筛选出最相关的 **Top-3 文档**。
-*   **L2 节点召回层 (Node Recall)**: 对每个 L1 命中文档，**独立**调用 `get_relevant_nodes` 进行树结构推理。这样每个 LLM call 只处理一棵树的规模，避免了 `main_tree.py` 中把所有文档的树一次性塞进 prompt 导致的精度下降问题。每文档最多召回 **5 个节点**。
-*   **L3 上下文提取层 (Context Extraction)**: 将命中节点转换为页面范围，从 `pages` 表读取文本。使用 `tiktoken` 对总上下文进行 **16K tokens 硬上限** 的截断。如果多个文档命中的页面总和超出预算，会按文档优先级逐步截断，并在最终 prompt 中标注 `[Truncated]`。
+*   **L0 双通道预过滤 (Dual-Channel Prefilter)**: `SuperTreeIndex.prefilter()` 并行执行两路召回：
+    *   **Channel A (语义)**: `ClosetIndex` 通过 jieba 分词匹配 `closet_tags` 表中的语义标签。
+    *   **Channel B (关键词)**: `KeywordIndex` 通过 jieba 分词匹配 `doc_keywords` 表中的文档名和描述关键词。
+    *   两路结果合并为候选文档集（最多 50 个），按匹配度评分排序。
+*   **L1 Super-Tree 文档选择 (Doc Selection)**: `SuperTreeIndex.select_documents()` 为每个候选文档构建 **mini-TOC**（仅保留 depth=1 节点，最多 8 个），结合 **KB Identity**（知识库整体摘要）作为上下文，通过一次 LLM 调用选出最相关的 **3-5 个文档**。总 prompt 控制在 **6000 tokens** 以内，超限时自动截断候选文档。
+*   **L2 节点召回层 (Node Recall)**: 对每个 L1 命中文档，**独立**调用 `get_relevant_nodes` 进行树结构推理。每个 LLM call 只处理一棵树的规模，避免多树混排导致的精度下降。每文档最多召回 **5 个节点**。
+*   **L3 上下文提取层 (Context Extraction)**: 将命中节点转换为页面范围，从 `pages` 表读取文本。使用 `tiktoken` 对总上下文进行 **16K tokens 硬上限** 的截断。超出预算时按文档优先级逐步截断，并在最终 prompt 中标注 `[Truncated]`。
+
+**降级策略**：L1 Super-Tree 任一阶段失败（预过滤空、LLM 选档失败、Act 阶段异常）时，`AgenticRouter.search()` 自动捕获异常并回退到 v2 的 **Plan→Route→Act→Verify** 三策略并行路由（Metadata + Semantics + Description + RRF 融合），确保系统始终可用。
 
 ### 3. SQLite 缓存加速
 
@@ -332,6 +366,33 @@ CREATE TABLE pages (
     page_number INTEGER NOT NULL,
     content TEXT NOT NULL,
     UNIQUE(doc_id, page_number)
+);
+
+-- Super-Tree Retrieval v3 新增表
+
+CREATE TABLE closet_tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    tag_text TEXT NOT NULL,
+    tag_token TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    source TEXT NOT NULL
+);
+CREATE INDEX idx_closet_tags_token ON closet_tags(doc_id, tag_token);
+
+CREATE TABLE doc_keywords (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    keyword TEXT NOT NULL,
+    field TEXT NOT NULL
+);
+CREATE INDEX idx_doc_keywords ON doc_keywords(keyword, doc_id);
+
+CREATE TABLE kb_identity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    identity_text TEXT NOT NULL,
+    doc_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
 

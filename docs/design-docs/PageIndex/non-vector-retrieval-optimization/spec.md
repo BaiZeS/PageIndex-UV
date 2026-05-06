@@ -218,3 +218,4 @@ async def search(self, query: str, top_k: int = 3) -> dict
 |------|----------|------|
 | 2026-04-30 | v1: Closet + Tree 两层方案 | AI + User |
 | 2026-05-05 | v2: 升级为 Agentic 多策略路由 | AI + User |
+| 2026-05-06 | v3: 前置 Super-Tree L0+L1 筛选，详见 `../super-tree-retrieval-v3/spec.md` | AI + User |
