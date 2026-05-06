@@ -1,7 +1,9 @@
+import json
 import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -71,3 +73,50 @@ class TestKeywordIndex:
         ki.remove_document(doc_id)
         results = ki.search("test")
         assert len(results) == 0
+
+
+KBIdentity = super_tree_mod.KBIdentity
+
+
+@pytest.fixture
+def kb_identity():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    db = PageIndexDB(path)
+    ki = KBIdentity(db, model="qwen-plus")
+    yield ki, db
+    db.close()
+    os.unlink(path)
+
+
+class TestKBIdentity:
+    def test_fallback_when_no_docs(self, kb_identity):
+        ki, db = kb_identity
+        identity = ki.get_identity()
+        assert "暂无文档" in identity
+
+    def test_fallback_when_cache_miss(self, kb_identity):
+        ki, db = kb_identity
+        db.insert_document("test.pdf", "/tmp/test.pdf")
+        identity = ki.get_identity()
+        assert "test.pdf" in identity
+
+    def test_llm_generation(self, kb_identity):
+        with patch.object(super_tree_mod, "llm_completion") as mock_llm:
+            mock_llm.return_value = '{"summary": "知识库共1个文档，主题：测试"}'
+            ki, db = kb_identity
+            db.insert_document("test.pdf", "/tmp/test.pdf", doc_description="测试文档")
+            identity = ki.get_identity()
+            assert "测试" in identity
+            mock_llm.assert_called_once()
+
+    def test_invalidate_and_rebuild(self, kb_identity):
+        ki, db = kb_identity
+        db.insert_document("old.pdf", "/tmp/old.pdf")
+        identity1 = ki.get_identity()
+        assert "old.pdf" in identity1
+
+        ki.invalidate()
+        db.insert_document("new.pdf", "/tmp/new.pdf")
+        identity2 = ki.get_identity()
+        assert "new.pdf" in identity2
