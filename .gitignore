@@ -1,13 +1,41 @@
+# ===== Python: 缓存 / 字节码 =====
 __pycache__/
 *.pyc
 *.pyo
+
+# ===== 构建产物 =====
 *.egg-info/
-PageIndex/tests/pdfs/
-*.pdf
-logs/
-*.db
-.env
+
+# ===== 虚拟环境 / 依赖 =====
 .venv/
+
+# ===== 测试 / 工具运行时缓存 =====
+.pytest_cache/
+
+# ===== CodeGraph 索引(本地产物: SQLite + 日志) =====
+.codegraph/
+
+# ===== 运行时数据 / 日志 =====
+logs/
+
+# ===== 数据库文件 =====
+*.db
+
+# ===== 环境变量 / 凭据 =====
+.env
+
+# ===== 大文件(PDF 等) =====
+*.pdf
+
+# ===== 历史路径遗留产物(重构前结构) =====
+PageIndex/tests/pdfs/
 PageIndex/tests/results/
 docs/mempalace/
+
+# ===== Git worktree =====
 .worktrees/
+
+# ===== AI 助手本地配置(不提交) =====
+.claude/
+CLAUDE.md
+AGENTS.md
