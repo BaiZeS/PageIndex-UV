@@ -3,9 +3,16 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+# Other test modules (test_router.py, test_super_tree.py) pre-seed
+# sys.modules["pageindex_mutil.utils"] with a stub that overrides count_tokens
+# with a coarse char-based approximation. That stub leaks across the test
+# session and would skew _score_retrieval's token math here. Evict any
+# previously-injected stub so the REAL pageindex_mutil.utils is bound.
+for _mod_name in list(sys.modules):
+    if _mod_name == "pageindex_mutil.utils" or _mod_name.startswith("pageindex_mutil.agentic"):
+        del sys.modules[_mod_name]
 
-from PageIndex.pageindex.agentic.verifier import CRAGVerifier, VerifyResult
+from pageindex_mutil.agentic.verifier import CRAGVerifier, VerifyResult
 
 
 def test_to_bool_normalization():

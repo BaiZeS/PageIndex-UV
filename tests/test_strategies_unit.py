@@ -3,9 +3,7 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-
-from PageIndex.pageindex.agentic.strategies import MetadataStrategy
+from pageindex_mutil.agentic.strategies import MetadataStrategy
 
 
 def test_metadata_strategy_empty_query():

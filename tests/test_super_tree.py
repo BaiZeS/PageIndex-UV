@@ -5,22 +5,22 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 from db import PageIndexDB
 
 # Avoid triggering __init__.py imports that pull in heavy deps like PyPDF2.
-super_tree_path = Path(__file__).parent.parent.parent / "PageIndex" / "pageindex"
+super_tree_path = Path(__file__).parent.parent / "pageindex_mutil"
 sys.path.insert(0, str(super_tree_path))
 
 # Make relative import in super_tree.py work by creating a fake package context.
 import importlib.util
 
 # Pre-seed pageindex.utils so closet_index.py won't fail on its own relative import.
-utils_spec = importlib.util.spec_from_file_location("pageindex.utils", super_tree_path / "utils.py")
+utils_spec = importlib.util.spec_from_file_location("pageindex_mutil.utils", super_tree_path / "utils.py")
 utils_mod = importlib.util.module_from_spec(utils_spec)
-sys.modules["pageindex.utils"] = utils_mod
+sys.modules["pageindex_mutil.utils"] = utils_mod
 # utils.py may also have missing deps; stub out the names closet_index needs.
 utils_mod.llm_completion = lambda *a, **k: None
 async def _mock_llm_acompletion(*a, **k):
@@ -36,14 +36,14 @@ def _mock_extract_json(text):
 utils_mod.extract_json = _mock_extract_json
 
 # Also need pageindex.closet_index for the _STOPWORDS import.
-closet_spec = importlib.util.spec_from_file_location("pageindex.closet_index", super_tree_path / "closet_index.py")
+closet_spec = importlib.util.spec_from_file_location("pageindex_mutil.closet_index", super_tree_path / "closet_index.py")
 closet_mod = importlib.util.module_from_spec(closet_spec)
-sys.modules["pageindex.closet_index"] = closet_mod
+sys.modules["pageindex_mutil.closet_index"] = closet_mod
 closet_spec.loader.exec_module(closet_mod)
 
-spec = importlib.util.spec_from_file_location("pageindex.super_tree", super_tree_path / "super_tree.py")
+spec = importlib.util.spec_from_file_location("pageindex_mutil.super_tree", super_tree_path / "super_tree.py")
 super_tree_mod = importlib.util.module_from_spec(spec)
-sys.modules["pageindex.super_tree"] = super_tree_mod
+sys.modules["pageindex_mutil.super_tree"] = super_tree_mod
 spec.loader.exec_module(super_tree_mod)
 KeywordIndex = super_tree_mod.KeywordIndex
 

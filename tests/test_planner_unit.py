@@ -3,9 +3,7 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-
-from PageIndex.pageindex.agentic.planner import RetrievalPlanner, PlanResult
+from pageindex_mutil.agentic.planner import RetrievalPlanner, PlanResult
 
 
 def test_default_plan():

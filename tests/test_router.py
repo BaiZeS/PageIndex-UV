@@ -7,18 +7,18 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Avoid triggering __init__.py imports that pull in heavy deps like PyPDF2.
-pageindex_path = Path(__file__).parent.parent.parent / "PageIndex" / "pageindex"
+pageindex_path = Path(__file__).parent.parent / "pageindex_mutil"
 sys.path.insert(0, str(pageindex_path))
 
 import importlib.util
 
 # Pre-seed pageindex.utils so imports won't fail
-utils_spec = importlib.util.spec_from_file_location("pageindex.utils", pageindex_path / "utils.py")
+utils_spec = importlib.util.spec_from_file_location("pageindex_mutil.utils", pageindex_path / "utils.py")
 utils_mod = importlib.util.module_from_spec(utils_spec)
-sys.modules["pageindex.utils"] = utils_mod
+sys.modules["pageindex_mutil.utils"] = utils_mod
 utils_mod.llm_completion = lambda *a, **k: None
 async def _mock_llm_acompletion(*a, **k):
     return None
@@ -27,39 +27,39 @@ utils_mod.count_tokens = lambda text, model=None: len(text or "") // 4
 utils_mod.extract_json = lambda *a, **k: None
 
 # Pre-seed pageindex.closet_index for _STOPWORDS
-closet_spec = importlib.util.spec_from_file_location("pageindex.closet_index", pageindex_path / "closet_index.py")
+closet_spec = importlib.util.spec_from_file_location("pageindex_mutil.closet_index", pageindex_path / "closet_index.py")
 closet_mod = importlib.util.module_from_spec(closet_spec)
-sys.modules["pageindex.closet_index"] = closet_mod
+sys.modules["pageindex_mutil.closet_index"] = closet_mod
 closet_spec.loader.exec_module(closet_mod)
 
 # Pre-seed pageindex.super_tree
-super_tree_spec = importlib.util.spec_from_file_location("pageindex.super_tree", pageindex_path / "super_tree.py")
+super_tree_spec = importlib.util.spec_from_file_location("pageindex_mutil.super_tree", pageindex_path / "super_tree.py")
 super_tree_mod = importlib.util.module_from_spec(super_tree_spec)
-sys.modules["pageindex.super_tree"] = super_tree_mod
+sys.modules["pageindex_mutil.super_tree"] = super_tree_mod
 super_tree_spec.loader.exec_module(super_tree_mod)
 
 # Pre-seed pageindex.agentic.planner
-planner_spec = importlib.util.spec_from_file_location("pageindex.agentic.planner", pageindex_path / "agentic" / "planner.py")
+planner_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.planner", pageindex_path / "agentic" / "planner.py")
 planner_mod = importlib.util.module_from_spec(planner_spec)
-sys.modules["pageindex.agentic.planner"] = planner_mod
+sys.modules["pageindex_mutil.agentic.planner"] = planner_mod
 planner_spec.loader.exec_module(planner_mod)
 
 # Pre-seed pageindex.agentic.strategies
-strategies_spec = importlib.util.spec_from_file_location("pageindex.agentic.strategies", pageindex_path / "agentic" / "strategies.py")
+strategies_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.strategies", pageindex_path / "agentic" / "strategies.py")
 strategies_mod = importlib.util.module_from_spec(strategies_spec)
-sys.modules["pageindex.agentic.strategies"] = strategies_mod
+sys.modules["pageindex_mutil.agentic.strategies"] = strategies_mod
 strategies_spec.loader.exec_module(strategies_mod)
 
 # Pre-seed pageindex.agentic.verifier
-verifier_spec = importlib.util.spec_from_file_location("pageindex.agentic.verifier", pageindex_path / "agentic" / "verifier.py")
+verifier_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.verifier", pageindex_path / "agentic" / "verifier.py")
 verifier_mod = importlib.util.module_from_spec(verifier_spec)
-sys.modules["pageindex.agentic.verifier"] = verifier_mod
+sys.modules["pageindex_mutil.agentic.verifier"] = verifier_mod
 verifier_spec.loader.exec_module(verifier_mod)
 
 # Now load the router
-router_spec = importlib.util.spec_from_file_location("pageindex.agentic.router", pageindex_path / "agentic" / "router.py")
+router_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.router", pageindex_path / "agentic" / "router.py")
 router_mod = importlib.util.module_from_spec(router_spec)
-sys.modules["pageindex.agentic.router"] = router_mod
+sys.modules["pageindex_mutil.agentic.router"] = router_mod
 router_spec.loader.exec_module(router_mod)
 AgenticRouter = router_mod.AgenticRouter
 

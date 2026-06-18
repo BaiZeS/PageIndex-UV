@@ -1,10 +1,5 @@
 """Unit tests for _build_docs_info reverse mapping."""
 
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-
 
 class FakeDB:
     def __init__(self, docs):
@@ -25,7 +20,7 @@ class FakeClient:
 
 
 def test_build_docs_info_with_reverse_mapping():
-    from PageIndex.pageindex.agentic.router import AgenticRouter
+    from pageindex_mutil.agentic.router import AgenticRouter
 
     # DB has integer ids; client.documents has UUID keys
     db_docs = [
@@ -50,7 +45,7 @@ def test_build_docs_info_with_reverse_mapping():
 
 
 def test_build_docs_info_fallback_to_memory():
-    from PageIndex.pageindex.agentic.router import AgenticRouter
+    from pageindex_mutil.agentic.router import AgenticRouter
 
     client = FakeClient({"uuid-1": {"doc_name": "mem.pdf"}}, {})
     client.db = None

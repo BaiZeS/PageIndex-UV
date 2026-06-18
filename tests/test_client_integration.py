@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from db import PageIndexDB
 
@@ -18,7 +18,7 @@ class TestPageIndexClientSuperTree:
         # We need to mock PyPDF2 since client.py imports it at top level
         sys.modules["PyPDF2"] = MagicMock()
 
-        from PageIndex.pageindex.client import PageIndexClient
+        from pageindex_mutil.client import PageIndexClient
 
         fd, db_path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -36,7 +36,7 @@ class TestPageIndexClientSuperTree:
         """PageIndexClient without db_path should not have super_tree_index."""
         sys.modules["PyPDF2"] = MagicMock()
 
-        from PageIndex.pageindex.client import PageIndexClient
+        from pageindex_mutil.client import PageIndexClient
 
         client = PageIndexClient()
         assert hasattr(client, "super_tree_index")
@@ -47,7 +47,7 @@ class TestPageIndexClientSuperTree:
         """index() should call super_tree_index.on_document_added after DB insert."""
         sys.modules["PyPDF2"] = MagicMock()
 
-        from PageIndex.pageindex.client import PageIndexClient
+        from pageindex_mutil.client import PageIndexClient
 
         fd, db_path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -73,7 +73,7 @@ class TestPageIndexClientSuperTree:
                         "level": 1,
                     }
                 ]
-                with patch("PageIndex.pageindex.client.md_to_tree") as mock_md:
+                with patch("pageindex_mutil.client.md_to_tree") as mock_md:
                     mock_md.return_value = {
                         "doc_name": "test.md",
                         "doc_description": "A test markdown file",
