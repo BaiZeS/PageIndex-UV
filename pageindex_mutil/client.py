@@ -11,7 +11,7 @@ import PyPDF2
 from .page_index import page_index
 from .page_index_md import md_to_tree
 from .retrieve import get_document, get_document_structure, get_page_content
-from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, create_node_mapping
+from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, create_node_mapping, configure_llm
 from .closet_index import ClosetIndex
 from .super_tree import SuperTreeIndex
 
@@ -44,10 +44,11 @@ class PageIndexClient:
     For agent-based QA, see examples/agentic_vectorless_rag_demo.py.
     """
     def __init__(self, api_key: str = None, model: str = None, retrieve_model: str = None, workspace: str = None, db_path: str = None):
+        # Delegate LLM credentials/endpoint to the unified config source in utils.
+        # configure_llm() handles OPENAI_API_KEY + CHATGPT_API_KEY alias and rebuilds
+        # the shared OpenAI/AsyncOpenAI clients.
         if api_key:
-            os.environ["OPENAI_API_KEY"] = api_key
-        elif not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
-            os.environ["OPENAI_API_KEY"] = os.getenv("CHATGPT_API_KEY")
+            configure_llm(api_key=api_key)
         self.workspace = Path(workspace).expanduser() if workspace else None
         overrides = {}
         if model:

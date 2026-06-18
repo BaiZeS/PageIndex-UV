@@ -17,15 +17,77 @@ from pathlib import Path
 from types import SimpleNamespace as config
 from openai import OpenAI, AsyncOpenAI
 
-# Backward compatibility: support CHATGPT_API_KEY as alias for OPENAI_API_KEY
-if not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
-    os.environ["OPENAI_API_KEY"] = os.getenv("CHATGPT_API_KEY")
+# ---------------------------------------------------------------------------
+# Unified LLM configuration (single source of truth).
+# Replaces the previously duplicated key/endpoint resolution that existed in
+# utils.py, main.py, and client.py. Key priority:
+#   explicit arg > OPENAI_API_KEY > DASHSCOPE_API_KEY > CHATGPT_API_KEY alias.
+# Endpoint default: OPENAI_API_KEY-source -> standard OpenAI endpoint;
+# DASHSCOPE_API_KEY-source -> DashScope compatible-mode endpoint; none ->
+# standard OpenAI endpoint. Explicit `base_url` arg or OPENAI_BASE_URL env
+# always overrides either default.
+# ---------------------------------------------------------------------------
 
-_API_KEY = os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
-_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+_OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+_DASHSCOPE_DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
-_client = OpenAI(api_key=_API_KEY, base_url=_BASE_URL) if _API_KEY else None
-_async_client = AsyncOpenAI(api_key=_API_KEY, base_url=_BASE_URL) if _API_KEY else None
+_client = None
+_async_client = None
+
+
+def _resolve_llm_config(api_key=None, base_url=None):
+    """Single source of truth for LLM credentials/endpoint.
+
+    Key priority: explicit arg > OPENAI_API_KEY > DASHSCOPE_API_KEY > CHATGPT_API_KEY alias.
+    Endpoint default: OPENAI_API_KEY-source -> OpenAI; DASHSCOPE_API_KEY-source -> DashScope;
+    none -> standard OpenAI. Explicit base_url / OPENAI_BASE_URL env always overrides.
+    """
+    # CHATGPT_API_KEY alias: back-compat for callers that still set it.
+    if not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = os.getenv("CHATGPT_API_KEY")
+    explicit_openai = api_key or os.getenv("OPENAI_API_KEY")
+    key = explicit_openai or os.getenv("DASHSCOPE_API_KEY")
+    if base_url:
+        url = base_url
+    elif explicit_openai:
+        url = os.getenv("OPENAI_BASE_URL", _OPENAI_DEFAULT_BASE_URL)
+    elif os.getenv("DASHSCOPE_API_KEY"):
+        url = os.getenv("OPENAI_BASE_URL", _DASHSCOPE_DEFAULT_BASE_URL)
+    else:
+        url = os.getenv("OPENAI_BASE_URL", _OPENAI_DEFAULT_BASE_URL)
+    return key, url
+
+
+def configure_llm(api_key=None, base_url=None):
+    """(Re)initialize LLM clients. Returns (api_key, base_url). For runtime reconfig + tests."""
+    global _client, _async_client
+    key, url = _resolve_llm_config(api_key=api_key, base_url=base_url)
+    if key:
+        _client = OpenAI(api_key=key, base_url=url)
+        _async_client = AsyncOpenAI(api_key=key, base_url=url)
+    else:
+        _client = None
+        _async_client = None
+    return key, url
+
+
+def get_llm_config():
+    """Read-only accessor for the resolved (api_key, base_url)."""
+    return _resolve_llm_config()
+
+
+def get_llm_client():
+    """Accessor for the shared synchronous OpenAI client (or None if no key)."""
+    return _client
+
+
+def get_llm_async_client():
+    """Accessor for the shared asynchronous OpenAI client (or None if no key)."""
+    return _async_client
+
+
+# Initialize at import (preserves prior import-time behavior).
+configure_llm()
 
 
 def count_tokens(text, model=None):

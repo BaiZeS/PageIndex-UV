@@ -3,7 +3,6 @@ import sys
 import json
 import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from openai import OpenAI
 from dotenv import load_dotenv
 from types import SimpleNamespace
 from datetime import datetime
@@ -11,30 +10,33 @@ import fitz
 
 from db import PageIndexDB
 
-from pageindex_mutil.utils import extract_json, create_clean_structure_for_description, write_node_id, count_tokens
+from pageindex_mutil.utils import (
+    extract_json,
+    create_clean_structure_for_description,
+    write_node_id,
+    count_tokens,
+    configure_llm,
+    get_llm_config,
+    get_llm_client,
+)
 
 # Load environment variables
 load_dotenv()
 
-# Configuration
-API_KEY = os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
-BASE_URL = os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+# Unified LLM config: the single source of truth lives in
+# pageindex_mutil.utils (configure_llm / _resolve_llm_config). main.py used to
+# duplicate the key/endpoint resolution and build its own OpenAI client; it now
+# delegates to the shared configure_llm() and reuses the shared client. This
+# keeps main.py's `_call_llm_json` behavior identical (same client, same endpoint)
+# while ensuring there is exactly one resolution path across the project.
+configure_llm()
+client = get_llm_client()
+
+# MODEL_NAME is a *model name*, not client config — separate concern, kept here.
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen-plus")
 
-# Ensure environment variables are set for the PageIndex library
-if API_KEY:
-    os.environ["CHATGPT_API_KEY"] = API_KEY
-if BASE_URL:
-    os.environ["OPENAI_BASE_URL"] = BASE_URL
-
-if not API_KEY:
-    print("Warning: API Key not found. Please set DASHSCOPE_API_KEY or OPENAI_API_KEY environment variable.")
-
-try:
-    client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-except Exception as e:
-    print(f"Error initializing OpenAI client: {e}")
-    client = None
+if not get_llm_config()[0]:
+    print("Warning: API Key not found. Please set OPENAI_API_KEY or DASHSCOPE_API_KEY environment variable.")
 
 # Multi-doc context budget
 MAX_CONTEXT_TOKENS = 16000

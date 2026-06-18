@@ -1,3 +1,14 @@
+# ---------------------------------------------------------------------------
+# LLM endpoint defaults (resolved centrally in pageindex_mutil/utils.py via
+# _resolve_llm_config / configure_llm):
+#   * OPENAI_API_KEY      -> standard OpenAI endpoint (https://api.openai.com/v1)
+#   * DASHSCOPE_API_KEY   -> DashScope compatible-mode endpoint
+#                            (https://dashscope.aliyuncs.com/compatible-mode/v1)
+#   * OPENAI_BASE_URL     -> overrides either of the above when set
+# When using the standard OpenAI endpoint, set `model` and `retrieve_model`
+# below to an OpenAI model (e.g. gpt-4o-mini). The defaults below (`qwen-plus`)
+# target the DashScope/Qwen endpoint.
+# ---------------------------------------------------------------------------
 model: "qwen-plus"
 retrieve_model: "qwen-plus"
 toc_check_page_num: 20
