@@ -11,11 +11,7 @@ import fitz
 
 from db import PageIndexDB
 
-# Add PageIndex to path to allow imports
-base_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(base_dir, "PageIndex"))
-
-from pageindex.utils import extract_json, create_clean_structure_for_description, write_node_id, count_tokens
+from pageindex_mutil.utils import extract_json, create_clean_structure_for_description, write_node_id, count_tokens
 
 # Load environment variables
 load_dotenv()
@@ -52,7 +48,7 @@ def generate_structure(pdf_path, json_path):
     print("This may take a few minutes...")
 
     try:
-        from pageindex.page_index import page_index_main
+        from pageindex_mutil.page_index import page_index_main
 
         opt = SimpleNamespace(
             model=MODEL_NAME,

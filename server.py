@@ -15,10 +15,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-# Ensure project root is on path for imports
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).parent / "PageIndex"))
-
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -32,7 +28,7 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 import mcp.types as types
 
-from PageIndex.pageindex import PageIndexClient
+from pageindex_mutil import PageIndexClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pageindex-mcp")
