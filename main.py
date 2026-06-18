@@ -705,8 +705,8 @@ Any other input is treated as a question and answered using multi-document RAG.
 
 def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    pdf_dir = os.path.join(base_dir, "PageIndex", "tests", "pdfs")
-    results_dir = os.path.join(base_dir, "PageIndex", "tests", "results")
+    pdf_dir = os.path.join(base_dir, "tests", "pdfs")
+    results_dir = os.path.join(base_dir, "tests", "results")
     logs_dir = ensure_logs_dir(base_dir)
     db_path = os.path.join(base_dir, "pageindex.db")
 

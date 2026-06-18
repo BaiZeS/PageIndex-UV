@@ -90,21 +90,21 @@ User Question
 
 ```text
 .
-├── PageIndex/                 # 核心库代码（PageIndex 框架）
-│   ├── pageindex/             # 核心包
-│   │   ├── page_index.py      # PDF 结构化索引生成逻辑
-│   │   ├── page_index_md.py   # Markdown 结构化索引生成逻辑
-│   │   ├── closet_index.py    # Closet 语义标签索引（jieba + SQLite 倒排）
-│   │   ├── super_tree.py      # Super-Tree 检索：KeywordIndex + KBIdentity + SuperTreeIndex
-│   │   ├── client.py          # PageIndexClient（单/多文档检索统一入口）
-│   │   ├── agentic/           # Agentic 多策略路由（v2 备用路径）
-│   │   │   ├── router.py      # AgenticRouter：Plan→Route→Act→Verify
-│   │   │   ├── planner.py     # RetrievalPlanner：Query 分析 + HyDE
-│   │   │   ├── strategies.py  # 三策略：Metadata / Semantics / Description
-│   │   │   └── verifier.py    # CRAGVerifier：置信度验证 + 三阈值路由
-│   │   └── utils.py           # 通用工具函数 (API 调用, Token 计数等)
-│   ├── cookbook/              # Jupyter Notebook 示例
-│   └── run_pageindex.py       # 命令行工具入口
+├── pageindex_mutil/           # 核心库代码（PageIndex 框架）
+│   ├── page_index.py          # PDF 结构化索引生成逻辑
+│   ├── page_index_md.py       # Markdown 结构化索引生成逻辑
+│   ├── closet_index.py        # Closet 语义标签索引（jieba + SQLite 倒排）
+│   ├── super_tree.py          # Super-Tree 检索：KeywordIndex + KBIdentity + SuperTreeIndex
+│   ├── retrieve.py            # 单文档检索辅助（树推理 + TOC 兜底）
+│   ├── client.py              # PageIndexClient（单/多文档检索统一入口）
+│   ├── utils.py               # 通用工具函数 (API 调用, Token 计数等)
+│   ├── config.yaml            # 索引/检索参数配置
+│   └── agentic/               # Agentic 多策略路由（v2 备用路径）
+│       ├── router.py          # AgenticRouter：Plan→Route→Act→Verify
+│       ├── planner.py         # RetrievalPlanner：Query 分析 + HyDE
+│       ├── strategies.py      # 三策略：Metadata / Semantics / Description
+│       └── verifier.py        # CRAGVerifier：置信度验证 + 三阈值路由
+├── tests/                     # 测试套件（8 个测试文件）
 ├── deploy/                    # 部署配置
 │   └── mcp-config.json        # Claude Desktop MCP 配置模板
 ├── logs/                      # 运行日志和输出结果
@@ -127,12 +127,12 @@ User Question
     *   `closet_tags` 表：语义标签倒排索引，用于 Semantics 策略的文档召回。
     *   `doc_keywords` 表：jieba 分词后的关键词倒排索引，用于 Super-Tree L0 预过滤的 Channel B。
     *   `kb_identity` 表：知识库整体摘要缓存（单行），为 Super-Tree L1 提供全局上下文。
-*   **`super_tree.py`**: Super-Tree Retrieval v3 核心实现，包含三个类：
+*   **`pageindex_mutil/super_tree.py`**: Super-Tree Retrieval v3 核心实现，包含三个类：
     *   `KeywordIndex`: jieba 中文分词 + SQLite 倒排索引，索引文档名和描述。
     *   `KBIdentity`: 懒加载的知识库整体摘要，LLM 生成（基于文档名和顶层章节），失败时回退到文档列表拼接。
     *   `SuperTreeIndex`: L0 双通道预过滤（ClosetIndex + KeywordIndex）+ L1 LLM 文档选择（基于 mini-TOC 和 KB Identity）。
-*   **`agentic/router.py`**: Agentic 多策略路由（v2 备用路径）。`AgenticRouter.search()` 优先尝试 Super-Tree，失败时自动回退到 Plan→Route→Act→Verify 三策略并行路由。
-*   **`client.py`**: `PageIndexClient` 统一入口。初始化时自动创建 `ClosetIndex`、`SuperTreeIndex` 和 `AgenticRouter`；`index()` 完成后自动触发关键词索引和语义标签索引。
+*   **`pageindex_mutil/agentic/router.py`**: Agentic 多策略路由（v2 备用路径）。`AgenticRouter.search()` 优先尝试 Super-Tree，失败时自动回退到 Plan→Route→Act→Verify 三策略并行路由。
+*   **`pageindex_mutil/client.py`**: `PageIndexClient` 统一入口。初始化时自动创建 `ClosetIndex`、`SuperTreeIndex` 和 `AgenticRouter`；`index()` 完成后自动触发关键词索引和语义标签索引。
 *   **`main.py`**: 交互式问答入口。启动后直接进入多文档问答提示符，所有已缓存文档自动作为知识库。通过 `/add` 命令索引新文档，`/doc` 命令聚焦单文档，`/list` 查看文档列表。内部复用了统一的 LLM JSON 调用器、节点到页面的转换助手，并预缓存每棵树的 JSON 字符串加速 L1 文档筛选。
 *   **`server.py`**: MCP 服务主文件。基于 Starlette + uvicorn 构建，对外暴露 SSE 传输的 MCP 协议端点，同时提供独立的 HTTP `/upload` 文件上传接口和 `/health` 健康检查。内置 API Key 认证（`X-API-Key` Header）和 CORS 中间件，支持 Docker 容器化部署。
 
@@ -275,7 +275,7 @@ Cached documents (3):
 
 | 命令 | 说明 |
 |------|------|
-| `/add <pdf路径>` | 索引新文档。支持相对路径（自动在 `PageIndex/tests/pdfs` 中查找）或绝对路径 |
+| `/add <文件路径>` | 索引新文档。支持相对路径（自动在工作目录中查找）或绝对路径；支持单文件、glob 通配符或目录（递归收集 `.pdf`/`.md`） |
 | `/doc <编号>` | 临时聚焦单文档，进入子循环深入问答。输入 `..` 返回多文档模式 |
 | `/list` | 列出所有已缓存文档 |
 | `/help` | 显示帮助 |
@@ -283,7 +283,7 @@ Cached documents (3):
 
 **索引新文档示例**：
 ```
-> /add PageIndex/tests/pdfs/业务流入门.pdf
+> /add /path/to/业务流入门.pdf
 Indexing 业务流入门.pdf...
 Indexed successfully.
 
@@ -293,17 +293,11 @@ Indexed successfully.
 
 **日志记录**: 问答日志保存在 `logs/qa_multidoc_YYYYMMDD.jsonl` 中，包含命中文档、截断标志和每文档 Token 用量。
 
-#### 方式二：命令行工具 (CLI)
-
-通过 `PageIndex/run_pageindex.py` 可以更灵活地处理文件，仅用于生成索引文件。
-
-```bash
-# 处理 PDF
-uv run PageIndex/run_pageindex.py --pdf_path "path/to/document.pdf" --model "qwen-plus"
-
-# 处理 Markdown
-uv run PageIndex/run_pageindex.py --md_path "path/to/document.md"
-```
+> **关于命令行索引**：本项目不再提供独立的 `run_pageindex.py` 程序化 CLI。文档索引导入由两种方式完成：
+> 1. 通过上面的交互式 `main.py`，使用 `/add <文件路径>` 命令（支持单文件、glob、目录）。
+> 2. 通过 `server.py` MCP 服务的 `/upload` 端点（见下方 [MCP 服务部署](#mcp-服务部署) 章节），支持 PDF/Markdown 文件上传即索引。
+>
+> 若需在代码中直接调用索引管线，可 `from pageindex_mutil import PageIndexClient` 后调用 `client.index(pdf_path)`。
 
 ---
 
@@ -526,6 +520,6 @@ curl -X POST \
 ## 审计与迭代说明
 
 *   **版本控制**: 本项目使用 `pyproject.toml` 和 `uv.lock` 严格锁定依赖版本，确保环境一致性。
-*   **代码规范**: 遵循 Python 标准代码风格，核心逻辑位于 `PageIndex` 包内，`db.py` 和 `main.py` 保持清晰的职责边界，便于维护和复用。
+*   **代码规范**: 遵循 Python 标准代码风格，核心逻辑位于 `pageindex_mutil` 包内，`db.py` 和 `main.py` 保持清晰的职责边界，便于维护和复用。
 *   **日志**: 运行过程中的关键信息和生成的 JSON 结果会保存在 `logs/` 目录中，按日期分文件存储（`qa_YYYYMMDD.jsonl` / `qa_multidoc_YYYYMMDD.jsonl`），便于审计追踪。
 *   **性能优化**: 通过 SQLite 缓存消除了重复的 PDF 解析和树遍历，后续可考虑为 `nodes` 和 `pages` 表添加针对性索引以应对超大规模文档。
