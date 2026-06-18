@@ -89,7 +89,7 @@ User Question
 #### 4.2.1 文件结构
 
 ```
-PageIndex/pageindex/
+pageindex_mutil/
   super_tree.py     # KeywordIndex + KBIdentity + SuperTreeIndex
   closet_index.py   # ClosetIndex（v2 已有，复用）
   agentic/          # v2 已有，复用
@@ -187,9 +187,9 @@ CREATE TABLE kb_identity (
 | 文件 | 操作 | 说明 |
 |------|------|------|
 | `db.py` | 修改 | 新增 `doc_keywords`、`kb_identity` 表 + CRUD |
-| `PageIndex/pageindex/super_tree.py` | 新建 | KeywordIndex + KBIdentity + SuperTreeIndex |
-| `PageIndex/pageindex/agentic/router.py` | 修改 | 优先 Super-Tree，失败回退 v2 |
-| `PageIndex/pageindex/client.py` | 修改 | 初始化 SuperTreeIndex，索引时触发关键词索引 |
+| `pageindex_mutil/super_tree.py` | 新建 | KeywordIndex + KBIdentity + SuperTreeIndex |
+| `pageindex_mutil/agentic/router.py` | 修改 | 优先 Super-Tree，失败回退 v2 |
+| `pageindex_mutil/client.py` | 修改 | 初始化 SuperTreeIndex，索引时触发关键词索引 |
 
 ## 6. 测试计划
 

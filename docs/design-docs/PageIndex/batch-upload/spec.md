@@ -43,7 +43,7 @@
 ## 4. 验收标准
 
 1. `curl -F "file=@a.pdf" -F "file=@b.pdf" http://localhost:3000/upload` 能同时索引两个 PDF
-2. `> /add PageIndex/tests/pdfs/` 能递归索引目录下所有 PDF
+2. `> /add tests/pdfs/` 能递归索引目录下所有 PDF
 3. `> /add "*.pdf"` 能索引当前目录下所有 PDF
 4. 并发索引时最多 3 个同时进行
 5. 任一文件失败时其余文件继续处理

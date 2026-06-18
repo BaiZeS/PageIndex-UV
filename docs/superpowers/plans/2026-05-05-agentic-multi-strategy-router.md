@@ -16,13 +16,13 @@
 |------|--------|---------------|
 | `db.py` | Modify | Add `closet_tags` table with CRUD operations |
 | `pyproject.toml` | Modify | Add `jieba>=0.42` dependency |
-| `PageIndex/pageindex/closet_index.py` | Create | LLM tag extraction + jieba tokenization + SQLite inverted index |
-| `PageIndex/pageindex/agentic/__init__.py` | Create | Package marker |
-| `PageIndex/pageindex/agentic/planner.py` | Create | Query analysis, HyDE hypothetical answer, variant generation, weight assignment |
-| `PageIndex/pageindex/agentic/strategies.py` | Create | MetadataStrategy (SQL LIKE), SemanticsStrategy (Closet), DescriptionStrategy (LLM relevance) |
-| `PageIndex/pageindex/agentic/verifier.py` | Create | CRAG verifier: S_ret computation, S_CoV LLM judgment, three-threshold routing |
-| `PageIndex/pageindex/agentic/router.py` | Create | AgenticRouter: orchestrates Plan→Route→Act→Verify pipeline |
-| `PageIndex/pageindex/client.py` | Modify | Integrate PageIndexDB + ClosetIndex + AgenticRouter; add `async search()` |
+| `pageindex_mutil/closet_index.py` | Create | LLM tag extraction + jieba tokenization + SQLite inverted index |
+| `pageindex_mutil/agentic/__init__.py` | Create | Package marker |
+| `pageindex_mutil/agentic/planner.py` | Create | Query analysis, HyDE hypothetical answer, variant generation, weight assignment |
+| `pageindex_mutil/agentic/strategies.py` | Create | MetadataStrategy (SQL LIKE), SemanticsStrategy (Closet), DescriptionStrategy (LLM relevance) |
+| `pageindex_mutil/agentic/verifier.py` | Create | CRAG verifier: S_ret computation, S_CoV LLM judgment, three-threshold routing |
+| `pageindex_mutil/agentic/router.py` | Create | AgenticRouter: orchestrates Plan→Route→Act→Verify pipeline |
+| `pageindex_mutil/client.py` | Modify | Integrate PageIndexDB + ClosetIndex + AgenticRouter; add `async search()` |
 | `test_smoke.py` | Create | End-to-end smoke test |
 
 ---
@@ -123,12 +123,12 @@
 ### Task 2: ClosetIndex — Semantic Tag Index
 
 **Files:**
-- Create: `PageIndex/pageindex/closet_index.py`
-- Test: `PageIndex/tests/test_closet_index.py`
+- Create: `pageindex_mutil/closet_index.py`
+- Test: `tests/test_closet_index.py`
 
 - [ ] **Step 1: Write the failing test**
 
-  Create `PageIndex/tests/test_closet_index.py`:
+  Create `tests/test_closet_index.py`:
 
   ```python
   import tempfile
@@ -138,7 +138,7 @@
   sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
   from db import PageIndexDB
-  from PageIndex.pageindex.closet_index import ClosetIndex, Tag
+  from pageindex_mutil.closet_index import ClosetIndex, Tag
 
 
   class FakeDB:
@@ -176,12 +176,12 @@
 
 - [ ] **Step 2: Run test to verify it fails**
 
-  Run: `python3 -m pytest PageIndex/tests/test_closet_index.py -v`
-  Expected: `ModuleNotFoundError: No module named 'PageIndex.pageindex.closet_index'`
+  Run: `python3 -m pytest tests/test_closet_index.py -v`
+  Expected: `ModuleNotFoundError: No module named 'pageindex_mutil.closet_index'`
 
 - [ ] **Step 3: Implement ClosetIndex**
 
-  Create `PageIndex/pageindex/closet_index.py`:
+  Create `pageindex_mutil/closet_index.py`:
 
   ```python
   import json
@@ -289,13 +289,13 @@
 
 - [ ] **Step 4: Run tests**
 
-  Run: `python3 -m pytest PageIndex/tests/test_closet_index.py -v`
+  Run: `python3 -m pytest tests/test_closet_index.py -v`
   Expected: All tests pass.
 
 - [ ] **Step 5: Commit**
 
   ```bash
-  git add PageIndex/pageindex/closet_index.py PageIndex/tests/test_closet_index.py
+  git add pageindex_mutil/closet_index.py tests/test_closet_index.py
   git commit -m "feat: add ClosetIndex for semantic tag indexing"
   ```
 
@@ -304,12 +304,12 @@
 ### Task 3: Planner — Plan Phase
 
 **Files:**
-- Create: `PageIndex/pageindex/agentic/planner.py`
-- Test: `PageIndex/tests/test_planner.py`
+- Create: `pageindex_mutil/agentic/planner.py`
+- Test: `tests/test_planner.py`
 
 - [ ] **Step 1: Write the failing test**
 
-  Create `PageIndex/tests/test_planner.py`:
+  Create `tests/test_planner.py`:
 
   ```python
   import os
@@ -318,7 +318,7 @@
 
   sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
-  from PageIndex.pageindex.agentic.planner import RetrievalPlanner, PlanResult
+  from pageindex_mutil.agentic.planner import RetrievalPlanner, PlanResult
 
 
   def test_plan_result_structure():
@@ -339,12 +339,12 @@
 
 - [ ] **Step 2: Run test to verify it fails**
 
-  Run: `python3 -m pytest PageIndex/tests/test_planner.py -v`
+  Run: `python3 -m pytest tests/test_planner.py -v`
   Expected: `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement RetrievalPlanner**
 
-  Create `PageIndex/pageindex/agentic/planner.py`:
+  Create `pageindex_mutil/agentic/planner.py`:
 
   ```python
   import json
@@ -423,13 +423,13 @@
 
 - [ ] **Step 4: Run tests**
 
-  Run: `python3 -m pytest PageIndex/tests/test_planner.py -v`
+  Run: `python3 -m pytest tests/test_planner.py -v`
   Expected: All tests pass.
 
 - [ ] **Step 5: Commit**
 
   ```bash
-  git add PageIndex/pageindex/agentic/planner.py PageIndex/tests/test_planner.py
+  git add pageindex_mutil/agentic/planner.py tests/test_planner.py
   git commit -m "feat: add RetrievalPlanner with HyDE and query variants"
   ```
 
@@ -438,12 +438,12 @@
 ### Task 4: Strategies — Three Retrieval Strategies
 
 **Files:**
-- Create: `PageIndex/pageindex/agentic/strategies.py`
-- Test: `PageIndex/tests/test_strategies.py`
+- Create: `pageindex_mutil/agentic/strategies.py`
+- Test: `tests/test_strategies.py`
 
 - [ ] **Step 1: Write the failing test**
 
-  Create `PageIndex/tests/test_strategies.py`:
+  Create `tests/test_strategies.py`:
 
   ```python
   import os
@@ -451,7 +451,7 @@
 
   sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
-  from PageIndex.pageindex.agentic.strategies import MetadataStrategy
+  from pageindex_mutil.agentic.strategies import MetadataStrategy
 
 
   def test_metadata_strategy_basic():
@@ -467,12 +467,12 @@
 
 - [ ] **Step 2: Run test to verify it fails**
 
-  Run: `python3 -m pytest PageIndex/tests/test_strategies.py -v`
+  Run: `python3 -m pytest tests/test_strategies.py -v`
   Expected: `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement all three strategies**
 
-  Create `PageIndex/pageindex/agentic/strategies.py`:
+  Create `pageindex_mutil/agentic/strategies.py`:
 
   ```python
   import json
@@ -569,13 +569,13 @@
 
 - [ ] **Step 4: Run tests**
 
-  Run: `python3 -m pytest PageIndex/tests/test_strategies.py -v`
+  Run: `python3 -m pytest tests/test_strategies.py -v`
   Expected: All tests pass.
 
 - [ ] **Step 5: Commit**
 
   ```bash
-  git add PageIndex/pageindex/agentic/strategies.py PageIndex/tests/test_strategies.py
+  git add pageindex_mutil/agentic/strategies.py tests/test_strategies.py
   git commit -m "feat: add Metadata, Semantics, Description retrieval strategies"
   ```
 
@@ -584,12 +584,12 @@
 ### Task 5: Verifier — CRAG Verify Phase
 
 **Files:**
-- Create: `PageIndex/pageindex/agentic/verifier.py`
-- Test: `PageIndex/tests/test_verifier.py`
+- Create: `pageindex_mutil/agentic/verifier.py`
+- Test: `tests/test_verifier.py`
 
 - [ ] **Step 1: Write the failing test**
 
-  Create `PageIndex/tests/test_verifier.py`:
+  Create `tests/test_verifier.py`:
 
   ```python
   import os
@@ -597,7 +597,7 @@
 
   sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
-  from PageIndex.pageindex.agentic.verifier import CRAGVerifier, VerifyResult
+  from pageindex_mutil.agentic.verifier import CRAGVerifier, VerifyResult
 
 
   def test_verify_result_dataclass():
@@ -617,12 +617,12 @@
 
 - [ ] **Step 2: Run test to verify it fails**
 
-  Run: `python3 -m pytest PageIndex/tests/test_verifier.py -v`
+  Run: `python3 -m pytest tests/test_verifier.py -v`
   Expected: `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement CRAGVerifier**
 
-  Create `PageIndex/pageindex/agentic/verifier.py`:
+  Create `pageindex_mutil/agentic/verifier.py`:
 
   ```python
   import logging
@@ -719,13 +719,13 @@
 
 - [ ] **Step 4: Run tests**
 
-  Run: `python3 -m pytest PageIndex/tests/test_verifier.py -v`
+  Run: `python3 -m pytest tests/test_verifier.py -v`
   Expected: All tests pass.
 
 - [ ] **Step 5: Commit**
 
   ```bash
-  git add PageIndex/pageindex/agentic/verifier.py PageIndex/tests/test_verifier.py
+  git add pageindex_mutil/agentic/verifier.py tests/test_verifier.py
   git commit -m "feat: add CRAG verifier with three-threshold confidence routing"
   ```
 
@@ -734,13 +734,13 @@
 ### Task 6: Router — Orchestration Layer
 
 **Files:**
-- Create: `PageIndex/pageindex/agentic/router.py`
-- Create: `PageIndex/pageindex/agentic/__init__.py`
-- Test: `PageIndex/tests/test_router.py`
+- Create: `pageindex_mutil/agentic/router.py`
+- Create: `pageindex_mutil/agentic/__init__.py`
+- Test: `tests/test_router.py`
 
 - [ ] **Step 1: Write the failing test**
 
-  Create `PageIndex/tests/test_router.py`:
+  Create `tests/test_router.py`:
 
   ```python
   import os
@@ -751,7 +751,7 @@
 
 
   def test_weighted_rrf():
-      from PageIndex.pageindex.agentic.router import AgenticRouter
+      from pageindex_mutil.agentic.router import AgenticRouter
 
       results = {
           "metadata": [("doc1", 1), ("doc2", 2)],
@@ -766,14 +766,14 @@
 
 - [ ] **Step 2: Run test to verify it fails**
 
-  Run: `python3 -m pytest PageIndex/tests/test_router.py -v`
+  Run: `python3 -m pytest tests/test_router.py -v`
   Expected: `ModuleNotFoundError`
 
 - [ ] **Step 3: Implement AgenticRouter**
 
-  Create `PageIndex/pageindex/agentic/__init__.py` (empty file, just a package marker).
+  Create `pageindex_mutil/agentic/__init__.py` (empty file, just a package marker).
 
-  Create `PageIndex/pageindex/agentic/router.py`:
+  Create `pageindex_mutil/agentic/router.py`:
 
   ```python
   import asyncio
@@ -1128,13 +1128,13 @@
 
 - [ ] **Step 4: Run tests**
 
-  Run: `python3 -m pytest PageIndex/tests/test_router.py -v`
+  Run: `python3 -m pytest tests/test_router.py -v`
   Expected: All tests pass.
 
 - [ ] **Step 5: Commit**
 
   ```bash
-  git add PageIndex/pageindex/agentic/
+  git add pageindex_mutil/agentic/
   git commit -m "feat: add AgenticRouter with Plan-Route-Act-Verify pipeline"
   ```
 
@@ -1143,12 +1143,12 @@
 ### Task 7: Client Integration
 
 **Files:**
-- Modify: `PageIndex/pageindex/client.py`
+- Modify: `pageindex_mutil/client.py`
 - Create: `test_smoke.py`
 
 - [ ] **Step 1: Modify PageIndexClient to integrate router**
 
-  In `PageIndex/pageindex/client.py`, add imports at the top:
+  In `pageindex_mutil/client.py`, add imports at the top:
 
   ```python
   from .closet_index import ClosetIndex
@@ -1282,7 +1282,7 @@
           print("=" * 50)
 
           print("\n[1/6] Import test...")
-          from PageIndex.pageindex import PageIndexClient
+          from pageindex_mutil import PageIndexClient
           print("  OK")
 
           print("\n[2/6] Initialize client...")
@@ -1332,7 +1332,7 @@
 - [ ] **Step 4: Commit**
 
   ```bash
-  git add PageIndex/pageindex/client.py test_smoke.py
+  git add pageindex_mutil/client.py test_smoke.py
   git commit -m "feat: integrate AgenticRouter into PageIndexClient with search()"
   ```
 

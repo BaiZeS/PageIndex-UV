@@ -45,7 +45,7 @@ Task 2 (main.py /add 批量命令)
 - context:
   - `server.py:297` — `upload_endpoint()` 现有实现，单文件处理逻辑
   - `server.py:335` — `get_client().index()` 调用点，需包装为异步
-  - `PageIndex/pageindex/client.py:80` — `index()` 方法签名
+  - `pageindex_mutil/client.py:80` — `index()` 方法签名
 - 验收标准:
   - [ ] 上传 2 个文件时返回包含 2 个结果的 JSON 数组
   - [ ] 并发数不超过 3（可通过日志或延迟验证）

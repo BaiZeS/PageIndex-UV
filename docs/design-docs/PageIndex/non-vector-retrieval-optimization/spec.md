@@ -115,7 +115,7 @@ query
 #### 4.2.1 文件结构
 
 ```
-PageIndex/pageindex/
+pageindex_mutil/
   agentic/
     __init__.py
     router.py       # AgenticRouter: orchestrate Plan→Route→Act→Verify
@@ -198,9 +198,9 @@ async def search(self, query: str, top_k: int = 3) -> dict
 |------|------|------|
 | `db.py` | 修改 | 新增/完善 `closet_tags` 表 + CRUD |
 | `pyproject.toml` | 修改 | 新增 `jieba>=0.42` |
-| `PageIndex/pageindex/closet_index.py` | 新建 | ClosetIndex 模块 |
-| `PageIndex/pageindex/agentic/*.py` | 新建 | Router + Planner + Strategies + Verifier |
-| `PageIndex/pageindex/client.py` | 修改 | 集成 SQLite + Router + ClosetIndex + search() |
+| `pageindex_mutil/closet_index.py` | 新建 | ClosetIndex 模块 |
+| `pageindex_mutil/agentic/*.py` | 新建 | Router + Planner + Strategies + Verifier |
+| `pageindex_mutil/client.py` | 修改 | 集成 SQLite + Router + ClosetIndex + search() |
 
 ## 6. 测试计划
 

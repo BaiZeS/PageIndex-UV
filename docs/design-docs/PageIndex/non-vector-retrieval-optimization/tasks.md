@@ -32,7 +32,7 @@ Task 7 (client.py 集成)
   - [x] `import jieba` 成功
 
 ### Task 2: closet_index.py — Closet 语义标签索引
-- **文件**: `PageIndex/pageindex/closet_index.py`（新建）
+- **文件**: `pageindex_mutil/closet_index.py`（新建）
 - **依赖**: Task 1
 - **说明**:
   - `Tag` 数据类 (`text`, `confidence`)
@@ -43,10 +43,10 @@ Task 7 (client.py 集成)
   - `search(query, top_k)` — jieba 分词 → 过滤停用词 → `match_closet_tags()`
   - `rebuild()` — 清空并重建（未来扩展）
 - **验收**:
-  - [x] `python3 -c "from pageindex.closet_index import Tag, ClosetIndex; print('OK')"` 成功
+  - [x] `python3 -c "from pageindex_mutil.closet_index import Tag, ClosetIndex; print('OK')"` 成功
 
 ### Task 3: agentic/planner.py — Plan 阶段
-- **文件**: `PageIndex/pageindex/agentic/planner.py`（新建）
+- **文件**: `pageindex_mutil/agentic/planner.py`（新建）
 - **依赖**: Task 2
 - **说明**:
   - `PlanResult` 数据类 (`queries`, `weights`, `query_type`)
@@ -56,7 +56,7 @@ Task 7 (client.py 集成)
   - [x] planner 可 import，`plan()` 返回正确结构
 
 ### Task 4: agentic/strategies.py — Route 三策略
-- **文件**: `PageIndex/pageindex/agentic/strategies.py`（新建）
+- **文件**: `pageindex_mutil/agentic/strategies.py`（新建）
 - **依赖**: Task 2
 - **说明**:
   - `MetadataStrategy` — SQL LIKE 匹配 doc_name / doc_description
@@ -67,7 +67,7 @@ Task 7 (client.py 集成)
   - [x] 三策略各自可独立运行并返回排名结果
 
 ### Task 5: agentic/verifier.py — Verify 阶段
-- **文件**: `PageIndex/pageindex/agentic/verifier.py`（新建）
+- **文件**: `pageindex_mutil/agentic/verifier.py`（新建）
 - **依赖**: 无（纯 LLM 判断）
 - **说明**:
   - `VerifyResult` 数据类 (`confidence`, `action`)
@@ -79,7 +79,7 @@ Task 7 (client.py 集成)
   - [x] verifier 返回高/中/低置信度正确
 
 ### Task 6: agentic/router.py — Router 编排
-- **文件**: `PageIndex/pageindex/agentic/router.py`（新建）
+- **文件**: `pageindex_mutil/agentic/router.py`（新建）
 - **依赖**: Task 3, 4, 5
 - **说明**:
   - `AgenticRouter.__init__(client, model)` — 持有 Planner/Strategies/Verifier
@@ -90,7 +90,7 @@ Task 7 (client.py 集成)
   - [x] router 端到端运行不报错
 
 ### Task 7: client.py — 集成与 search() 接口
-- **文件**: `PageIndex/pageindex/client.py`（修改）
+- **文件**: `pageindex_mutil/client.py`（修改）
 - **依赖**: Task 6
 - **说明**:
   - `__init__` 中集成 `PageIndexDB` + `AgenticRouter` + `ClosetIndex`
@@ -98,5 +98,5 @@ Task 7 (client.py 集成)
   - 新增 `async def search(query, top_k)` — 单文档 shortcut / 多文档走 Router
   - 新增 `_ensure_db()` 辅助方法
 - **验收**:
-  - [x] `python3 -c "from pageindex import PageIndexClient; print('OK')"` 成功
+  - [x] `python3 -c "from pageindex_mutil import PageIndexClient; print('OK')"` 成功
   - [x] 现有接口行为不变
