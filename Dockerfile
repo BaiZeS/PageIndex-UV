@@ -7,12 +7,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps
+# Install runtime deps (cached layer keyed on pyproject.toml)
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e "."
+RUN pip install --no-cache-dir .
 
-# Copy application code
+# Copy application source, then install the package itself editable (source present for finder)
 COPY . .
+RUN pip install --no-cache-dir -e . --no-deps
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app

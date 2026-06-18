@@ -28,3 +28,13 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["pageindex_mutil*"]
+
+[tool.setuptools.package-data]
+pageindex_mutil = ["config.yaml"]
