@@ -224,18 +224,24 @@ graph TD
     请参考 [uv 官方文档](https://github.com/astral-sh/uv) 安装。
 
 2.  **配置环境变量**:
-    在项目根目录创建 `.env` 文件，填入你的 API Key：
+    在项目根目录创建 `.env` 文件，填入你的 API Key（可参考已提交的 `.env.example` 模板）：
     ```ini
     # 使用 DashScope (Qwen) —— 模型名直接写 DashScope 侧名称，无需 provider 前缀
     DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxx
     OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
     MODEL_NAME=qwen-plus
+    # 可选：检索/向量模型名（不设则回退到 MODEL_NAME，再回退到 config.yaml 的 retrieve_model）
+    # RETRIEVE_MODEL_NAME=text-embedding-v3
 
     # 或者使用 OpenAI
     # OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
     # OPENAI_BASE_URL=https://api.openai.com/v1
     # MODEL_NAME=gpt-4o
+    # RETRIEVE_MODEL_NAME=text-embedding-3-small
     ```
+    > **模型名解析优先级**（CLI `main.py` 与服务端 `server.py` 共用同一路径）：
+    > 调用方显式参数 > `MODEL_NAME` / `RETRIEVE_MODEL_NAME` 环境变量 > `config.yaml` 默认值。
+    > 即 `MODEL_NAME` 环境变量现在在**所有路径**（CLI + 服务端）中都会覆盖 `config.yaml` 的 `model` 字段。
 
 3.  **安装依赖**:
     ```bash
@@ -421,6 +427,8 @@ API_KEY=your-secure-api-key
 DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxx
 OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 MODEL_NAME=qwen-plus
+# 可选：检索/向量模型名（不设则回退到 MODEL_NAME，再回退到 config.yaml）
+# RETRIEVE_MODEL_NAME=text-embedding-v3
 
 # 服务监听
 HOST=0.0.0.0
@@ -434,6 +442,8 @@ DB_PATH=/app/data/index.db
 数据通过 volume 挂载持久化：`./data:/app/data`
 
 > **注意**: MCP 服务（`server.py`）本身也需要 LLM API Key 来执行检索和生成答案。除了上表中的 `API_KEY`（用于 HTTP 请求认证），还必须在环境变量中提供 LLM 配置：`DASHSCOPE_API_KEY`（或 `OPENAI_API_KEY`）、`OPENAI_BASE_URL`、`MODEL_NAME`。docker-compose.yml 中已包含这些变量。
+>
+> **模型名统一解析（P7）**：`MODEL_NAME` 现在在**所有路径**（CLI `main.py` 与服务端 `server.py`）中都会覆盖 `config.yaml` 的 `model` 字段——二者共用 `ConfigLoader` 同一解析路径。新增 `RETRIEVE_MODEL_NAME` 环境变量用于覆盖 `retrieve_model`。优先级：调用方显式参数 > `MODEL_NAME` / `RETRIEVE_MODEL_NAME` 环境变量 > `config.yaml` 默认值。
 
 #### 本地开发运行
 

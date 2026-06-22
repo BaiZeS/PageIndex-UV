@@ -744,6 +744,20 @@ class ConfigLoader:
     def load(self, user_opt=None) -> config:
         """
         Load the configuration, merging user options with default values.
+
+        Model-name resolution precedence (highest wins):
+            1. caller-explicit kwarg in ``user_opt`` (e.g. ``load({"model": ...})``)
+            2. ``MODEL_NAME`` / ``RETRIEVE_MODEL_NAME`` env vars
+            3. ``config.yaml`` defaults
+
+        Env vars are applied to the merged dict *values* (not as keys), so
+        ``_validate_keys`` never sees them and they cannot trigger
+        unknown-key errors. The caller's ``user_opt`` is applied last so an
+        explicit kwarg always beats both env and yaml.
+
+        This keeps CLI (``main.py``) and the server path
+        (``PageIndexClient`` -> ``ConfigLoader``) on ONE resolution path for
+        model names — the same path P6 introduced for LLM credentials.
         """
         if user_opt is None:
             user_dict = {}
@@ -755,7 +769,21 @@ class ConfigLoader:
             raise TypeError("user_opt must be dict, config(SimpleNamespace) or None")
 
         self._validate_keys(user_dict)
-        merged = {**self._default_dict, **user_dict}
+
+        # Start from yaml defaults, then apply env overrides for model names.
+        # FIX 1 (rework iteration): env values that are empty OR whitespace-only
+        # must NOT override the yaml default — fall back instead. Non-empty values
+        # are stripped so leading/trailing whitespace does not corrupt the model
+        # name (e.g. MODEL_NAME=" " -> yaml; MODEL_NAME=" gpt-4o " -> "gpt-4o").
+        merged = {**self._default_dict}
+        env_model = os.getenv("MODEL_NAME")
+        if env_model and env_model.strip():
+            merged["model"] = env_model.strip()
+        env_retrieve_model = os.getenv("RETRIEVE_MODEL_NAME")
+        if env_retrieve_model and env_retrieve_model.strip():
+            merged["retrieve_model"] = env_retrieve_model.strip()
+        # Caller-explicit kwargs win over both env and yaml.
+        merged.update(user_dict)
         return config(**merged)
 
 def create_node_mapping(tree):

@@ -8,6 +8,17 @@
 # When using the standard OpenAI endpoint, set `model` and `retrieve_model`
 # below to an OpenAI model (e.g. gpt-4o-mini). The defaults below (`qwen-plus`)
 # target the DashScope/Qwen endpoint.
+#
+# Model-name overrides (resolved in ConfigLoader.load):
+#   * MODEL_NAME            env var overrides `model` below
+#   * RETRIEVE_MODEL_NAME   env var overrides `retrieve_model` below
+#   Precedence (highest wins):
+#     1. caller-explicit kwarg to ConfigLoader().load({...})
+#     2. MODEL_NAME / RETRIEVE_MODEL_NAME env vars
+#     3. the `model` / `retrieve_model` values in THIS file
+#   This is the ONE resolution path shared by both the CLI (main.py) and the
+#   server path (PageIndexClient -> ConfigLoader), so the same MODEL_NAME env
+#   now takes effect in ALL paths.
 # ---------------------------------------------------------------------------
 model: "qwen-plus"
 retrieve_model: "qwen-plus"

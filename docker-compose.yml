@@ -10,7 +10,13 @@ services:
       - API_KEY=${API_KEY:-changeme}
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      # MODEL_NAME is now consumed by the server (server.py -> PageIndexClient ->
+      # ConfigLoader) as well as the CLI, overriding config.yaml `model`.
+      # Precedence: caller-explicit > MODEL_NAME env > config.yaml default.
       - MODEL_NAME=${MODEL_NAME:-qwen-plus}
+      # Optional: override the retrieval/embedding model independently of MODEL_NAME.
+      # When unset, retrieve_model falls back to MODEL_NAME, then to config.yaml.
+      - RETRIEVE_MODEL_NAME=${RETRIEVE_MODEL_NAME:-}
       - HOST=0.0.0.0
       - PORT=3000
       - WORKSPACE=/app/data/workspace

@@ -18,6 +18,7 @@ from pageindex_mutil.utils import (
     configure_llm,
     get_llm_config,
     get_llm_client,
+    ConfigLoader,
 )
 
 # Load environment variables
@@ -32,8 +33,20 @@ load_dotenv()
 configure_llm()
 client = get_llm_client()
 
-# MODEL_NAME is a *model name*, not client config — separate concern, kept here.
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen-plus")
+# MODEL_NAME now resolved via the SAME ConfigLoader path the server uses
+# (PageIndexClient -> ConfigLoader). Precedence: caller-explicit > MODEL_NAME
+# env > config.yaml default. main.py passes no overrides, so an env var (if set)
+# wins, otherwise the config.yaml `model` default is used.
+#
+# Behavior change vs the old `os.getenv("MODEL_NAME", "qwen-plus")` (intentional
+# unification, documented in handoff-model-unify.md behavior_changes Row B):
+# when MODEL_NAME env is UNSET, the OLD code used a hardcoded "qwen-plus" literal
+# and IGNORED config.yaml `model`; the NEW code honors config.yaml `model`. For
+# the shipped default (config.yaml ships `model: qwen-plus`) behavior matches,
+# but a CUSTOMIZED config.yaml `model` is now honored by the CLI too. When
+# MODEL_NAME env is set, both old and new use that value (new additionally strips
+# surrounding whitespace).
+MODEL_NAME = ConfigLoader().load(None).model
 
 if not get_llm_config()[0]:
     print("Warning: API Key not found. Please set OPENAI_API_KEY or DASHSCOPE_API_KEY environment variable.")
