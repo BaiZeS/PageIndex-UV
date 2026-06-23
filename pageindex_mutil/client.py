@@ -73,10 +73,10 @@ class PageIndexClient:
 
         if db_path and PageIndexDB:
             self.db = PageIndexDB(db_path)
-            self.closet_index = ClosetIndex(self.db, self.model)
-            self.super_tree_index = SuperTreeIndex(self.db, self.model, self)
+            self.closet_index = ClosetIndex(self.db, self.model, self.retrieve_model)
+            self.super_tree_index = SuperTreeIndex(self.db, self.model, self, self.retrieve_model)
             if AgenticRouter:
-                self.router = AgenticRouter(self, self.model)
+                self.router = AgenticRouter(self, self.model, self.retrieve_model)
 
     def index(self, file_path: str, mode: str = "auto") -> str:
         """Index a document. Returns a document_id."""

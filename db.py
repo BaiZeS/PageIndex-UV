@@ -1,27 +1,83 @@
 import os
 import sqlite3
+import threading
 
 
 SQLITE_MAX_VARIABLE_NUMBER = 999
+
+# WAL + synchronous=NORMAL + busy_timeout (spec §6.1).
+# busy_timeout=5000ms covers ~3 concurrent uploads queueing depth (spec §5.2).
+_BUSY_TIMEOUT_MS = 5000
 
 
 class PageIndexDB:
     def __init__(self, db_path):
         self.db_path = db_path
+        # Plan B (spec §4.3): thread-local connection pool. Each worker thread
+        # gets its own connection via threading.local(); connections are
+        # registered in _tls_connections so close() can iterate and close them
+        # all (R1/R3 leak guard). check_same_thread=False only silences
+        # sqlite3's default cross-thread guard — actual isolation is guaranteed
+        # by thread-local ownership (one connection per thread).
+        self._local = threading.local()
+        self._tls_connections = []
+        self._tls_lock = threading.Lock()
+        # _conn kept as a backwards-compatible alias to the main-thread
+        # thread-local connection (no caller relies on it, but it avoids
+        # surprising AttributeError on legacy attribute access).
         self._conn = None
         self.ensure_schema()
 
     def _connect(self):
-        if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path)
-            self._conn.execute("PRAGMA foreign_keys = ON")
-            self._conn.row_factory = sqlite3.Row
-        return self._conn
+        """Return the calling thread's thread-local connection.
+
+        Creates it on first use (per thread), applying the spec §6.1 pragmas
+        (journal_mode=WAL, synchronous=NORMAL, busy_timeout, foreign_keys=ON)
+        and row_factory=Row. All pragmas are idempotent. The connection is
+        registered in _tls_connections (under _tls_lock) so close() can clean
+        it up regardless of which thread created it.
+
+        Callers use the returned connection as a context manager
+        (``with self._connect() as conn:``) relying on sqlite3's native
+        __enter__/__exit__ (commit/rollback) semantics — preserved here.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+            with self._tls_lock:
+                self._tls_connections.append(conn)
+            if threading.current_thread() is threading.main_thread():
+                self._conn = conn
+        return conn
 
     def close(self):
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        """Close the current thread's connection and all registered connections.
+
+        Iterates _tls_connections (thread-safe under _tls_lock), closing each
+        (swallowing already-closed errors), then clears the registry. Safe to
+        call multiple times (idempotent).
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            self._local.conn = None
+        self._conn = None
+        with self._tls_lock:
+            for c in self._tls_connections:
+                try:
+                    c.close()
+                except sqlite3.Error:
+                    pass
+            self._tls_connections.clear()
 
     def ensure_schema(self):
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -75,6 +131,15 @@ class PageIndexDB:
                     field TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_doc_keywords ON doc_keywords(keyword, doc_id);
+
+                CREATE INDEX IF NOT EXISTS idx_nodes_doc_id
+                    ON nodes(doc_id);
+
+                CREATE INDEX IF NOT EXISTS idx_nodes_parent_node_id
+                    ON nodes(parent_node_id);
+
+                CREATE INDEX IF NOT EXISTS idx_pages_doc_id
+                    ON pages(doc_id);
 
                 CREATE TABLE IF NOT EXISTS kb_identity (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -268,6 +333,18 @@ class PageIndexDB:
     def delete_closet_tags(self, doc_id):
         with self._connect() as conn:
             conn.execute("DELETE FROM closet_tags WHERE doc_id = ?", (doc_id,))
+
+    def delete_document(self, doc_id: int) -> None:
+        """Delete a document and cascade-delete its child rows.
+
+        Relies on existing ``ON DELETE CASCADE`` foreign keys on
+        nodes/pages/closet_tags/doc_keywords (see ensure_schema). The
+        thread-local connection from ``self._connect()`` applies
+        ``PRAGMA foreign_keys = ON`` per connection, so the cascade fires.
+        Idempotent: deleting a non-existent id deletes 0 rows (no error).
+        """
+        with self._connect() as conn:
+            conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
 
     def match_closet_tags(self, tokens, top_k=5):
         if not tokens:

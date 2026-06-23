@@ -12,14 +12,15 @@ from ..super_tree import SuperTreeIndex
 class AgenticRouter:
     """Orchestrate Plan -> Route -> Act -> Verify."""
 
-    def __init__(self, client, model: str):
+    def __init__(self, client, model: str, retrieve_model: str = None):
         self.client = client
         self.model = model
-        self.planner = RetrievalPlanner(model)
+        self.retrieve_model = retrieve_model
+        self.planner = RetrievalPlanner(model, retrieve_model)
         self.metadata_strategy = MetadataStrategy()
         self.semantics_strategy = None
-        self.description_strategy = DescriptionStrategy(model)
-        self.verifier = CRAGVerifier(model)
+        self.description_strategy = DescriptionStrategy(model, retrieve_model)
+        self.verifier = CRAGVerifier(model, retrieve_model)
         self._main_funcs = None
 
         if hasattr(client, "closet_index") and client.closet_index:

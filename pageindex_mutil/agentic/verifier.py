@@ -22,8 +22,9 @@ class CRAGVerifier:
     _DOC_WEIGHT = 0.3
     _NODE_WEIGHT = 0.3
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, retrieve_model: str = None):
         self.model = model
+        self.retrieve_model = retrieve_model
 
     def _score_retrieval(
         self, context: str, source_docs: int, covered_nodes: int
@@ -75,7 +76,7 @@ class CRAGVerifier:
 直接返回JSON，不要其他内容。
 """
         try:
-            response = llm_completion(self.model, prompt)
+            response = llm_completion(self.retrieve_model or self.model, prompt)
             if not response:
                 return VerifyResult(confidence=s_ret, action="answer")
 

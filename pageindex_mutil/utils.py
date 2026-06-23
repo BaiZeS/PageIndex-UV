@@ -168,7 +168,27 @@ def get_json_content(response):
     
     json_content = response.strip()
     return json_content
-         
+
+
+def strip_markdown_fence(text: str) -> str:
+    """Strip a single outermost Markdown code fence (```...```) if present.
+
+    Unlike extract_json, does NOT attempt JSON parsing — returns the stripped
+    text content. Idempotent on already-unfenced text. Handles ```lang fences
+    (```text, ```json, etc.) by dropping the opening fence line.
+    """
+    if not text:
+        return text
+    s = text.strip()
+    if s.startswith("```"):
+        # drop the opening fence line (optionally ```lang)
+        first_nl = s.find("\n")
+        if first_nl != -1:
+            s = s[first_nl + 1:]
+        if s.endswith("```"):
+            s = s[:-3]
+    return s.strip()
+
 
 def extract_json(content):
     try:

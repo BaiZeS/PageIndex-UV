@@ -47,6 +47,11 @@ client = get_llm_client()
 # MODEL_NAME env is set, both old and new use that value (new additionally strips
 # surrounding whitespace).
 MODEL_NAME = ConfigLoader().load(None).model
+# RETRIEVE_MODEL_NAME: retrieval-path model (query-time LLM calls in
+# _call_llm_json / generate_answer). When unset/empty, falls back to MODEL_NAME
+# (NFR4 backward compat). Resolved via the same ConfigLoader path (RETRIEVE_MODEL_NAME
+# env > config.yaml retrieve_model default).
+RETRIEVE_MODEL_NAME = ConfigLoader().load(None).retrieve_model
 
 if not get_llm_config()[0]:
     print("Warning: API Key not found. Please set OPENAI_API_KEY or DASHSCOPE_API_KEY environment variable.")
@@ -65,11 +70,12 @@ def generate_structure(pdf_path, json_path):
     try:
         from pageindex_mutil.page_index import page_index_main
 
+        _cfg = ConfigLoader().load(None)
         opt = SimpleNamespace(
             model=MODEL_NAME,
-            toc_check_page_num=20,
-            max_page_num_each_node=10,
-            max_token_num_each_node=20000,
+            toc_check_page_num=_cfg.toc_check_page_num,
+            max_page_num_each_node=_cfg.max_page_num_each_node,
+            max_token_num_each_node=_cfg.max_token_num_each_node,
             if_add_node_id='yes',
             if_add_node_summary='yes',
             if_add_doc_description='yes',
@@ -142,7 +148,7 @@ def _call_llm_json(prompt, extract_key=None, expect_list=False):
         return []
     try:
         response = client.chat.completions.create(
-            model=MODEL_NAME,
+            model=RETRIEVE_MODEL_NAME or MODEL_NAME,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": prompt}
@@ -289,7 +295,7 @@ def generate_answer(question, context):
         """
     try:
         response = client.chat.completions.create(
-            model=MODEL_NAME,
+            model=RETRIEVE_MODEL_NAME or MODEL_NAME,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": prompt}

@@ -303,25 +303,30 @@ async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_ad
 if __name__ == "__main__":
     import os
     import json
-    
+
+    # Deterministic relative import (quality-gate improvement #5): __main__ has
+    # no test/CI coverage, so use a try/except fallback to cover both
+    # `python -m pageindex_mutil.page_index_md` (relative import works) and a
+    # direct `python pageindex_mutil/page_index_md.py` invocation (falls back to
+    # the absolute package import).
+    try:
+        from .utils import ConfigLoader
+    except ImportError:
+        from pageindex_mutil.utils import ConfigLoader
+
     # MD_NAME = 'Detect-Order-Construct'
     MD_NAME = 'cognitive-load'
     MD_PATH = os.path.join(os.path.dirname(__file__), '..', 'examples/documents/', f'{MD_NAME}.md')
 
 
-    MODEL="gpt-4.1"
-    IF_THINNING=False
-    THINNING_THRESHOLD=5000
-    SUMMARY_TOKEN_THRESHOLD=200
-    IF_SUMMARY=True
-
+    _cfg = ConfigLoader().load(None)
     tree_structure = asyncio.run(md_to_tree(
-        md_path=MD_PATH, 
-        if_thinning=IF_THINNING, 
-        min_token_threshold=THINNING_THRESHOLD, 
-        if_add_node_summary='yes' if IF_SUMMARY else 'no', 
-        summary_token_threshold=SUMMARY_TOKEN_THRESHOLD, 
-        model=MODEL))
+        md_path=MD_PATH,
+        if_thinning=_cfg.if_thinning,
+        min_token_threshold=_cfg.thinning_threshold,
+        if_add_node_summary='yes' if _cfg.if_summary else 'no',
+        summary_token_threshold=_cfg.summary_token_threshold,
+        model=_cfg.model))
     
     print('\n' + '='*60)
     print('TREE STRUCTURE')

@@ -41,9 +41,9 @@ class TestConfigLoaderModelEnv:
         monkeypatch.delenv("MODEL_NAME", raising=False)
         monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
         cfg = ConfigLoader().load(None)
-        # config.yaml ships qwen-plus for both (see pageindex_mutil/config.yaml).
-        assert cfg.model == "qwen-plus"
-        assert cfg.retrieve_model == "qwen-plus"
+        # config.yaml ships gpt-4.1-mini for both (see pageindex_mutil/config.yaml).
+        assert cfg.model == "gpt-4.1-mini"
+        assert cfg.retrieve_model == "gpt-4.1-mini"
 
     def test_precedence_explicit_kwarg_beats_env(self, monkeypatch):
         """Caller-explicit model in load(user_opt) must win over MODEL_NAME env."""
@@ -87,10 +87,10 @@ class TestConfigLoaderModelEnv:
     # values must be stripped (leading/trailing whitespace removed).
 
     def test_whitespace_model_name_falls_back_to_yaml(self, monkeypatch):
-        """MODEL_NAME=' ' (whitespace only) must NOT override yaml — fall back to qwen-plus."""
+        """MODEL_NAME=' ' (whitespace only) must NOT override yaml — fall back to gpt-4.1-mini."""
         monkeypatch.setenv("MODEL_NAME", " ")
         cfg = ConfigLoader().load(None)
-        assert cfg.model == "qwen-plus"  # NOT " "
+        assert cfg.model == "gpt-4.1-mini"  # NOT " "
 
     def test_whitespace_model_name_is_stripped(self, monkeypatch):
         """MODEL_NAME=' gpt-4o ' must be normalized to 'gpt-4o' (stripped)."""
@@ -102,10 +102,63 @@ class TestConfigLoaderModelEnv:
         """MODEL_NAME='' (empty string) must fall back to yaml default."""
         monkeypatch.setenv("MODEL_NAME", "")
         cfg = ConfigLoader().load(None)
-        assert cfg.model == "qwen-plus"
+        assert cfg.model == "gpt-4.1-mini"
 
     def test_whitespace_retrieve_model_name_falls_back(self, monkeypatch):
         """RETRIEVE_MODEL_NAME=' ' (whitespace only) must fall back to yaml retrieve_model."""
         monkeypatch.setenv("RETRIEVE_MODEL_NAME", " ")
         cfg = ConfigLoader().load(None)
-        assert cfg.retrieve_model == "qwen-plus"
+        assert cfg.retrieve_model == "gpt-4.1-mini"
+
+
+class TestConfigLoaderMagicNumbers:
+    """W6 FR4/NFR5: magic-number config keys exposed by ConfigLoader.load().
+
+    The 4 new keys (if_thinning, thinning_threshold, summary_token_threshold,
+    if_summary) must default to the current hardcoded values. The 3 existing
+    keys (toc_check_page_num, max_page_num_each_node, max_token_num_each_node)
+    must remain readable (regression protection for FR5).
+    """
+
+    def test_if_thinning_default(self, monkeypatch):
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
+        cfg = ConfigLoader().load(None)
+        assert cfg.if_thinning is False
+
+    def test_thinning_threshold_default(self, monkeypatch):
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
+        cfg = ConfigLoader().load(None)
+        assert cfg.thinning_threshold == 5000
+
+    def test_summary_token_threshold_default(self, monkeypatch):
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
+        cfg = ConfigLoader().load(None)
+        assert cfg.summary_token_threshold == 200
+
+    def test_if_summary_default(self, monkeypatch):
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
+        cfg = ConfigLoader().load(None)
+        assert cfg.if_summary is True
+
+    def test_existing_toc_check_page_num(self, monkeypatch):
+        """Regression: existing key still readable (FR5 consumer)."""
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
+        cfg = ConfigLoader().load(None)
+        assert cfg.toc_check_page_num == 20
+
+    def test_existing_max_page_num_each_node(self, monkeypatch):
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
+        cfg = ConfigLoader().load(None)
+        assert cfg.max_page_num_each_node == 10
+
+    def test_existing_max_token_num_each_node(self, monkeypatch):
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+        monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
+        cfg = ConfigLoader().load(None)
+        assert cfg.max_token_num_each_node == 20000

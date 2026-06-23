@@ -13,8 +13,9 @@ class PlanResult:
 
 
 class RetrievalPlanner:
-    def __init__(self, model: str):
+    def __init__(self, model: str, retrieve_model: str = None):
         self.model = model
+        self.retrieve_model = retrieve_model
 
     async def plan(self, query: str) -> PlanResult:
         prompt = f"""你是一个检索策略规划专家。分析以下用户问题，决定最佳检索策略。
@@ -38,7 +39,7 @@ class RetrievalPlanner:
 直接返回JSON，不要其他内容。
 """
         try:
-            response = await llm_acompletion(self.model, prompt)
+            response = await llm_acompletion(self.retrieve_model or self.model, prompt)
             if not response:
                 return self._default_plan(query)
             data = extract_json(response)

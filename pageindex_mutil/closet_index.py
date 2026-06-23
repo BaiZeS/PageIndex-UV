@@ -39,9 +39,10 @@ class ClosetIndex:
     _MIN_TAG_CONFIDENCE = 0.5
     _MIN_TOKEN_LENGTH = 1
 
-    def __init__(self, db, model: str):
+    def __init__(self, db, model: str, retrieve_model: str = None):
         self.db = db
         self.model = model
+        self.retrieve_model = retrieve_model
         if jieba is None:
             logging.warning("jieba not installed; ClosetIndex search will be unavailable")
         if hasattr(db, "ensure_closet_schema"):
@@ -69,7 +70,7 @@ class ClosetIndex:
 直接返回最终JSON结构，不要输出其他内容。
 """
         try:
-            response = llm_completion(self.model, prompt)
+            response = llm_completion(self.retrieve_model or self.model, prompt)
             if not response:
                 return []
             data = extract_json(response)

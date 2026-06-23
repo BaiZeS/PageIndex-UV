@@ -25,6 +25,15 @@ async def _mock_llm_acompletion(*a, **k):
 utils_mod.llm_acompletion = _mock_llm_acompletion
 utils_mod.count_tokens = lambda text, model=None: len(text or "") // 4
 utils_mod.extract_json = lambda *a, **k: None
+# Load the REAL strip_markdown_fence from utils.py source so super_tree.py's
+# `from .utils import ..., strip_markdown_fence` resolves (W2 FR3). The function
+# is pure, no heavy deps.
+_real_utils_spec = importlib.util.spec_from_file_location(
+    "_real_utils_strip_rt", pageindex_path / "utils.py"
+)
+_real_utils_mod = importlib.util.module_from_spec(_real_utils_spec)
+_real_utils_spec.loader.exec_module(_real_utils_mod)
+utils_mod.strip_markdown_fence = _real_utils_mod.strip_markdown_fence
 
 # Pre-seed pageindex.closet_index for _STOPWORDS
 closet_spec = importlib.util.spec_from_file_location("pageindex_mutil.closet_index", pageindex_path / "closet_index.py")

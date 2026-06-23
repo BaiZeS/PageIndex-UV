@@ -46,15 +46,16 @@ class KeywordIndex:
 
 
 import json
-from .utils import llm_completion
+from .utils import llm_completion, strip_markdown_fence
 
 
 class KBIdentity:
     """Lazy-generated knowledge base identity summary."""
 
-    def __init__(self, db, model: str):
+    def __init__(self, db, model: str, retrieve_model: str = None):
         self.db = db
         self.model = model
+        self.retrieve_model = retrieve_model
 
     def get_identity(self) -> str:
         cached = self.db.get_kb_identity()
@@ -100,10 +101,11 @@ class KBIdentity:
 
 直接返回纯文本摘要，不要输出 JSON 或其他格式。"""
 
-        response = llm_completion(self.model, prompt)
+        response = llm_completion(self.retrieve_model or self.model, prompt)
         if response:
-            self.db.set_kb_identity(response.strip(), len(docs))
-            return response.strip()
+            cleaned = strip_markdown_fence(response)
+            self.db.set_kb_identity(cleaned, len(docs))
+            return cleaned
         raise RuntimeError("LLM returned empty response")
 
     def _build_fallback(self, docs) -> str:
@@ -129,12 +131,13 @@ class SuperTreeIndex:
     _MAX_SUPER_TREE_TOKENS = 6000
     _SUMMARY_MAX_LEN = 100
 
-    def __init__(self, db, model: str, client):
+    def __init__(self, db, model: str, client, retrieve_model: str = None):
         self.db = db
         self.model = model
+        self.retrieve_model = retrieve_model
         self.client = client
         self.keyword_index = KeywordIndex(db)
-        self.kb_identity = KBIdentity(db, model)
+        self.kb_identity = KBIdentity(db, model, retrieve_model)
         self._backfill_existing_docs()
 
     # ------------------------------------------------------------------
@@ -231,7 +234,7 @@ class SuperTreeIndex:
 }}
 直接返回最终JSON结构，不要输出其他内容。"""
 
-        response = await llm_acompletion(self.model, prompt)
+        response = await llm_acompletion(self.retrieve_model or self.model, prompt)
         if not response:
             return []
 

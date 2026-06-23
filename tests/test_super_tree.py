@@ -34,6 +34,14 @@ def _mock_extract_json(text):
     except Exception:
         return None
 utils_mod.extract_json = _mock_extract_json
+# Load the REAL strip_markdown_fence from utils.py source so FR3 tests exercise
+# the actual production logic (the function is pure, no heavy deps).
+_real_utils_spec = importlib.util.spec_from_file_location(
+    "_real_utils_strip", super_tree_path / "utils.py"
+)
+_real_utils_mod = importlib.util.module_from_spec(_real_utils_spec)
+_real_utils_spec.loader.exec_module(_real_utils_mod)
+utils_mod.strip_markdown_fence = _real_utils_mod.strip_markdown_fence
 
 # Also need pageindex.closet_index for the _STOPWORDS import.
 closet_spec = importlib.util.spec_from_file_location("pageindex_mutil.closet_index", super_tree_path / "closet_index.py")
@@ -130,6 +138,30 @@ class TestKBIdentity:
         db.insert_document("new.pdf", "/tmp/new.pdf")
         identity2 = ki.get_identity()
         assert "new.pdf" in identity2
+
+    def test_kb_identity_strips_markdown_fence(self, kb_identity):
+        """W2 FR3/AC3.1 — fenced LLM output must be stripped before storage.
+
+        RED (Task #8): _generate_with_llm stores response.strip() raw, so a
+        fenced response persists with ``` markers, polluting L1 prompts.
+        """
+        ki, db = kb_identity
+        db.insert_document("test.pdf", "/tmp/test.pdf", doc_description="测试文档")
+        with patch.object(super_tree_mod, "llm_completion") as mock_llm:
+            mock_llm.return_value = "```text\n某摘要内容\n```"
+            identity = ki.get_identity()
+            # Stored identity must not retain fence markers.
+            assert "```" not in identity
+            assert "某摘要内容" in identity
+
+    def test_kb_identity_idempotent_on_plain_text(self, kb_identity):
+        """W2 FR3/AC3.2 — plain text (no fence) is returned unchanged."""
+        ki, db = kb_identity
+        db.insert_document("test.pdf", "/tmp/test.pdf", doc_description="测试文档")
+        with patch.object(super_tree_mod, "llm_completion") as mock_llm:
+            mock_llm.return_value = "某摘要"
+            identity = ki.get_identity()
+            assert identity == "某摘要"
 
 
 SuperTreeIndex = super_tree_mod.SuperTreeIndex

@@ -49,8 +49,9 @@ class SemanticsStrategy:
 
 
 class DescriptionStrategy:
-    def __init__(self, model: str):
+    def __init__(self, model: str, retrieve_model: str = None):
         self.model = model
+        self.retrieve_model = retrieve_model
         self._main_get_relevant = None
         # Attempt one-time import of main.py helper to avoid runtime side effects
         try:
@@ -84,7 +85,7 @@ class DescriptionStrategy:
 最多返回5个最相关的文档。直接返回JSON，不要其他内容。
 """
         try:
-            response = llm_completion(self.model, prompt)
+            response = llm_completion(self.retrieve_model or self.model, prompt)
             if not response:
                 return []
             data = extract_json(response)

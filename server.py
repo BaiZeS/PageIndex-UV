@@ -96,6 +96,30 @@ def get_client() -> PageIndexClient:
     return client
 
 
+def _safe_remove_upload(pdf_path: str, workspace) -> None:
+    """Remove an uploaded file only if it resolves under workspace/uploads/.
+
+    TOCTOU guard: resolve() + parent check before os.remove; FileNotFoundError
+    swallowed (idempotent); other OSError logged but non-blocking. Refuses to
+    delete files outside the uploads directory to prevent accidental removal
+    of unrelated user files (spec §5.4 / R2).
+    """
+    try:
+        upload_dir = (Path(workspace) / "uploads").resolve()
+        target = Path(pdf_path).resolve()
+        # Guard: only delete files that live inside workspace/uploads/.
+        if upload_dir not in target.parents:
+            logger.warning(
+                "Skipping disk cleanup: %s not under uploads/", pdf_path
+            )
+            return
+        os.remove(target)
+    except FileNotFoundError:
+        pass  # idempotent — file already gone
+    except OSError as e:
+        logger.warning("Failed to remove upload file %s: %s", pdf_path, e)
+
+
 # ---------------------------------------------------------------------------
 # MCP Server setup
 # ---------------------------------------------------------------------------
@@ -160,16 +184,38 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
 
             db_id = c._uuid_to_db.pop(doc_id, None)
             if db_id is not None and c.db is not None:
+                # R7 timing: fetch pdf_path BEFORE cascade delete (the row and
+                # its pdf_path column are gone after delete_document).
+                try:
+                    doc = c.db.get_document_by_id(db_id)
+                    pdf_path = doc.get("pdf_path") if doc else None
+                except Exception as e:
+                    logger.warning("Failed to fetch document for disk cleanup: %s", e)
+                    pdf_path = None
+
+                # FR1: DB cascade delete (documents + child tables).
                 try:
                     c.db.delete_document(db_id)
                 except Exception as e:
                     logger.warning("Failed to delete document from DB: %s", e)
 
-            if c.closet_index and db_id is not None:
-                try:
-                    c.closet_index.remove_document(db_id)
-                except Exception as e:
-                    logger.warning("Failed to delete closet tags: %s", e)
+                # FR2: invalidate closet tags (existing, idempotent via cascade).
+                if c.closet_index:
+                    try:
+                        c.closet_index.remove_document(db_id)
+                    except Exception as e:
+                        logger.warning("Failed to delete closet tags: %s", e)
+
+                # FR2: invalidate super-tree keyword index + kb identity.
+                if c.super_tree_index:
+                    try:
+                        c.super_tree_index.on_document_removed(db_id)
+                    except Exception as e:
+                        logger.warning("Failed to invalidate super-tree index: %s", e)
+
+                # FR4: remove the uploaded file from disk (guarded).
+                if pdf_path:
+                    _safe_remove_upload(pdf_path, c.workspace)
 
             return [types.TextContent(type="text", text=json.dumps({"success": True, "doc_id": doc_id}, ensure_ascii=False))]
 
