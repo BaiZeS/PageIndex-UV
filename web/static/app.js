@@ -92,6 +92,23 @@ const app = createApp({
           throw new Error(msg);
         }
         const j = await r.json();
+        // Prominent failure notification when any file in this response failed to
+        // index (e.g. revoked LLM key → HTTP 200 with succeeded:0). Supplements,
+        // does not replace, the per-row ✕ log so the user sees the backend's
+        // failure reason without reading server logs. Success stays silent.
+        const okCount = (j.succeeded || 0);
+        const totalCount = (j.total != null ? j.total : (j.results || []).length);
+        if (okCount < totalCount) {
+          const failedCount = totalCount - okCount;
+          let firstErr = (j.results || []).find(r => !r.success)?.error || "";
+          if (firstErr.length > 120) firstErr = firstErr.slice(0, 120) + "…";
+          const message = totalCount <= 1
+            ? f.name + (firstErr ? "：" + firstErr : "")
+            : failedCount + "/" + totalCount + " 个文档索引失败" + (firstErr ? "：" + firstErr : "");
+          ElementPlus.ElNotification({
+            title: "文档索引失败", type: "error", duration: 6000, position: "top-right", message,
+          });
+        }
         uploadResults.value.push({ name: f.name, ok: (j.succeeded||0)>0, raw: j });
         if ((j.succeeded||0) > 0) loadDocs();
         opt.onSuccess();
