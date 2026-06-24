@@ -40,3 +40,6 @@ docs/mempalace/
 CLAUDE.md
 AGENTS.md
 docs/devkit/
+
+# ===== devkit 过程产物(handoff 交接文件,不提交) =====
+**/handoff.md
