@@ -527,6 +527,24 @@ curl -X POST \
 
 ---
 
+## Web 控制台
+
+`server.py` 除了 MCP 接口外，还内置一个**单页 Web 控制台**，提供图形化的文档检索、问答与运行时配置能力（零构建，前端走 CDN）。
+
+- **访问**：服务启动后浏览器打开 `http://localhost:3000/`（即 `server.py` 监听地址）。页面与静态资源（`/static/*`）**无需 API Key** 即可加载；后续 `/api/*` 与 `/upload` 调用才需要鉴权。
+- **鉴权**：API Key 与 `.env` 中的 `API_KEY` 一致。首次打开时在控制台输入 Key，前端会存入 `localStorage` 并在之后每个请求自动带上 `X-API-Key` 头。
+- **三个标签页**：
+  - **文档**：查看已索引文档列表 / 元数据。
+  - **问答**：输入自然语言问题，调用后端 RAG 检索（`POST /api/search`）返回答案。
+  - **模型配置**：查看当前模型 / Provider（`GET /api/config`，凭据已掩码），并可热替换模型名与凭据（`POST /api/config`）。
+- **配置持久化与备份**：在「模型配置」页修改 **模型名** 或 **凭据/密钥** 后，不仅会**立即**在运行时生效（重建客户端），还会写盘持久化：
+  - 模型名 → 同时写入 `pageindex_mutil/config.yaml`（定点行替换）与 `.env` 的 `MODEL_NAME` / `RETRIEVE_MODEL_NAME`。
+  - 凭据 / `base_url` → 写入 `.env`。
+  - **写盘前自动备份 `.bak`**；若写盘失败，`.bak` 保留作为回滚。
+- **CDN 依赖**：前端通过 `unpkg.com` 加载 Vue 3 + Element Plus，因此**运行环境需要能访问外网**（CDN）。无法访问外网时页面可打开但组件无法加载。
+
+---
+
 ## 审计与迭代说明
 
 *   **版本控制**: 本项目使用 `pyproject.toml` 和 `uv.lock` 严格锁定依赖版本，确保环境一致性。

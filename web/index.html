@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PageIndex 控制台</title>
+  <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="app-topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span class="brand-name">PageIndex</span>
+          <span class="brand-sub">控制台</span>
+        </div>
+        <div class="auth">
+          <el-input
+            v-model="keyInput"
+            placeholder="API Key（与 .env API_KEY 一致）"
+            class="auth-input"
+            show-password
+            size="default">
+            <template #prefix><span class="auth-key-icon">key</span></template>
+          </el-input>
+          <el-button type="primary" @click="saveKey" class="auth-save">保存 Key</el-button>
+        </div>
+      </div>
+    </header>
+
+    <main class="app-main">
+      <el-tabs v-model="tab" class="console-tabs">
+
+        <!-- ── 文档 ───────────────────────────────────────── -->
+        <el-tab-pane label="文档" name="docs">
+          <section class="panel">
+            <header class="panel-head">
+              <div>
+                <h2 class="panel-title">文档库</h2>
+                <p class="panel-desc">已索引的文档。拖拽 PDF / Markdown 到下方上传。</p>
+              </div>
+              <el-button size="small" @click="loadDocs" class="ghost-btn">
+                <span class="ico">↻</span> 刷新
+              </el-button>
+            </header>
+
+            <el-upload
+              :http-request="onUpload"
+              drag
+              multiple
+              :show-file-list="false"
+              class="doc-uploader">
+              <div class="uploader-body">
+                <div class="uploader-icon" aria-hidden="true">⬆</div>
+                <div class="uploader-title">拖拽或点击上传</div>
+                <div class="uploader-hint">PDF · Markdown</div>
+              </div>
+            </el-upload>
+
+            <div class="doc-table-wrap">
+              <el-table :data="docs" class="doc-table" :empty-text="'暂无文档 — 上传后这里会出现列表'">
+                <el-table-column prop="id" label="#" width="64" align="center"></el-table-column>
+                <el-table-column prop="doc_name" label="文档" min-width="180"></el-table-column>
+                <el-table-column prop="doc_description" label="描述" min-width="240" show-overflow-tooltip></el-table-column>
+              </el-table>
+            </div>
+
+            <ul v-if="uploadResults.length" class="upload-log">
+              <li v-for="(r, i) in uploadResults" :key="i" :class="r.ok ? 'ok' : 'fail'">
+                <span class="log-status">{{ r.ok ? '✓' : '✕' }}</span>
+                <span class="log-name">{{ r.name }}</span>
+              </li>
+            </ul>
+          </section>
+        </el-tab-pane>
+
+        <!-- ── 问答 ───────────────────────────────────────── -->
+        <el-tab-pane label="问答" name="qa">
+          <section class="panel">
+            <header class="panel-head">
+              <div>
+                <h2 class="panel-title">检索问答</h2>
+                <p class="panel-desc">对已索引文档提问，返回答案与命中的文档片段。</p>
+              </div>
+            </header>
+
+            <div class="ask-row">
+              <el-input
+                v-model="query"
+                type="textarea"
+                :rows="3"
+                placeholder="输入问题，例如：这份文档说明了什么？"
+                class="ask-input"
+                resize="none"></el-input>
+              <el-button type="primary" :loading="searching" @click="doSearch" class="ask-btn">
+                {{ searching ? '检索中…' : '提问' }}
+              </el-button>
+            </div>
+
+            <div v-if="searching" class="answer-card loading">
+              <div class="skel-line w-80"></div>
+              <div class="skel-line w-60"></div>
+              <div class="skel-line w-40"></div>
+            </div>
+
+            <article v-else-if="answer" class="answer-card">
+              <div class="answer-meta">
+                <span class="conf-label">置信度</span>
+                <div class="conf-meter">
+                  <div class="conf-bar" :style="{ width: Math.round(confidenceRatio * 100) + '%' }"></div>
+                </div>
+                <span class="conf-val">{{ confidenceLabel }}</span>
+              </div>
+
+              <p class="answer-text">{{ answer.answer }}</p>
+
+              <div v-if="matchedRows.length" class="matches">
+                <h3 class="matches-title">命中文档</h3>
+                <ol class="match-list">
+                  <li v-for="(m, i) in matchedRows" :key="m.key" class="match-row">
+                    <span class="match-rank">{{ i + 1 }}</span>
+                    <span class="match-name">{{ m.name }}</span>
+                  </li>
+                </ol>
+              </div>
+            </article>
+
+            <div v-else class="empty-hint">输入问题后点击「提问」查看检索结果。</div>
+          </section>
+        </el-tab-pane>
+
+        <!-- ── 模型配置 ───────────────────────────────────── -->
+        <el-tab-pane label="模型配置" name="cfg">
+          <section class="panel">
+            <header class="panel-head">
+              <div>
+                <h2 class="panel-title">模型配置</h2>
+                <p class="panel-desc">当前值已填入下方（来自上方「当前」快照）。修改后点击「应用」即生效；清空某项表示保持不变。</p>
+              </div>
+            </header>
+
+            <div v-if="config" class="current-card">
+              <span class="current-label">当前</span>
+              <span class="current-field"><em>model</em> {{ config.model || '—' }}</span>
+              <span class="dot">·</span>
+              <span class="current-field">{{ config.provider || '—' }}</span>
+              <span class="dot">·</span>
+              <span class="current-field mono">{{ config.base_url || '—' }}</span>
+              <span class="dot">·</span>
+              <span class="current-field" :class="{ present: config.has_api_key }">
+                key {{ config.has_api_key ? ('已设置 ' + (config.api_key_masked || '')) : '未设置' }}
+              </span>
+            </div>
+
+            <el-form label-width="120px" class="cfg-form">
+              <el-form-item label="模型名"><el-input v-model="cfgForm.model" placeholder="未设置"></el-input></el-form-item>
+              <el-form-item label="检索模型"><el-input v-model="cfgForm.retrieve_model" placeholder="未设置"></el-input></el-form-item>
+              <el-form-item label="API Key"><el-input v-model="cfgForm.api_key" show-password placeholder="留空表示不修改"></el-input></el-form-item>
+              <el-form-item label="Base URL"><el-input v-model="cfgForm.base_url" placeholder="未设置"></el-input></el-form-item>
+              <el-form-item label="持久化"><el-switch v-model="cfgForm.persist"></el-switch></el-form-item>
+              <el-form-item>
+                <el-button type="primary" @click="saveConfig">应用</el-button>
+                <span v-if="cfgMsg" class="cfg-msg">{{ cfgMsg }}</span>
+              </el-form-item>
+            </el-form>
+          </section>
+        </el-tab-pane>
+      </el-tabs>
+    </main>
+  </div>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://unpkg.com/element-plus"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -11,6 +11,7 @@ import json
 import uuid
 import asyncio
 import logging
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -19,16 +20,20 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response, JSONResponse
+from starlette.responses import Response, JSONResponse, FileResponse
 from starlette.routing import Route, Mount
+from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp
 import uvicorn
+
+import web_config
 
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 import mcp.types as types
 
 from pageindex_mutil import PageIndexClient
+from pageindex_mutil.utils import configure_llm
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pageindex-mcp")
@@ -41,14 +46,18 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "3000"))
 WORKSPACE = os.getenv("WORKSPACE", "/app/data/workspace")
 DB_PATH = os.getenv("DB_PATH", "/app/data/index.db")
+# Static web console directory (module-relative so it resolves under Docker WORKDIR and local dev alike)
+WEB_DIR = Path(__file__).resolve().parent / "web"
 
 # ---------------------------------------------------------------------------
 # API Key middleware
 # ---------------------------------------------------------------------------
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Skip auth for health endpoint
-        if request.url.path == "/health":
+        # Skip auth for health + static console (page itself is public; API still gated)
+        if request.url.path == "/health" \
+                or request.url.path == "/" \
+                or request.url.path.startswith("/static"):
             return await call_next(request)
 
         # Allow OPTIONS for CORS preflight
@@ -94,6 +103,40 @@ def get_client() -> PageIndexClient:
     if client is None:
         raise RuntimeError("PageIndexClient not initialized")
     return client
+
+
+_startup_workspace = WORKSPACE
+_startup_db_path = DB_PATH
+
+
+def _rebuild_client(*, model=None, retrieve_model=None):
+    """Rebuild the global PageIndexClient with new model overrides.
+
+    Credentials live in the shared utils client (configure_llm); only model
+    names need a client rebuild because closet_index/router are bound at __init__.
+    Construct-first, then close+swap: a construction failure leaves the global
+    `client` pointing at the still-live old instance (not a closed one), so the
+    server is not bricked until restart.
+    """
+    global client
+    if client is None:
+        return
+    overrides = {}
+    if model:
+        overrides["model"] = model
+    if retrieve_model:
+        overrides["retrieve_model"] = retrieve_model
+    if not overrides:
+        return
+    new_client = PageIndexClient(
+        workspace=_startup_workspace, db_path=_startup_db_path, **overrides
+    )  # if this raises, the old `client` is untouched
+    try:
+        client.close()
+    except Exception:
+        pass
+    client = new_client
+    logger.info("Rebuilt PageIndexClient with overrides=%s", overrides)
 
 
 def _safe_remove_upload(pdf_path: str, workspace) -> None:
@@ -337,6 +380,139 @@ async def health_endpoint(request: Request) -> Response:
     return JSONResponse({"status": "ok", "documents": doc_count})
 
 
+async def documents_endpoint(request: Request) -> Response:
+    c = get_client()
+    docs = []
+    if c.db is not None:
+        try:
+            docs = c.db.get_all_documents()
+        except Exception:
+            logger.exception("documents_endpoint failed")
+    safe = [
+        {
+            "id": d.get("id"),
+            "doc_name": d.get("pdf_name"),
+            "doc_description": d.get("doc_description"),
+            "pdf_path": d.get("pdf_path"),
+        }
+        for d in docs
+    ]
+    return JSONResponse({"documents": safe})
+
+
+async def search_endpoint(request: Request) -> Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    query = (body or {}).get("query")
+    if not query or not str(query).strip():
+        return JSONResponse({"error": "Missing 'query'"}, status_code=400)
+    top_k = body.get("top_k", 3)
+    try:
+        result = await get_client().search(str(query).strip(), top_k=top_k)
+    except Exception as e:
+        logger.exception("search_endpoint failed")
+        return JSONResponse({"error": f"Search failed: {e}"}, status_code=500)
+    # Enrich matched_docs with doc_name for the UI: search returns doc_id=uuid,
+    # which does not align with /api/documents db-integer ids. The client's
+    # in-memory `documents` dict is uuid-keyed and holds doc_name, so resolve
+    # here. Additive + getattr-guarded so stub clients (e.g. SimpleNamespace
+    # without a `documents` attr) don't crash.
+    cl = get_client()
+    docs_in_mem = getattr(cl, "documents", None) or {}
+    for md in result.get("matched_docs", []) or []:
+        doc = docs_in_mem.get(md.get("doc_id"))
+        if doc:
+            md.setdefault("doc_name", doc.get("doc_name", ""))
+    return JSONResponse(result)
+
+
+async def config_get_endpoint(request: Request) -> Response:
+    snap = web_config.read_config_snapshot(get_client())
+    return JSONResponse(snap)
+
+
+async def config_post_endpoint(request: Request) -> Response:
+    try:
+        body = await request.json() or {}
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    persist = body.get("persist", True)
+    model = body.get("model")
+    retrieve_model = body.get("retrieve_model")
+    api_key = body.get("api_key")
+    base_url = body.get("base_url")
+
+    persisted = False
+    wrote_any = model or retrieve_model or api_key or base_url
+    try:
+        # 1) Runtime apply (immediate effect) + sync os.environ so the read-back
+        #    snapshot (which reads os.getenv via ConfigLoader/get_llm_config) is
+        #    consistent. configure_llm rebuilds the shared client but does NOT touch
+        #    os.environ; _rebuild_client sets client.model but ConfigLoader().load()
+        #    re-reads os.getenv — so without these env syncs the snapshot would be stale.
+        if api_key:
+            os.environ["OPENAI_API_KEY"] = api_key
+        if base_url:
+            os.environ["OPENAI_BASE_URL"] = base_url
+        if api_key or base_url:
+            configure_llm(api_key=api_key, base_url=base_url)
+        if model:
+            os.environ["MODEL_NAME"] = model
+        if retrieve_model:
+            os.environ["RETRIEVE_MODEL_NAME"] = retrieve_model
+        if model or retrieve_model:
+            _rebuild_client(model=model, retrieve_model=retrieve_model)
+
+        # 2) Persist to disk (per-file guarded backup -> targeted write -> verify).
+        #    spec §5.4 step 4 + §7.2: on ANY failure in apply or persist, restore the
+        #    .bak backups written below so config.yaml/.env return to their original
+        #    pre-request state (consistent failure state).
+        if persist and wrote_any:
+            if model or retrieve_model:
+                # config.yaml: back up + line-replace only when present
+                if web_config.DEFAULT_CONFIG_YAML.exists():
+                    web_config.backup_file(web_config.DEFAULT_CONFIG_YAML)
+                web_config.set_config_yaml_model(
+                    web_config.DEFAULT_CONFIG_YAML, model=model, retrieve_model=retrieve_model)
+                env_fields = {}
+                if model:
+                    env_fields["MODEL_NAME"] = model
+                if retrieve_model:
+                    env_fields["RETRIEVE_MODEL_NAME"] = retrieve_model
+                if web_config.DEFAULT_ENV.exists():
+                    web_config.backup_file(web_config.DEFAULT_ENV)
+                web_config.set_env_fields(web_config.DEFAULT_ENV, env_fields)
+            cred_fields = {}
+            if api_key:
+                cred_fields["OPENAI_API_KEY"] = api_key
+            if base_url:
+                cred_fields["OPENAI_BASE_URL"] = base_url
+            if cred_fields:
+                if web_config.DEFAULT_ENV.exists():
+                    web_config.backup_file(web_config.DEFAULT_ENV)
+                web_config.set_env_fields(web_config.DEFAULT_ENV, cred_fields)
+            persisted = True
+    except Exception as e:
+        logger.exception("config apply/persist failed; restoring .bak backups")
+        # spec §5.4 step 4: roll back each file whose .bak exists (restore original).
+        # Each restore is independently guarded so a restore failure can't mask the
+        # original error (it is logged instead).
+        for path in (web_config.DEFAULT_CONFIG_YAML, web_config.DEFAULT_ENV):
+            try:
+                bak = path.with_suffix(path.suffix + ".bak")
+                if bak.exists():
+                    shutil.copy2(bak, path)
+            except Exception as restore_err:
+                logger.error("rollback restore failed for %s: %s", path, restore_err)
+        return JSONResponse({"error": f"Persist failed: {e}", "applied": True,
+                             "persisted": False}, status_code=500)
+    snap = web_config.read_config_snapshot(get_client())
+    snap.update({"applied": True, "persisted": persisted})
+    return JSONResponse(snap)
+
+
 # Global semaphore to limit concurrent indexing during batch uploads
 _UPLOAD_SEMAPHORE = asyncio.Semaphore(3)
 
@@ -481,7 +657,7 @@ async def handle_sse(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: Starlette) -> AsyncIterator[None]:
-    global client
+    global client, _startup_workspace, _startup_db_path
     logger.info("Initializing PageIndexClient...")
     workspace = WORKSPACE
     db_path = DB_PATH
@@ -497,6 +673,8 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         logger.info("Using fallback workspace: %s", workspace)
 
+    _startup_workspace = workspace
+    _startup_db_path = db_path
     client = PageIndexClient(workspace=workspace, db_path=db_path)
     logger.info("PageIndexClient ready. Documents: %d", len(client.documents))
     yield
@@ -514,9 +692,15 @@ middleware = [
 ]
 
 routes = [
+    Route("/", endpoint=lambda request: FileResponse(str(WEB_DIR / "index.html")), methods=["GET"]),
     Route("/health", endpoint=health_endpoint, methods=["GET"]),
     Route("/upload", endpoint=upload_endpoint, methods=["POST", "OPTIONS"]),
+    Route("/api/documents", endpoint=documents_endpoint, methods=["GET"]),
+    Route("/api/search", endpoint=search_endpoint, methods=["POST"]),
+    Route("/api/config", endpoint=config_get_endpoint, methods=["GET"]),
+    Route("/api/config", endpoint=config_post_endpoint, methods=["POST"]),
     Route("/sse", endpoint=handle_sse, methods=["GET"]),
+    Mount("/static", app=StaticFiles(directory=str(WEB_DIR / "static")), name="static"),
     Mount("/messages/", app=sse_transport.handle_post_message),
 ]
 
