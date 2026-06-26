@@ -11,10 +11,24 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pageindex_mutil.utils import ConfigLoader
+
+# Raw model/retrieve_model defaults read straight from config.yaml (no env, no
+# ConfigLoader). The fallback tests below assert against these so they stay
+# valid when the shipped default model name changes (e.g. gpt-4.1-mini ->
+# deepseek-v4-flash) — they pin the *behavior* (env empty/whitespace -> yaml
+# default), not a specific model string.
+_CONFIG_YAML = Path(__file__).parent.parent / "pageindex_mutil" / "config.yaml"
+
+
+def _yaml_model_defaults():
+    """Return (model, retrieve_model) shipped in config.yaml, read raw."""
+    data = yaml.safe_load(_CONFIG_YAML.read_text(encoding="utf-8")) or {}
+    return data.get("model"), data.get("retrieve_model")
 
 
 # Keys that ConfigLoader must NOT treat as unknown when they come from the
@@ -41,9 +55,10 @@ class TestConfigLoaderModelEnv:
         monkeypatch.delenv("MODEL_NAME", raising=False)
         monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
         cfg = ConfigLoader().load(None)
-        # config.yaml ships gpt-4.1-mini for both (see pageindex_mutil/config.yaml).
-        assert cfg.model == "gpt-4.1-mini"
-        assert cfg.retrieve_model == "gpt-4.1-mini"
+        # Must equal whatever config.yaml currently ships (see pageindex_mutil/config.yaml).
+        yaml_model, yaml_retrieve = _yaml_model_defaults()
+        assert cfg.model == yaml_model
+        assert cfg.retrieve_model == yaml_retrieve
 
     def test_precedence_explicit_kwarg_beats_env(self, monkeypatch):
         """Caller-explicit model in load(user_opt) must win over MODEL_NAME env."""
@@ -87,10 +102,10 @@ class TestConfigLoaderModelEnv:
     # values must be stripped (leading/trailing whitespace removed).
 
     def test_whitespace_model_name_falls_back_to_yaml(self, monkeypatch):
-        """MODEL_NAME=' ' (whitespace only) must NOT override yaml — fall back to gpt-4.1-mini."""
+        """MODEL_NAME=' ' (whitespace only) must NOT override yaml — fall back to the yaml default."""
         monkeypatch.setenv("MODEL_NAME", " ")
         cfg = ConfigLoader().load(None)
-        assert cfg.model == "gpt-4.1-mini"  # NOT " "
+        assert cfg.model == _yaml_model_defaults()[0]  # NOT " "
 
     def test_whitespace_model_name_is_stripped(self, monkeypatch):
         """MODEL_NAME=' gpt-4o ' must be normalized to 'gpt-4o' (stripped)."""
@@ -102,13 +117,13 @@ class TestConfigLoaderModelEnv:
         """MODEL_NAME='' (empty string) must fall back to yaml default."""
         monkeypatch.setenv("MODEL_NAME", "")
         cfg = ConfigLoader().load(None)
-        assert cfg.model == "gpt-4.1-mini"
+        assert cfg.model == _yaml_model_defaults()[0]
 
     def test_whitespace_retrieve_model_name_falls_back(self, monkeypatch):
         """RETRIEVE_MODEL_NAME=' ' (whitespace only) must fall back to yaml retrieve_model."""
         monkeypatch.setenv("RETRIEVE_MODEL_NAME", " ")
         cfg = ConfigLoader().load(None)
-        assert cfg.retrieve_model == "gpt-4.1-mini"
+        assert cfg.retrieve_model == _yaml_model_defaults()[1]
 
 
 class TestConfigLoaderMagicNumbers:

@@ -27,11 +27,13 @@ load_dotenv()
 # Unified LLM config: the single source of truth lives in
 # pageindex_mutil.utils (configure_llm / _resolve_llm_config). main.py used to
 # duplicate the key/endpoint resolution and build its own OpenAI client; it now
-# delegates to the shared configure_llm() and reuses the shared client. This
-# keeps main.py's `_call_llm_json` behavior identical (same client, same endpoint)
-# while ensuring there is exactly one resolution path across the project.
+# delegates to the shared configure_llm() and resolves the shared client
+# per-call via get_llm_client(). Do NOT capture it into a module-level global:
+# a snapshot taken at import goes stale when the web console hot-switches
+# base_url/api_key (configure_llm rebuilds the shared client, but a captured
+# reference keeps pointing at the old, now-disabled credentials — the
+# single-document QA path hit exactly this 403 "Virtual key is disabled").
 configure_llm()
-client = get_llm_client()
 
 # MODEL_NAME now resolved via the SAME ConfigLoader path the server uses
 # (PageIndexClient -> ConfigLoader). Precedence: caller-explicit > MODEL_NAME
@@ -143,6 +145,7 @@ def _call_llm_json(prompt, extract_key=None, expect_list=False):
     If extract_key is set, pulls that key from a dict result.
     If expect_list is True, expects the result to be a list directly.
     """
+    client = get_llm_client()
     if not client:
         print("OpenAI client not initialized.")
         return []
@@ -281,6 +284,7 @@ def write_qa_log(log_f, record):
 
 
 def generate_answer(question, context):
+    client = get_llm_client()
     if not client:
         return "Error: OpenAI client not initialized."
 

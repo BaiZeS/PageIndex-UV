@@ -173,16 +173,26 @@ class TestRetrieveModelWiringMainPy:
         importlib.reload(main_mod)
         return main_mod
 
+    def _mock_client(self, main_mod, content):
+        """Stub get_llm_client so _call_llm_json/generate_answer use a mock
+        client capturing the `model` kwarg. main.py resolves the shared client
+        per-call via get_llm_client() (no module-level snapshot), so we patch
+        that accessor rather than a captured global."""
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock()]
+        mock_resp.choices[0].message.content = content
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = mock_resp
+        main_mod.get_llm_client = lambda: mock_client
+        return mock_client
+
     def test_call_llm_json_uses_retrieve_model_when_set(self, monkeypatch):
         """main.py:145 _call_llm_json -> model=RETRIEVE_MODEL_NAME or MODEL_NAME."""
         main_mod = self._import_main_with_env(monkeypatch, retrieve_model="r-model", model="m")
         # Mock the OpenAI client's chat.completions.create
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = '{"key": ["val"]}'
-        main_mod.client.chat.completions.create = MagicMock(return_value=mock_resp)
+        mock_client = self._mock_client(main_mod, '{"key": ["val"]}')
         main_mod._call_llm_json("prompt", extract_key="key")
-        assert main_mod.client.chat.completions.create.call_args[1]["model"] == "r-model"
+        assert mock_client.chat.completions.create.call_args[1]["model"] == "r-model"
 
     def test_call_llm_json_falls_back_to_model_when_retrieve_unset(self, monkeypatch):
         """NFR4: RETRIEVE_MODEL_NAME None/empty -> model=MODEL_NAME (the `or` fallback).
@@ -197,30 +207,21 @@ class TestRetrieveModelWiringMainPy:
         # Simulate the null/empty retrieve_model case (config.yaml retrieve_model
         # could be null, or RETRIEVE_MODEL_NAME env empty).
         main_mod.RETRIEVE_MODEL_NAME = None
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = '{"key": ["val"]}'
-        main_mod.client.chat.completions.create = MagicMock(return_value=mock_resp)
+        mock_client = self._mock_client(main_mod, '{"key": ["val"]}')
         main_mod._call_llm_json("prompt", extract_key="key")
-        assert main_mod.client.chat.completions.create.call_args[1]["model"] == "m"
+        assert mock_client.chat.completions.create.call_args[1]["model"] == "m"
 
     def test_generate_answer_uses_retrieve_model_when_set(self, monkeypatch):
         """main.py:292 generate_answer -> model=RETRIEVE_MODEL_NAME or MODEL_NAME."""
         main_mod = self._import_main_with_env(monkeypatch, retrieve_model="r-model", model="m")
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = "answer"
-        main_mod.client.chat.completions.create = MagicMock(return_value=mock_resp)
+        mock_client = self._mock_client(main_mod, "answer")
         main_mod.generate_answer("q", "ctx")
-        assert main_mod.client.chat.completions.create.call_args[1]["model"] == "r-model"
+        assert mock_client.chat.completions.create.call_args[1]["model"] == "r-model"
 
     def test_generate_answer_falls_back_to_model_when_retrieve_unset(self, monkeypatch):
         """NFR4: RETRIEVE_MODEL_NAME None/empty -> model=MODEL_NAME (the `or` fallback)."""
         main_mod = self._import_main_with_env(monkeypatch, retrieve_model="r-model", model="m")
         main_mod.RETRIEVE_MODEL_NAME = None
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = "answer"
-        main_mod.client.chat.completions.create = MagicMock(return_value=mock_resp)
+        mock_client = self._mock_client(main_mod, "answer")
         main_mod.generate_answer("q", "ctx")
-        assert main_mod.client.chat.completions.create.call_args[1]["model"] == "m"
+        assert mock_client.chat.completions.create.call_args[1]["model"] == "m"
