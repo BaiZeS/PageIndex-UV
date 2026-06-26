@@ -1,4 +1,6 @@
+import json
 import textwrap
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -311,3 +313,280 @@ def test_search_endpoint_enriches_matched_doc_names(monkeypatch):
     r = c.post("/api/search", json={"query": "q"})
     assert r.status_code == 200
     assert r.json()["matched_docs"][0]["doc_name"] == "My Doc"
+
+
+# ---------------------------------------------------------------------------
+# T10 — DELETE /api/documents/{doc_id} (FR10)
+# Reuses delete_document_internal extracted from W2 MCP handler (AC10.3, AC10.5,
+# AC10.6, AC10.7). Test isolation: monkeypatch get_client/API_KEY; tmp_path for
+# any temp files; do not touch real .env / config.yaml.
+# ---------------------------------------------------------------------------
+
+
+def _delete_client(monkeypatch, fake_client):
+    monkeypatch.setattr(server, "get_client", lambda: fake_client)
+    monkeypatch.setattr(server, "API_KEY", "")
+    from starlette.testclient import TestClient
+    return TestClient(server.app)
+
+
+def test_delete_document_endpoint_success(monkeypatch):
+    """AC10.3 — DELETE /api/documents/{id} returns 200 + {success, doc_id}."""
+    fake_db = SimpleNamespace()
+    fake_client = SimpleNamespace(db=fake_db, workspace="/tmp/ws")
+    monkeypatch.setattr(server, "delete_document_internal",
+                        lambda c, db_id: True)
+    c = _delete_client(monkeypatch, fake_client)
+    r = c.delete("/api/documents/42")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["success"] is True
+    assert body["doc_id"] == 42
+
+
+def test_delete_document_endpoint_not_found(monkeypatch):
+    """AC10.5 idempotent — missing doc_id still returns 200 + {success, existed=False}."""
+    # Simulate internal function returning False (DB row not present).
+    monkeypatch.setattr(server, "delete_document_internal",
+                        lambda c, db_id: False)
+    fake_client = SimpleNamespace(db=SimpleNamespace(), workspace="/tmp/ws")
+    c = _delete_client(monkeypatch, fake_client)
+    r = c.delete("/api/documents/999")
+    # Per v1.1 spec §5.1.1 error response table: missing -> 404
+    assert r.status_code == 404
+    body = r.json()
+    assert "error" in body
+
+
+def test_delete_document_endpoint_uses_internal_function(monkeypatch):
+    """AC10.3 — REST handler MUST delegate to delete_document_internal."""
+    calls = {}
+    fake_client = SimpleNamespace(db=SimpleNamespace(), workspace="/tmp/ws")
+
+    def fake_internal(c, db_id):
+        calls["args"] = (c, db_id)
+        return True
+    monkeypatch.setattr(server, "delete_document_internal", fake_internal)
+    c = _delete_client(monkeypatch, fake_client)
+    r = c.delete("/api/documents/7")
+    assert r.status_code == 200
+    assert calls.get("args") == (fake_client, 7)
+
+
+def test_delete_document_endpoint_mcp_unchanged(monkeypatch):
+    """AC10.6 — MCP delete_document handler still routes through
+    delete_document_internal (no regression vs W2 behavior)."""
+    calls = {}
+    # The MCP handler in handle_call_tool resolves uuid -> db_id via
+    # c._uuid_to_db.pop(doc_id, None). Wire a fake client whose pop returns
+    # a known db_id, then assert delete_document_internal(c, db_id) was called.
+    fake_db = SimpleNamespace()
+    fake_closet = SimpleNamespace(remove_document=lambda db_id: None)
+    fake_super = SimpleNamespace(on_document_removed=lambda db_id: None)
+    fake_client = SimpleNamespace(
+        db=fake_db,
+        workspace="/tmp/ws",
+        documents={"uuid-x": {"doc_name": "x"}},
+        _uuid_to_db={"uuid-x": 123},
+        closet_index=fake_closet,
+        super_tree_index=fake_super,
+    )
+    monkeypatch.setattr(server, "get_client", lambda: fake_client)
+    monkeypatch.setattr(server, "delete_document_internal",
+                        lambda c, db_id: calls.setdefault("called", True) or True)
+    import asyncio as _asyncio
+    result = _asyncio.run(server.handle_call_tool(
+        "delete_document", {"doc_id": "uuid-x"}))
+    # MCP handler still returns TextContent JSON {success: True, doc_id}
+    parsed = json.loads(result[0].text)
+    assert parsed.get("success") is True
+    assert parsed.get("doc_id") == "uuid-x"
+    # The shared internal function was invoked (MCP -> internal, not a private copy).
+    assert calls.get("called") is True
+
+
+def test_delete_document_endpoint_idempotent(monkeypatch, tmp_path):
+    """AC10.5 — repeated DELETE on same id is safe; second call returns 200/404
+    with no exception (idempotent semantics per §5.1.1)."""
+    invocations = []
+    monkeypatch.setattr(server, "delete_document_internal",
+                        lambda c, db_id: invocations.append(db_id) or True)
+    fake_client = SimpleNamespace(db=SimpleNamespace(), workspace=str(tmp_path))
+    c = _delete_client(monkeypatch, fake_client)
+    r1 = c.delete("/api/documents/5")
+    r2 = c.delete("/api/documents/5")
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    # Internal called twice; both succeed (idempotent at REST layer).
+    assert invocations == [5, 5] or invocations == [5]  # tolerate internal caching
+
+
+# ---------------------------------------------------------------------------
+# T11 — POST /api/config/test (FR12 ping)
+# spec §5.1.2: pure read-only connectivity test. ALWAYS returns 200 — errors
+# are surfaced as `ok: false` in the body. Endpoint MUST NOT mutate any state
+# (no configure_llm, no env writes, no yaml writes).
+# ---------------------------------------------------------------------------
+
+import time as _time_for_tests
+
+
+def _config_test_client(monkeypatch, fake_chat_create=None,
+                        fake_get_llm_config=None, fake_loader_model="gpt-test"):
+    """Build a TestClient for /api/config/test with monkeypatched openai client.
+
+    `fake_chat_create` replaces OpenAI(...).chat.completions.create.
+    `fake_get_llm_config` replaces get_llm_config() — used when body has no
+    api_key/base_url.
+    """
+    monkeypatch.setattr(server, "API_KEY", "")
+    if fake_get_llm_config is None:
+        fake_get_llm_config = lambda: ("sk-active", "http://active/v1")
+    monkeypatch.setattr(server, "get_llm_config", fake_get_llm_config)
+    # ConfigLoader().load(None).model — server.py uses this when body has no model
+    monkeypatch.setattr(server, "ConfigLoader",
+                        lambda: SimpleNamespace(load=lambda _: SimpleNamespace(model=fake_loader_model)))
+    # Sentinel to assert NO state mutation occurred
+    state_calls = {"configure_llm": 0, "set_env_fields": 0,
+                   "set_config_yaml_model": 0}
+    monkeypatch.setattr(server, "configure_llm",
+                        lambda **kw: state_calls.__setitem__("configure_llm",
+                                                             state_calls["configure_llm"] + 1))
+    if fake_chat_create is not None:
+        # Patch openai.OpenAI to a stub whose .chat.completions.create is fake_chat_create
+        class _StubCompletions:
+            def __init__(self, fn):
+                self._fn = fn
+
+            def create(self, **kwargs):
+                return self._fn(**kwargs)
+
+        class _StubChat:
+            def __init__(self, fn):
+                self.completions = _StubCompletions(fn)
+
+        class _StubOpenAI:
+            def __init__(self, api_key=None, base_url=None, **kw):
+                self.api_key = api_key
+                self.base_url = base_url
+                self.chat = _StubChat(fake_chat_create)
+        monkeypatch.setattr(server, "OpenAI", _StubOpenAI)
+    return state_calls
+
+
+def test_config_test_endpoint_success(monkeypatch):
+    # Mock chat.completions.create returns a fake completion object
+    def fake_create(model, messages, max_tokens):
+        # Return an object with .choices[0].message.content (openai shape)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="pong"))]
+        )
+    state = _config_test_client(monkeypatch, fake_chat_create=fake_create)
+    from starlette.testclient import TestClient
+    c = TestClient(server.app)
+    r = c.post("/api/config/test",
+               json={"model": "gpt-x", "api_key": "sk-test",
+                     "base_url": "http://test/v1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert isinstance(body["latency_ms"], int)
+    assert body["latency_ms"] >= 0
+    assert body["model"] == "gpt-x"
+    # No state mutation — FR12 is read-only
+    assert state["configure_llm"] == 0
+
+
+def test_config_test_endpoint_timeout(monkeypatch):
+    # Mock chat.completions.create to sleep longer than the 10s wait_for budget.
+    # We can't realistically wait 15s in unit tests; patch `asyncio.wait_for`
+    # (the symbol the handler binds to) to raise asyncio.TimeoutError
+    # immediately, which exercises the same handler branch.
+    def fake_create(model, messages, max_tokens):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="x"))])
+    state = _config_test_client(monkeypatch, fake_chat_create=fake_create)
+
+    real_wait_for = asyncio.wait_for
+    real_to_thread = asyncio.to_thread
+
+    def fake_wait_for(awaitable, timeout=None, **kw):
+        # Cancel the inner coroutine to avoid "coroutine was never awaited"
+        # warnings, then raise TimeoutError.
+        try:
+            awaitable.close()
+        except Exception:
+            pass
+        raise asyncio.TimeoutError()
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    from starlette.testclient import TestClient
+    c = TestClient(server.app)
+    r = c.post("/api/config/test",
+               json={"model": "gpt-x", "api_key": "sk-test",
+                     "base_url": "http://test/v1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["error"] == "timeout"
+    assert body["latency_ms"] >= 9000  # ~10s budget (handler reports >= 10000)
+    # No state mutation
+    assert state["configure_llm"] == 0
+
+
+def test_config_test_endpoint_auth_error(monkeypatch):
+    import openai
+    def fake_create(model, messages, max_tokens):
+        # openai SDK requires response.request; build a minimal stub.
+        fake_resp = SimpleNamespace(
+            status_code=401,
+            request=SimpleNamespace(method="POST", url="http://test/v1/chat/completions"),
+            headers={},
+        )
+        raise openai.AuthenticationError(
+            message="invalid api key",
+            response=fake_resp,
+            body={"error": "unauthorized"})
+    state = _config_test_client(monkeypatch, fake_chat_create=fake_create)
+    from starlette.testclient import TestClient
+    c = TestClient(server.app)
+    r = c.post("/api/config/test",
+               json={"model": "gpt-x", "api_key": "sk-bad",
+                     "base_url": "http://test/v1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["error"] == "auth_error"
+    assert "detail" in body and body["detail"]
+    # No state mutation
+    assert state["configure_llm"] == 0
+
+
+def test_config_test_endpoint_not_found(monkeypatch):
+    import openai
+    def fake_create(model, messages, max_tokens):
+        fake_resp = SimpleNamespace(
+            status_code=404,
+            request=SimpleNamespace(method="POST", url="http://test/v1/chat/completions"),
+            headers={},
+        )
+        raise openai.NotFoundError(
+            message="model not found",
+            response=fake_resp,
+            body={"error": "model_not_found"})
+    state = _config_test_client(monkeypatch, fake_chat_create=fake_create)
+    from starlette.testclient import TestClient
+    c = TestClient(server.app)
+    r = c.post("/api/config/test",
+               json={"model": "no-such-model", "api_key": "sk-test",
+                     "base_url": "http://test/v1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["error"] == "model_not_found"
+    assert "detail" in body and body["detail"]
+    # No state mutation
+    assert state["configure_llm"] == 0

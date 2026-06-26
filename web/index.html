@@ -59,11 +59,41 @@
               </div>
             </el-upload>
 
+            <!-- T13: per-file upload progress list (binds to T12's uploadProgress
+                 ref). One row per in-flight or recently-completed file. -->
+            <div v-if="Object.keys(uploadProgress).length" class="upload-progress-list">
+              <div
+                v-for="(p, name) in uploadProgress"
+                :key="name"
+                class="upload-row"
+                :class="{ failed: p.phase === 'failed', done: p.phase === 'done', cancelled: p.phase === 'cancelled' }">
+                <div class="upload-name" :title="name">{{ name }}</div>
+                <el-progress
+                  class="upload-bar"
+                  :percentage="p.total ? Math.round((p.loaded || 0) / p.total * 100) : 0"
+                  :status="p.phase === 'failed' ? 'exception' : (p.phase === 'done' ? 'success' : (p.phase === 'cancelled' ? 'warning' : ''))"
+                  :indeterminate="p.phase === 'indexing' || p.phase === 'queued'"
+                  :show-text="p.phase !== 'indexing' && p.phase !== 'queued'" />
+                <div class="upload-phase">{{ p.phase }}</div>
+                <el-button
+                  v-if="p.phase === 'uploading' || p.phase === 'queued' || p.phase === 'indexing'"
+                  size="small"
+                  class="upload-cancel"
+                  @click="cancelUpload(name)">取消</el-button>
+                <div v-if="p.error" class="upload-error" :title="p.error">{{ p.error }}</div>
+              </div>
+            </div>
+
             <div class="doc-table-wrap">
               <el-table :data="docs" class="doc-table" :empty-text="'暂无文档 — 上传后这里会出现列表'">
                 <el-table-column prop="id" label="#" width="64" align="center"></el-table-column>
                 <el-table-column prop="doc_name" label="文档" min-width="180"></el-table-column>
                 <el-table-column prop="doc_description" label="描述" min-width="240" show-overflow-tooltip></el-table-column>
+                <el-table-column label="操作" width="100" align="center">
+                  <template #default="scope">
+                    <el-button size="small" type="danger" plain @click="deleteDoc(scope.row)">删除</el-button>
+                  </template>
+                </el-table-column>
               </el-table>
             </div>
 
@@ -116,15 +146,10 @@
 
               <p class="answer-text">{{ answer.answer }}</p>
 
-              <div v-if="matchedRows.length" class="matches">
-                <h3 class="matches-title">命中文档</h3>
-                <ol class="match-list">
-                  <li v-for="(m, i) in matchedRows" :key="m.key" class="match-row">
-                    <span class="match-rank">{{ i + 1 }}</span>
-                    <span class="match-name">{{ m.name }}</span>
-                  </li>
-                </ol>
-              </div>
+              <!-- T13 (FR11): evidence chain — accordion of matched docs with
+                   selected_nodes + page snippets. Replaces the previous flat
+                   match list with a collapsible, per-doc evidence view. -->
+              <component :is="evidenceModule(answer)" v-if="answer" />
             </article>
 
             <div v-else class="empty-hint">输入问题后点击「提问」查看检索结果。</div>
@@ -163,6 +188,22 @@
               <el-form-item>
                 <el-button type="primary" @click="saveConfig">应用</el-button>
                 <span v-if="cfgMsg" class="cfg-msg">{{ cfgMsg }}</span>
+              </el-form-item>
+              <!-- T13 (FR12): connectivity self-test -->
+              <el-form-item label="连通性测试">
+                <el-button
+                  class="test-btn"
+                  :loading="testResult && testResult.status === 'loading'"
+                  @click="testConnectivity">测试当前配置</el-button>
+              </el-form-item>
+              <el-form-item v-if="testResult && testResult.status !== 'loading'" class="test-result">
+                <el-alert
+                  :type="testResult.ok ? 'success' : 'error'"
+                  :title="testResult.ok
+                    ? ('✓ 连接成功 (' + testResult.latency_ms + 'ms' + (testResult.model ? ' · ' + testResult.model : '') + ')')
+                    : ('✗ ' + (testResult.error || 'unknown') + (testResult.detail ? ' · ' + testResult.detail : ''))"
+                  :closable="false"
+                  show-icon />
               </el-form-item>
             </el-form>
           </section>

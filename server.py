@@ -32,8 +32,10 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 import mcp.types as types
 
+import openai
+from openai import OpenAI
 from pageindex_mutil import PageIndexClient
-from pageindex_mutil.utils import configure_llm
+from pageindex_mutil.utils import configure_llm, get_llm_config, ConfigLoader
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pageindex-mcp")
@@ -163,6 +165,58 @@ def _safe_remove_upload(pdf_path: str, workspace) -> None:
         logger.warning("Failed to remove upload file %s: %s", pdf_path, e)
 
 
+def delete_document_internal(c, db_id: int) -> bool:
+    """Shared delete pipeline for MCP `delete_document` and REST
+    `DELETE /api/documents/{doc_id}` (v1.1 spec §5.1.1 / AC10.3 / AC10.7).
+
+    Performs the full W2 delete chain: DB cascade (FR1) -> closet index
+    invalidation -> super-tree + kb_identity invalidation -> guarded disk
+    cleanup (FR4). R7 timing is preserved: pdf_path is captured BEFORE
+    `c.db.delete_document` because the row (and its `pdf_path` column)
+    is gone after the cascade. Each step is independently try/except-wrapped
+    so one failure cannot mask later cleanup; all failures are logged but
+    do not raise (W2 behavior the MCP handler has always exposed).
+
+    Returns True on the no-error path; False only when the DB layer is
+    unavailable (c.db is None) -- the REST handler maps this to 503.
+    """
+    if c.db is None:
+        return False
+    # R7 timing: fetch pdf_path BEFORE cascade delete (the row and its
+    # pdf_path column are gone after delete_document).
+    try:
+        doc = c.db.get_document_by_id(db_id)
+        pdf_path = doc.get("pdf_path") if doc else None
+    except Exception as e:
+        logger.warning("Failed to fetch document for disk cleanup: %s", e)
+        pdf_path = None
+
+    # FR1: DB cascade delete (documents + child tables).
+    try:
+        c.db.delete_document(db_id)
+    except Exception as e:
+        logger.warning("Failed to delete document from DB: %s", e)
+
+    # FR2: invalidate closet tags (idempotent via cascade even if this fails).
+    if getattr(c, "closet_index", None):
+        try:
+            c.closet_index.remove_document(db_id)
+        except Exception as e:
+            logger.warning("Failed to delete closet tags: %s", e)
+
+    # FR2: invalidate super-tree keyword index + kb identity.
+    if getattr(c, "super_tree_index", None):
+        try:
+            c.super_tree_index.on_document_removed(db_id)
+        except Exception as e:
+            logger.warning("Failed to invalidate super-tree index: %s", e)
+
+    # FR4: remove the uploaded file from disk (guarded by _safe_remove_upload).
+    if pdf_path:
+        _safe_remove_upload(pdf_path, c.workspace)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # MCP Server setup
 # ---------------------------------------------------------------------------
@@ -226,40 +280,10 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
                 del c.documents[doc_id]
 
             db_id = c._uuid_to_db.pop(doc_id, None)
-            if db_id is not None and c.db is not None:
-                # R7 timing: fetch pdf_path BEFORE cascade delete (the row and
-                # its pdf_path column are gone after delete_document).
-                try:
-                    doc = c.db.get_document_by_id(db_id)
-                    pdf_path = doc.get("pdf_path") if doc else None
-                except Exception as e:
-                    logger.warning("Failed to fetch document for disk cleanup: %s", e)
-                    pdf_path = None
-
-                # FR1: DB cascade delete (documents + child tables).
-                try:
-                    c.db.delete_document(db_id)
-                except Exception as e:
-                    logger.warning("Failed to delete document from DB: %s", e)
-
-                # FR2: invalidate closet tags (existing, idempotent via cascade).
-                if c.closet_index:
-                    try:
-                        c.closet_index.remove_document(db_id)
-                    except Exception as e:
-                        logger.warning("Failed to delete closet tags: %s", e)
-
-                # FR2: invalidate super-tree keyword index + kb identity.
-                if c.super_tree_index:
-                    try:
-                        c.super_tree_index.on_document_removed(db_id)
-                    except Exception as e:
-                        logger.warning("Failed to invalidate super-tree index: %s", e)
-
-                # FR4: remove the uploaded file from disk (guarded).
-                if pdf_path:
-                    _safe_remove_upload(pdf_path, c.workspace)
-
+            if db_id is not None:
+                # v1.1 spec §5.1.1: MCP and REST share delete_document_internal
+                # so behavior cannot drift between surfaces (AC10.6 / AC10.7).
+                delete_document_internal(c, db_id)
             return [types.TextContent(type="text", text=json.dumps({"success": True, "doc_id": doc_id}, ensure_ascii=False))]
 
         else:
@@ -400,6 +424,39 @@ async def documents_endpoint(request: Request) -> Response:
     return JSONResponse({"documents": safe})
 
 
+async def document_delete_endpoint(request: Request) -> Response:
+    """v1.1 spec section 5.1.1 / FR10 -- REST DELETE for a single document.
+
+    Path param `doc_id` is the integer primary key from `documents.id`
+    (NOT the v1.0 MCP UUID; see R-X1). Delegates the actual delete work
+    to `delete_document_internal` so MCP and REST cannot drift (AC10.7).
+
+    Responses:
+      200 {"success": true, "doc_id": <int>}        -- normal delete or
+         idempotent no-op (row already gone).
+      400 {"error": "doc_id must be integer"}        -- non-integer path param.
+      404 {"error": "Document not found"}            -- internal reports False.
+      500 {"error": "Delete failed: ..."}            -- unexpected exception.
+    """
+    raw = request.path_params.get("doc_id")
+    try:
+        doc_id = int(raw)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "doc_id must be integer"}, status_code=400)
+    try:
+        c = get_client()
+        if c.db is None:
+            return JSONResponse({"error": "DB unavailable"}, status_code=503)
+        ok = delete_document_internal(c, doc_id)
+        if not ok:
+            return JSONResponse({"error": "Document not found"}, status_code=404)
+    except Exception as e:
+        logger.exception("document_delete_endpoint failed")
+        return JSONResponse({"error": f"Delete failed: {e}"}, status_code=500)
+    return JSONResponse({"success": True, "doc_id": doc_id})
+
+
+
 async def search_endpoint(request: Request) -> Response:
     try:
         body = await request.json()
@@ -511,6 +568,112 @@ async def config_post_endpoint(request: Request) -> Response:
     snap = web_config.read_config_snapshot(get_client())
     snap.update({"applied": True, "persisted": persisted})
     return JSONResponse(snap)
+
+
+async def config_test_endpoint(request: Request) -> Response:
+    """FR12 ping — model connectivity test (spec §5.1.2).
+
+    Body (all optional, fallback to active config):
+      {model?: str, api_key?: str, base_url?: str}
+
+    Performs a minimal openai-compatible chat.completions.create call wrapped
+    in `asyncio.to_thread` + `asyncio.wait_for(timeout=10)`. NEVER writes state
+    (no configure_llm / env writes / yaml writes) — pure read-only ping.
+
+    Always returns HTTP 200. Errors are surfaced as `ok: false` in the body so
+    the frontend can render green/red based on `ok` (per spec §5.1.2 / AC12.4).
+    """
+    import time as _time
+
+    # Parse body (malformed JSON -> 400)
+    try:
+        body = await request.json() or {}
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    # A-RESOLVED-7: body overrides; fall back to active values.
+    active_key, active_url = get_llm_config()
+    api_key = body.get("api_key") or active_key
+    base_url = body.get("base_url") or active_url
+    # model: body overrides; else current ConfigLoader().load(None).model
+    model = body.get("model") or ConfigLoader().load(None).model
+
+    if not api_key or not model:
+        return JSONResponse(
+            {"ok": False, "error": "missing api_key or model",
+             "model": model, "base_url": base_url},
+            status_code=200,
+        )
+
+    # Build a TEMP openai client — never mutate the shared `_client`/`_async_client`.
+    # This keeps the ping read-only and lets the active client keep serving traffic.
+    temp_client = OpenAI(api_key=api_key, base_url=base_url)
+    start = _time.monotonic()
+
+    def _ping_call():
+        # A-RESOLVED-6: max_tokens=8, 10s timeout (via asyncio.wait_for outside).
+        return temp_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=8,
+        )
+
+    try:
+        # Run blocking sync openai call in a worker thread so the event loop
+        # stays free (NFR3: do not block other endpoints).
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_ping_call),
+            timeout=10.0,
+        )
+        latency_ms = int((_time.monotonic() - start) * 1000)
+        # Extract response snippet when available (best-effort, openai-shaped).
+        snippet = ""
+        try:
+            if result and getattr(result, "choices", None):
+                snippet = (result.choices[0].message.content or "")[:200]
+        except Exception:
+            snippet = ""
+        return JSONResponse(
+            {"ok": True, "latency_ms": latency_ms, "model": model,
+             "base_url": base_url, "response": snippet},
+            status_code=200,
+        )
+    except asyncio.TimeoutError:
+        # On timeout the budget was fully consumed; report the 10s budget so the
+        # frontend can show "Timeout after 10s" deterministically even if the
+        # caller never actually waited (test stubs, etc.).
+        latency_ms = int((_time.monotonic() - start) * 1000)
+        if latency_ms < 10_000:
+            latency_ms = 10_000
+        return JSONResponse(
+            {"ok": False, "error": "timeout", "latency_ms": latency_ms,
+             "model": model, "base_url": base_url},
+            status_code=200,
+        )
+    except openai.AuthenticationError as e:
+        latency_ms = int((_time.monotonic() - start) * 1000)
+        return JSONResponse(
+            {"ok": False, "error": "auth_error", "detail": str(e),
+             "latency_ms": latency_ms, "model": model, "base_url": base_url},
+            status_code=200,
+        )
+    except openai.NotFoundError as e:
+        latency_ms = int((_time.monotonic() - start) * 1000)
+        return JSONResponse(
+            {"ok": False, "error": "model_not_found", "detail": str(e),
+             "latency_ms": latency_ms, "model": model, "base_url": base_url},
+            status_code=200,
+        )
+    except Exception as e:
+        latency_ms = int((_time.monotonic() - start) * 1000)
+        logger.exception("config_test_endpoint unexpected error")
+        return JSONResponse(
+            {"ok": False, "error": type(e).__name__, "detail": str(e),
+             "latency_ms": latency_ms, "model": model, "base_url": base_url},
+            status_code=200,
+        )
 
 
 # Global semaphore to limit concurrent indexing during batch uploads
@@ -696,9 +859,11 @@ routes = [
     Route("/health", endpoint=health_endpoint, methods=["GET"]),
     Route("/upload", endpoint=upload_endpoint, methods=["POST", "OPTIONS"]),
     Route("/api/documents", endpoint=documents_endpoint, methods=["GET"]),
+    Route("/api/documents/{doc_id:int}", endpoint=document_delete_endpoint, methods=["DELETE"]),
     Route("/api/search", endpoint=search_endpoint, methods=["POST"]),
     Route("/api/config", endpoint=config_get_endpoint, methods=["GET"]),
     Route("/api/config", endpoint=config_post_endpoint, methods=["POST"]),
+    Route("/api/config/test", endpoint=config_test_endpoint, methods=["POST"]),
     Route("/sse", endpoint=handle_sse, methods=["GET"]),
     Mount("/static", app=StaticFiles(directory=str(WEB_DIR / "static")), name="static"),
     Mount("/messages/", app=sse_transport.handle_post_message),

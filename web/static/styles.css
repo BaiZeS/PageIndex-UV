@@ -196,6 +196,50 @@ body {
 .upload-log li.fail .log-status { color: var(--danger); }
 .upload-log .log-name { color: var(--text); }
 
+/* ── T13 (FR9 binding) — per-file upload progress list ─────────────────── */
+.upload-progress-list { margin-top: 16px; display: flex; flex-direction: column; gap: 6px; }
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-2);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.upload-row.done      { border-left-color: var(--accent-2); }
+.upload-row.failed    { border-left-color: var(--danger); }
+.upload-row.cancelled { border-left-color: var(--warn); }
+.upload-name {
+  flex: 0 0 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.upload-bar { flex: 1; min-width: 0; }
+.upload-bar :deep(.el-progress__text) { color: var(--text-muted) !important; font-size: 12px; }
+.upload-phase {
+  flex: 0 0 80px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.upload-cancel { flex: 0 0 auto; }
+.upload-error {
+  flex: 1 1 100%;
+  color: var(--danger);
+  font-size: 12px;
+  padding-top: 4px;
+  word-break: break-all;
+}
+
 /* ── QA tab ─────────────────────────────────────────────────────────────── */
 .ask-row { display: flex; gap: 12px; align-items: stretch; margin-bottom: 20px; }
 .ask-input { flex: 1; }
@@ -313,6 +357,55 @@ body {
 }
 .match-name { color: var(--text); font-size: 13px; word-break: break-all; }
 
+/* ── T13 (FR11) — evidence module (matched_docs + selected_nodes + pages) ─ */
+.evidence-module { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.evidence-summary { color: var(--text-muted); font-size: 12px; margin-bottom: 10px; font-family: var(--mono); letter-spacing: 0.3px; }
+.evidence-empty { color: var(--text-muted); font-size: 13px; padding: 16px; text-align: center; background: var(--surface); border: 1px dashed var(--border); border-radius: var(--radius-sm); }
+.evidence-empty-sub { color: var(--text-muted); font-size: 12px; padding: 4px 0; }
+.evidence-module :deep(.el-collapse) { border: none; background: transparent; }
+.evidence-module :deep(.el-collapse-item__header) {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 12px;
+  color: var(--text);
+  font-size: 13px;
+  margin-bottom: 6px;
+  transition: border-color .15s ease, background .15s ease;
+}
+.evidence-module :deep(.el-collapse-item__header:hover) { border-color: var(--accent-2); }
+.evidence-module :deep(.el-collapse-item__header.is-active) {
+  border-color: var(--accent-2);
+  background: var(--accent-soft);
+}
+.evidence-module :deep(.el-collapse-item__wrap) { border: none; background: transparent; }
+.evidence-module :deep(.el-collapse-item__content) { padding: 8px 12px 14px; }
+.evidence-section-title {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin: 10px 0 6px;
+}
+.evidence-nodes, .evidence-pages { display: flex; flex-direction: column; gap: 6px; }
+.evidence-node, .evidence-page {
+  padding: 8px 12px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.6;
+  border-left: 2px solid var(--border);
+  background: var(--surface);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+.evidence-node-title { font-weight: 600; color: var(--text); margin-bottom: 2px; }
+.evidence-node-path { color: var(--text-muted); font-family: var(--mono); font-size: 11px; margin-bottom: 4px; word-break: break-all; }
+.evidence-node-summary { color: var(--text); font-size: 12px; }
+.evidence-node-pages { color: var(--accent); font-size: 11px; font-family: var(--mono); margin-top: 4px; }
+.evidence-page { display: flex; gap: 8px; align-items: flex-start; }
+.evidence-page-num { color: var(--accent); font-family: var(--mono); font-size: 11px; flex: 0 0 60px; }
+.evidence-page-text { color: var(--text); font-size: 12px; flex: 1; }
+
 /* ── Config tab ─────────────────────────────────────────────────────────── */
 .current-card {
   display: flex;
@@ -343,6 +436,18 @@ body {
 
 .cfg-form { max-width: 560px; }
 .cfg-msg { color: var(--accent-2); font-size: 13px; margin-left: 8px; }
+
+/* ── T13 (FR12) — connectivity test button + result alert ──────────────── */
+.test-btn { min-width: 140px; }
+.test-result :deep(.el-alert) {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+}
+.test-result :deep(.el-alert--success) { border-left: 3px solid var(--accent-2); }
+.test-result :deep(.el-alert--error)   { border-left: 3px solid var(--danger); }
+.test-result :deep(.el-alert__title) { color: var(--text); font-weight: 500; font-size: 13px; }
 
 /* ==========================================================================
    Element Plus overrides — dark theme
