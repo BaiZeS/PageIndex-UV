@@ -1,6 +1,6 @@
-# Web Console Design System (v1.2)
+# Web Console Design System
 
-> Frozen at v1.2.0. Source of truth: [`web/static/tokens.css`](../web/static/tokens.css).
+Source of truth: [`web/static/tokens.css`](../web/static/tokens.css).
 
 The web console uses a **hybrid** design language — **C**-school (editorial calm: Aesop, MUJI, paper-like) as the substrate, **A**-school (builder SaaS precision: Linear, Vercel, JetBrains-Mono-for-data) for the details.
 

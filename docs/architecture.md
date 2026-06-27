@@ -1,7 +1,4 @@
-# Architecture Overview
-
-> **Status**: frozen at v1.2.0 (commit `3d09544`)
-> **Audience**: contributors + integrators who want a single mental model of the system.
+# Architecture
 
 PageIndex-UV is a **non-vector, reasoning-based RAG** tool over long documents (PDF / Markdown). It exposes both an interactive CLI and an MCP server, backed by a shared `PageIndexClient` runtime.
 
@@ -107,4 +104,4 @@ The convention is `spec.md` (what & why) + `tasks.md` (how, broken into atomic t
 - **HTTP API** (`/api/*`) is the public contract for integrators; additive changes only within a major.
 - **MCP tool schemas** are public; adding optional fields is non-breaking.
 - **`pageindex_mutil/`** is internal — refactors don't bump the version.
-- **Web console** (`web/static/*`) ships with the server; pin via the server's commit hash.
+- **Web console** (`web/static/*`) ships with the server; pin via the server release.

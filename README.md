@@ -1,8 +1,5 @@
 # PageIndex-UV
 
-> **v1.2.0** — web console modular refactor + C+A design system + bug-fix pass
-> See [`docs/release-notes/v1.2.0.md`](docs/release-notes/v1.2.0.md) for what changed.
-
 ## 项目简介
 
 **PageIndex-UV** 是一个基于 [PageIndex](https://github.com/VectifyAI/PageIndex) 思想的文档结构化索引与推理问答工具，使用现代化的 Python 工具链进行管理。本项目专注于**非向量化（Vectorless）、基于推理（Reasoning-based）**的方式处理长文档（PDF/Markdown），所有核心代码内联在仓库中，无需外部子模块。
@@ -13,15 +10,7 @@
 
 通过解析文档的自然层级结构（目录树），结合 LLM 的推理能力，本工具能够生成带有摘要、页码映射和层级关系的 JSON 索引，为后续的 RAG（检索增强生成）任务提供高精度的上下文定位支持。
 
-## 文档导航
-
-| 想要... | 看 |
-|---|---|
-| 理解系统整体结构 | [`docs/architecture.md`](docs/architecture.md) |
-| 知道 v1.2 改了什么 | [`docs/release-notes/v1.2.0.md`](docs/release-notes/v1.2.0.md) |
-| 设计 web 控制台 / 改样式 | [`docs/web-console-design-system.md`](docs/web-console-design-system.md) |
-| 集成 MCP 客户端 | [`docs/mcp-tools.md`](docs/mcp-tools.md) |
-| 改某个 feature 的逻辑 | `docs/design-docs/PageIndex/<feature>/{spec,tasks}.md` |
+详见 [`docs/architecture.md`](docs/architecture.md)、[`docs/web-console-design-system.md`](docs/web-console-design-system.md)、[`docs/mcp-tools.md`](docs/mcp-tools.md)。
 
 ### 核心步骤
 
@@ -555,55 +544,6 @@ curl -X POST \
   - 凭据 / `base_url` → 写入 `.env`。
   - **写盘前自动备份 `.bak`**；若写盘失败，`.bak` 保留作为回滚。
 - **CDN 依赖**：前端通过 `unpkg.com` 加载 Vue 3 + Element Plus，因此**运行环境需要能访问外网**（CDN）。无法访问外网时页面可打开但组件无法加载。
-
-### v1.1 新增功能
-
-v1.1 在 v1.0 三个标签页基础上新增 4 个特性：上传进度条（FR9）、文档删除（FR10）、问答证据源（FR11）、模型连通性测试（FR12）。
-
-#### 上传进度条 (FR9)
-
-打开 `http://localhost:3000/` → 文档 Tab → 拖拽或选择 PDF/Markdown 文件：
-
-- 每个文件单独显示进度条（0% → 100% 字节级进度，通过 `XMLHttpRequest.upload.onprogress` 拿真实字节事件）
-- 上传完成后短暂显示「索引中」不确定状态（indeterminate 灰色进度条 + spinner）
-- 失败时变红 + 错误消息
-- 队列中或上传中的文件可点击「取消」（前端调用 `XMLHttpRequest.abort()`，后端继续处理已上传字节）
-- 整体顶部汇总进度条（已完成数 / 总数）
-- 多文件批量上传时每个文件独立显示阶段状态：`queued → uploading → indexing → succeeded/failed`
-
-#### 文档删除 (FR10)
-
-文档 Tab → 表格行 → 点击「删除」：
-
-- 弹出确认对话框：`删除文档 "{name}"?此操作不可恢复`（ElementPlus `ElMessageBox.confirm`）
-- 确认后调用 `DELETE /api/documents/{id}`，复用 W2 删除路径（DB cascade + 索引失效 + 磁盘清理 + KBIdentity 失效）
-- 成功 → Toast 提示 + 表格移除该行
-- 失败 → 红色错误 toast + 行保留
-- 幂等：重复删除同一文档不会报错（`DELETE 0` 行视为成功）
-- 注意：MCP `delete_document` 工具走同一内部函数 `delete_document_internal()`（行为一致）
-
-#### 证据来源 (FR11)
-
-问答 Tab → 提问后 → 答案下方显示证据模块：
-
-- 默认折叠的 `<el-collapse>` 面板，标题显示「证据 (N 篇 · M 节点 · X 页码)」
-- 顶部汇总行：`基于 N 篇文档 · 引用 M 个节点 · 涉及 X 个页码`
-- 每个匹配文档作为一个折叠项，标题显示 `文档名 · 匹配度`
-- 展开后显示该文档的 `doc_description` 截断、相关页码列表、每个 selected_node 的标题 + 摘要片段（前 200 字符）
-- 证据为空时（`matched_docs=[]`）显示占位「未找到相关证据」
-- 后端零改动 —— `POST /api/search` 已返回 `matched_docs` / `selected_nodes` / `pages` 字段，前端直接消费
-
-#### 模型连通性测试 (FR12)
-
-模型配置 Tab → 底部「连通性测试」按钮（独立于「应用」按钮）：
-
-- 调用 `POST /api/config/test`，使用当前表单值（空字段回退到活动配置）
-- 发送最小 ping 请求：`chat.completions.create(messages=[{"role":"user","content":"ping"}], max_tokens=8)`，10 秒超时
-- 成功：`✓ 连接成功 (312 ms)` 绿色提示，显示使用的 model 和 base_url
-- 失败：`✗ {error_type}: {detail}` 红色提示（如 `401 Unauthorized` / `model not found` / `Timeout after 10s`）
-- 不修改任何配置或环境变量（纯只读 ping，不影响 `os.environ` / `config.yaml` / `.env`）
-- 端点与 `POST /api/config` 完全解耦，失败不影响「应用」按钮
-- 注意：测试通过 ≠ 实际可用，请保存后用真实问答验证
 
 ---
 

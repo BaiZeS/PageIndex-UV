@@ -1,6 +1,5 @@
 # MCP Tools Reference
 
-> Server: `pageindex-uv` v1.27.0 (the underlying `pageindex` package's version — see `pyproject.toml`)
 > Protocol: MCP `2025-11-25`
 > Transport: HTTP + SSE (`GET /sse`, `POST /messages/?session_id=…`)
 > Auth: `X-API-Key` header (same as REST API)
