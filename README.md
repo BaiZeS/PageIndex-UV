@@ -1,5 +1,8 @@
 # PageIndex-UV
 
+> **v1.2.0** — web console modular refactor + C+A design system + bug-fix pass
+> See [`docs/release-notes/v1.2.0.md`](docs/release-notes/v1.2.0.md) for what changed.
+
 ## 项目简介
 
 **PageIndex-UV** 是一个基于 [PageIndex](https://github.com/VectifyAI/PageIndex) 思想的文档结构化索引与推理问答工具，使用现代化的 Python 工具链进行管理。本项目专注于**非向量化（Vectorless）、基于推理（Reasoning-based）**的方式处理长文档（PDF/Markdown），所有核心代码内联在仓库中，无需外部子模块。
@@ -9,6 +12,16 @@
 2. **MCP 标准化服务** (`server.py`)：通过 Model Context Protocol (SSE 传输) 对外暴露 RAG 检索能力，支持 Claude Desktop、Cursor 等 Agent 工具直接调用，同时提供 HTTP 文件上传接口。
 
 通过解析文档的自然层级结构（目录树），结合 LLM 的推理能力，本工具能够生成带有摘要、页码映射和层级关系的 JSON 索引，为后续的 RAG（检索增强生成）任务提供高精度的上下文定位支持。
+
+## 文档导航
+
+| 想要... | 看 |
+|---|---|
+| 理解系统整体结构 | [`docs/architecture.md`](docs/architecture.md) |
+| 知道 v1.2 改了什么 | [`docs/release-notes/v1.2.0.md`](docs/release-notes/v1.2.0.md) |
+| 设计 web 控制台 / 改样式 | [`docs/web-console-design-system.md`](docs/web-console-design-system.md) |
+| 集成 MCP 客户端 | [`docs/mcp-tools.md`](docs/mcp-tools.md) |
+| 改某个 feature 的逻辑 | `docs/design-docs/PageIndex/<feature>/{spec,tasks}.md` |
 
 ### 核心步骤
 

@@ -30,19 +30,14 @@ logs/
 # ===== 大文件(PDF 等) =====
 *.pdf
 
-# ===== 历史路径遗留产物(重构前结构) =====
-PageIndex/tests/pdfs/
-PageIndex/tests/results/
-docs/mempalace/
-
 # ===== Git worktree =====
 .worktrees/
 
 # ===== AI 助手本地配置(不提交) =====
 .claude/
+.superpowers/
 CLAUDE.md
 AGENTS.md
-docs/devkit/
 
 # ===== devkit 过程产物(handoff 交接文件,不提交) =====
 **/handoff.md
