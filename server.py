@@ -77,6 +77,23 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
 
 # ---------------------------------------------------------------------------
+# No-cache middleware for the static console
+# ---------------------------------------------------------------------------
+class NoCacheStaticMiddleware(BaseHTTPMiddleware):
+    """Disable HTTP caching for /static/* so front-end edits to CSS/JS
+    are picked up on the next page load without the user having to
+    hard-reload or hunt for the right query-string. Only applies to the
+    app's own /static/ tree — external CDNs (Vue, Element Plus, fonts)
+    keep their normal caching policies."""
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+
+# ---------------------------------------------------------------------------
 # CORS middleware
 # ---------------------------------------------------------------------------
 class CORSMiddleware(BaseHTTPMiddleware):
@@ -852,6 +869,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
 middleware = [
     Middleware(CORSMiddleware),
     Middleware(APIKeyMiddleware),
+    Middleware(NoCacheStaticMiddleware),
 ]
 
 routes = [
