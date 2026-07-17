@@ -311,7 +311,13 @@ class AgenticRouter:
                 "confidence": "low",
                 "matched_docs": matched,
                 "selected_nodes": [
-                    {"node_id": n.get("node_id"), "title": n.get("title")}
+                    {
+                    "node_id": n.get("node_id"),
+                    "title": n.get("title"),
+                    "summary": n.get("summary", ""),
+                    "text": n.get("text", ""),
+                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
+                }
                     for n in nodes
                 ],
                 "pages": [
@@ -328,7 +334,13 @@ class AgenticRouter:
             "confidence": conf,
             "matched_docs": matched,
             "selected_nodes": [
-                {"node_id": n.get("node_id"), "title": n.get("title")}
+                {
+                    "node_id": n.get("node_id"),
+                    "title": n.get("title"),
+                    "summary": n.get("summary", ""),
+                    "text": n.get("text", ""),
+                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
+                }
                 for n in nodes
             ],
             "pages": [
@@ -458,7 +470,13 @@ class AgenticRouter:
                 "confidence": "low",
                 "matched_docs": matched,
                 "selected_nodes": [
-                    {"node_id": n.get("node_id"), "title": n.get("title")}
+                    {
+                    "node_id": n.get("node_id"),
+                    "title": n.get("title"),
+                    "summary": n.get("summary", ""),
+                    "text": n.get("text", ""),
+                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
+                }
                     for n in nodes
                 ],
                 "pages": [
@@ -490,7 +508,13 @@ class AgenticRouter:
                             for d, s in fused[: top_k * 2]
                         ],
                         "selected_nodes": [
-                            {"node_id": n.get("node_id"), "title": n.get("title")}
+                            {
+                    "node_id": n.get("node_id"),
+                    "title": n.get("title"),
+                    "summary": n.get("summary", ""),
+                    "text": n.get("text", ""),
+                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
+                }
                             for n in nodes2
                         ],
                         "pages": [
@@ -509,7 +533,13 @@ class AgenticRouter:
             "confidence": conf,
             "matched_docs": matched,
             "selected_nodes": [
-                {"node_id": n.get("node_id"), "title": n.get("title")}
+                {
+                    "node_id": n.get("node_id"),
+                    "title": n.get("title"),
+                    "summary": n.get("summary", ""),
+                    "text": n.get("text", ""),
+                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
+                }
                 for n in nodes
             ],
             "pages": [
