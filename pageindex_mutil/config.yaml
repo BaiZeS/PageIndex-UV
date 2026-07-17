@@ -45,3 +45,8 @@ max_super_tree_tokens: 6000
 summary_max_len: 100
 tau_high: 0.7
 tau_low: 0.4
+
+# LiteParse multi-format parsing
+liteparse_ocr_enabled: true
+liteparse_ocr_language: "eng"
+liteparse_dpi: 150

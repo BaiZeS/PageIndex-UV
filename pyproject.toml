@@ -1,6 +1,6 @@
 [project]
 name = "pageindex-uv"
-version = "0.1.0"
+version = "0.2.0"
 description = "Document structure indexing and reasoning-based RAG with MCP service"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,6 +8,7 @@ dependencies = [
     "openai>=2.8.0",
     "pymupdf==1.26.4",
     "pypdf2==3.0.1",
+    "liteparse>=2.6.0",
     "python-dotenv==1.1.0",
     "pyyaml==6.0.2",
     "tiktoken==0.11.0",

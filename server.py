@@ -725,6 +725,8 @@ def _determine_mode(filename: str) -> str:
         return "pdf"
     elif name_lower.endswith(".md") or name_lower.endswith(".markdown"):
         return "md"
+    # All other supported formats (docx, pptx, xlsx, images, etc.)
+    # are handled via LiteParse in auto mode
     return "auto"
 
 

@@ -12,6 +12,7 @@ from .retrieve import get_document, get_document_structure, get_page_content
 from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, create_node_mapping, configure_llm
 from .closet_index import ClosetIndex
 from .super_tree import SuperTreeIndex
+from .page_index_liteparse import is_liteparse_format, liteparse_to_tree
 
 # Optional: db.py lives at project root; gracefully degrade if unavailable.
 try:
@@ -140,6 +141,35 @@ class PageIndexClient:
             self.documents[doc_id] = {
                 'id': doc_id,
                 'type': 'md',
+                'path': file_path,
+                'doc_name': result.get('doc_name', ''),
+                'doc_description': result.get('doc_description', ''),
+                'line_count': result.get('line_count', 0),
+                'structure': result['structure'],
+            }
+        elif mode == "auto" and is_liteparse_format(file_path):
+            logging.info("Indexing via LiteParse: %s", file_path)
+            coro = liteparse_to_tree(
+                file_path=file_path,
+                model=self.model,
+                if_thinning=False,
+                if_add_node_summary='yes',
+                summary_token_threshold=200,
+                if_add_doc_description='yes',
+                if_add_node_text='yes',
+                if_add_node_id='yes'
+            )
+            try:
+                asyncio.get_running_loop()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    result = pool.submit(asyncio.run, coro).result()
+            except RuntimeError:
+                result = asyncio.run(coro)
+
+            doc_type = ext.lstrip('.')
+            self.documents[doc_id] = {
+                'id': doc_id,
+                'type': doc_type,
                 'path': file_path,
                 'doc_name': result.get('doc_name', ''),
                 'doc_description': result.get('doc_description', ''),
@@ -419,7 +449,13 @@ class PageIndexClient:
             "confidence": "high",
             "matched_docs": [{"doc_id": doc_id, "score": 1.0}],
             "selected_nodes": [
-                {"node_id": n.get("node_id"), "title": n.get("title")}
+                {
+                    "node_id": n.get("node_id"),
+                    "title": n.get("title"),
+                    "summary": n.get("summary", ""),
+                    "text": n.get("text", ""),
+                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
+                }
                 for n in selected
             ],
             "pages": [{"doc_id": doc_id, "pages": sorted(set(pages))}],

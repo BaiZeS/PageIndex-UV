@@ -188,7 +188,13 @@ def list_pdfs(directory):
 # Batch upload helpers for /add command
 # ---------------------------------------------------------------------------
 
-_ALLOWED_EXTENSIONS = ('.pdf', '.md', '.markdown')
+_ALLOWED_EXTENSIONS = (
+    '.pdf', '.md', '.markdown',
+    '.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls',
+    '.odt', '.ods', '.odp',
+    '.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif', '.webp',
+    '.html', '.htm', '.txt', '.csv', '.rtf',
+)
 
 
 def _resolve_upload_paths(raw_path, pdf_dir):
