@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 import textwrap
 from datetime import datetime
 import time
@@ -121,12 +122,12 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 return content, finish_reason
             return content
         except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
+            logging.warning("LLM call failed (attempt %d/%d): %s", i + 1, max_retries, e)
             if i < max_retries - 1:
-                time.sleep(1)
+                delay = min(2 ** i, 60) + random.uniform(0, 1)
+                time.sleep(delay)
             else:
-                logging.error('Max retries reached for prompt: ' + prompt)
+                logging.error('Max retries reached for prompt: ' + prompt[:100])
                 if return_finish_reason:
                     return "", "error"
                 return ""
@@ -147,12 +148,12 @@ async def llm_acompletion(model, prompt):
             )
             return response.choices[0].message.content
         except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
+            logging.warning("Async LLM call failed (attempt %d/%d): %s", i + 1, max_retries, e)
             if i < max_retries - 1:
-                await asyncio.sleep(1)
+                delay = min(2 ** i, 60) + random.uniform(0, 1)
+                await asyncio.sleep(delay)
             else:
-                logging.error('Max retries reached for prompt: ' + prompt)
+                logging.error('Max retries reached for prompt: ' + prompt[:100])
                 return ""
             
             
@@ -216,7 +217,7 @@ def extract_json(content):
             # Remove any trailing commas before closing brackets/braces
             json_content = json_content.replace(',]', ']').replace(',}', '}')
             return json.loads(json_content)
-        except:
+        except Exception:
             logging.error("Failed to parse JSON even after cleanup")
             return {}
     except Exception as e:
@@ -235,21 +236,6 @@ def write_node_id(data, node_id=0):
             node_id = write_node_id(data[index], node_id)
     return node_id
 
-def get_nodes(structure):
-    if isinstance(structure, dict):
-        structure_node = copy.deepcopy(structure)
-        structure_node.pop('nodes', None)
-        nodes = [structure_node]
-        for key in list(structure.keys()):
-            if 'nodes' in key:
-                nodes.extend(get_nodes(structure[key]))
-        return nodes
-    elif isinstance(structure, list):
-        nodes = []
-        for item in structure:
-            nodes.extend(get_nodes(item))
-        return nodes
-    
 def structure_to_list(structure):
     if isinstance(structure, dict):
         nodes = []
@@ -746,15 +732,28 @@ def format_structure(structure, order=None):
 
 
 class ConfigLoader:
+    _cache: dict = {}  # class-level cache: path_str -> (mtime, dict)
+
     def __init__(self, default_path: str = None):
         if default_path is None:
             default_path = Path(__file__).parent / "config.yaml"
-        self._default_dict = self._load_yaml(default_path)
+        self._default_path = Path(default_path)
+        self._default_dict = self._load_yaml_cached(self._default_path)
 
-    @staticmethod
-    def _load_yaml(path):
+    @classmethod
+    def _load_yaml_cached(cls, path):
+        path_str = str(path)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        cached = cls._cache.get(path_str)
+        if cached and cached[0] == mtime:
+            return cached[1]
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            data = yaml.safe_load(f) or {}
+        cls._cache[path_str] = (mtime, data)
+        return data
 
     def _validate_keys(self, user_dict):
         unknown_keys = set(user_dict) - set(self._default_dict)

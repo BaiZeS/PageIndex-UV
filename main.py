@@ -20,6 +20,19 @@ from pageindex_mutil.utils import (
     get_llm_client,
     ConfigLoader,
 )
+from pageindex_mutil.reasoning import (
+    _call_llm_json,
+    pages_from_nodes,
+    get_relevant_nodes,
+    get_relevant_pages,
+    extract_text_from_db,
+    generate_answer,
+    build_context_with_budget,
+    get_relevant_documents_for_multidoc,
+    MAX_CONTEXT_TOKENS,
+    MODEL_NAME,
+    RETRIEVE_MODEL_NAME,
+)
 
 # Load environment variables
 load_dotenv()
@@ -35,31 +48,11 @@ load_dotenv()
 # single-document QA path hit exactly this 403 "Virtual key is disabled").
 configure_llm()
 
-# MODEL_NAME now resolved via the SAME ConfigLoader path the server uses
-# (PageIndexClient -> ConfigLoader). Precedence: caller-explicit > MODEL_NAME
-# env > config.yaml default. main.py passes no overrides, so an env var (if set)
-# wins, otherwise the config.yaml `model` default is used.
-#
-# Behavior change vs the old `os.getenv("MODEL_NAME", "qwen-plus")` (intentional
-# unification, documented in handoff-model-unify.md behavior_changes Row B):
-# when MODEL_NAME env is UNSET, the OLD code used a hardcoded "qwen-plus" literal
-# and IGNORED config.yaml `model`; the NEW code honors config.yaml `model`. For
-# the shipped default (config.yaml ships `model: qwen-plus`) behavior matches,
-# but a CUSTOMIZED config.yaml `model` is now honored by the CLI too. When
-# MODEL_NAME env is set, both old and new use that value (new additionally strips
-# surrounding whitespace).
-MODEL_NAME = ConfigLoader().load(None).model
-# RETRIEVE_MODEL_NAME: retrieval-path model (query-time LLM calls in
-# _call_llm_json / generate_answer). When unset/empty, falls back to MODEL_NAME
-# (NFR4 backward compat). Resolved via the same ConfigLoader path (RETRIEVE_MODEL_NAME
-# env > config.yaml retrieve_model default).
-RETRIEVE_MODEL_NAME = ConfigLoader().load(None).retrieve_model
+# MODEL_NAME / RETRIEVE_MODEL_NAME / MAX_CONTEXT_TOKENS are now resolved
+# centrally in pageindex_mutil.reasoning and imported from there.
 
 if not get_llm_config()[0]:
     print("Warning: API Key not found. Please set OPENAI_API_KEY or DASHSCOPE_API_KEY environment variable.")
-
-# Multi-doc context budget
-MAX_CONTEXT_TOKENS = 16000
 
 REASONING_TREE = 'tree'
 REASONING_TOC = 'toc_fallback'
@@ -139,54 +132,6 @@ def ensure_node_ids(structure):
     return structure
 
 
-def _call_llm_json(prompt, extract_key=None, expect_list=False):
-    """Generic LLM JSON caller.
-
-    If extract_key is set, pulls that key from a dict result.
-    If expect_list is True, expects the result to be a list directly.
-    """
-    client = get_llm_client()
-    if not client:
-        print("OpenAI client not initialized.")
-        return []
-    try:
-        response = client.chat.completions.create(
-            model=RETRIEVE_MODEL_NAME or MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.0
-        )
-        content = response.choices[0].message.content
-        if not content:
-            return []
-        result = extract_json(content)
-        if expect_list and isinstance(result, list):
-            return result
-        if extract_key and isinstance(result, dict) and isinstance(result.get(extract_key), list):
-            return [str(x) for x in result[extract_key] if x is not None]
-        return []
-    except Exception as e:
-        print(f"Error in LLM call: {e}")
-        return []
-
-
-def pages_from_nodes(nodes):
-    seen = set()
-    pages = []
-    for node in nodes:
-        start = node.get('start_index')
-        end = node.get('end_index')
-        if start is None or end is None:
-            continue
-        for p in range(start, end + 1):
-            if p not in seen:
-                seen.add(p)
-                pages.append(p)
-    return pages
-
-
 def _flatten_nodes(structure, doc_id, parent_node_id=None, out=None):
     if out is None:
         out = []
@@ -218,57 +163,6 @@ def _extract_page_records(pdf_path, doc_id):
     return records
 
 
-def get_relevant_nodes(question, tree_json_str):
-    prompt = f"""
-        You are given a question and a tree structure of a document.
-        Each node contains a node id, node title, and a corresponding summary.
-        Your task is to find all nodes that are likely to contain the answer to the question.
-
-        Question: {question}
-
-        Document tree structure:
-        {tree_json_str}
-
-        Please reply in the following JSON format:
-        {{
-            "thinking": "<Your thinking process on which nodes are relevant to the question>",
-            "node_list": ["node_id_1", "node_id_2", "..."]
-        }}
-        Directly return the final JSON structure. Do not output anything else.
-        """
-    return _call_llm_json(prompt, extract_key='node_list')
-
-
-def get_relevant_pages(question, toc_text):
-    prompt = f"""
-        You are an intelligent assistant.
-        I have a document with the following Table of Contents (TOC), which may include summaries for each section:
-
-        {toc_text}
-
-        The user has asked: "{question}"
-
-        Based on the TOC and summaries, which pages are most likely to contain the answer?
-        Reasoning about which section covers the topic.
-        Then return ONLY a JSON list of physical page numbers.
-        Format: [page_num1, page_num2, ...]
-        Example: [5, 6, 7]
-
-        If you are unsure, select the most relevant sections' pages.
-        """
-    pages = _call_llm_json(prompt, expect_list=True)
-    return [int(p) for p in pages if isinstance(p, (int, str)) and str(p).isdigit()]
-
-
-def extract_text_from_db(db, doc_id, pages):
-    rows = db.get_pages_by_numbers(doc_id, pages)
-    parts = []
-    for page_num, content in rows:
-        parts.append(f"\n--- Page {page_num} ---\n")
-        parts.append(content)
-    return "".join(parts)
-
-
 def ensure_logs_dir(base_dir):
     logs_dir = os.path.join(base_dir, "logs")
     os.makedirs(logs_dir, exist_ok=True)
@@ -281,34 +175,6 @@ def write_qa_log(log_f, record):
         log_f.flush()
     except Exception as e:
         print(f"Failed to write log: {e}")
-
-
-def generate_answer(question, context):
-    client = get_llm_client()
-    if not client:
-        return "Error: OpenAI client not initialized."
-
-    prompt = f"""
-        Answer the user's question based on the following context.
-        If the answer is not in the context, say "I cannot find the answer in the provided context."
-
-        Context:
-        {context}
-
-        Question: {question}
-        """
-    try:
-        response = client.chat.completions.create(
-            model=RETRIEVE_MODEL_NAME or MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.5
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Error generating answer: {e}"
 
 
 def list_pdfs(directory):
@@ -568,51 +434,6 @@ def answer_multidoc(question, db, docs_info, doc_lookup, doc_tree_json, log_f):
     })
 
     return answer, {"status": "ok", "truncated": overall_truncated}
-
-
-def get_relevant_documents_for_multidoc(question, docs_info):
-    """L1: Select top-K relevant documents from a list of doc metadata."""
-    prompt = f"""
-You are given a user question and a list of documents.
-Your task is to identify which documents are most likely to contain the answer.
-Select up to 3 most relevant documents.
-
-User Question: {question}
-
-Documents:
-{json.dumps(docs_info, indent=2, ensure_ascii=False)}
-
-Please reply in the following JSON format:
-{{
-    "thinking": "<brief reasoning>",
-    "doc_ids": ["doc_id_1", "doc_id_2", ...]
-}}
-Directly return the final JSON structure. Do not output anything else.
-If no documents seem relevant, return an empty list.
-"""
-    return _call_llm_json(prompt, extract_key='doc_ids')
-
-
-def build_context_with_budget(db, doc_id, pages, doc_name, remaining_tokens):
-    """Extract page text from DB while respecting a token budget."""
-    if remaining_tokens <= 0:
-        return "", 0, True
-
-    rows = db.get_pages_by_numbers(doc_id, sorted(set(pages)))
-    parts = [f"\n=== Document: {doc_name} ===\n"]
-    truncated = False
-    used = count_tokens(parts[0])
-
-    for page_num, content in rows:
-        page_text = f"\n--- Page {page_num} ---\n{content}"
-        page_tokens = count_tokens(page_text)
-        if used + page_tokens > remaining_tokens:
-            truncated = True
-            break
-        parts.append(page_text)
-        used += page_tokens
-
-    return "".join(parts), used, truncated
 
 
 # ---------------------------------------------------------------------------

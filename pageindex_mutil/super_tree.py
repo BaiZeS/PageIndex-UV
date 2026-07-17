@@ -126,6 +126,7 @@ from .utils import llm_acompletion, count_tokens, extract_json
 class SuperTreeIndex:
     """L0 dual-channel prefilter + L1 Super-Tree document selection."""
 
+    # Defaults (overridden by config.yaml via _init_from_config)
     _MAX_TOP_NODES_PER_DOC = 8
     _MAX_CANDIDATE_DOCS = 50
     _MAX_SUPER_TREE_TOKENS = 6000
@@ -138,7 +139,24 @@ class SuperTreeIndex:
         self.client = client
         self.keyword_index = KeywordIndex(db)
         self.kb_identity = KBIdentity(db, model, retrieve_model)
+        self._init_from_config()
         self._backfill_existing_docs()
+
+    def _init_from_config(self):
+        """Override class defaults with config.yaml values if present."""
+        try:
+            from .utils import ConfigLoader
+            cfg = ConfigLoader().load(None)
+            self._MAX_TOP_NODES_PER_DOC = getattr(cfg, "max_top_nodes_per_doc", self._MAX_TOP_NODES_PER_DOC)
+            self._MAX_CANDIDATE_DOCS = getattr(cfg, "max_candidate_docs", self._MAX_CANDIDATE_DOCS)
+            self._MAX_SUPER_TREE_TOKENS = getattr(cfg, "max_super_tree_tokens", self._MAX_SUPER_TREE_TOKENS)
+            self._SUMMARY_MAX_LEN = getattr(cfg, "summary_max_len", self._SUMMARY_MAX_LEN)
+        except Exception:
+            pass
+
+    def _get_db_to_uuid(self) -> Dict[int, str]:
+        """Build reverse mapping from db_id -> uuid."""
+        return {v: k for k, v in getattr(self.client, "_uuid_to_db", {}).items()}
 
     # ------------------------------------------------------------------
     # Lifecycle hooks
@@ -246,7 +264,7 @@ class SuperTreeIndex:
 
         # Map back to UUIDs
         uuid_results = []
-        db_to_uuid = {v: k for k, v in getattr(self.client, "_uuid_to_db", {}).items()}
+        db_to_uuid = self._get_db_to_uuid()
         for doc_id in doc_ids:
             if isinstance(doc_id, int):
                 uuid = db_to_uuid.get(doc_id)
@@ -261,25 +279,37 @@ class SuperTreeIndex:
     # ------------------------------------------------------------------
     def _build_super_tree(self, doc_ids: list[int]) -> Dict:
         documents = []
-        db_to_uuid = {v: k for k, v in getattr(self.client, "_uuid_to_db", {}).items()}
+        db_to_uuid = self._get_db_to_uuid()
+
+        # Batch-fetch all documents once (avoids N+1 query per doc)
+        all_docs = self.db.get_all_documents()
+        docs_by_id = {d["id"]: d for d in all_docs}
 
         for db_doc_id in doc_ids:
-            doc = next((d for d in self.db.get_all_documents() if d["id"] == db_doc_id), None)
+            doc = docs_by_id.get(db_doc_id)
             if not doc:
                 continue
 
             uuid = db_to_uuid.get(db_doc_id, str(db_doc_id))
             top_nodes = self.db.get_top_level_nodes(db_doc_id)
 
-            # Sort by child count (more children = more structurally important)
-            nodes_with_children = []
-            with self.db._connect() as conn:
-                for node in top_nodes:
-                    children = conn.execute(
-                        "SELECT COUNT(*) FROM nodes WHERE parent_node_id = ?",
-                        (node.get("node_id"),),
-                    ).fetchone()[0]
-                    nodes_with_children.append((node, children))
+            # Batch-fetch child counts for all top nodes in one query
+            top_node_ids = [n.get("node_id") for n in top_nodes if n.get("node_id")]
+            child_counts = {}
+            if top_node_ids:
+                with self.db._connect() as conn:
+                    placeholders = ",".join("?" * len(top_node_ids))
+                    rows = conn.execute(
+                        f"SELECT parent_node_id, COUNT(*) FROM nodes "
+                        f"WHERE parent_node_id IN ({placeholders}) GROUP BY parent_node_id",
+                        top_node_ids,
+                    ).fetchall()
+                    child_counts = {row[0]: row[1] for row in rows}
+
+            nodes_with_children = [
+                (node, child_counts.get(node.get("node_id"), 0))
+                for node in top_nodes
+            ]
 
             nodes_with_children.sort(key=lambda x: x[1], reverse=True)
             selected = nodes_with_children[:self._MAX_TOP_NODES_PER_DOC]

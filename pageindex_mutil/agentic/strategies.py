@@ -53,10 +53,10 @@ class DescriptionStrategy:
         self.model = model
         self.retrieve_model = retrieve_model
         self._main_get_relevant = None
-        # Attempt one-time import of main.py helper to avoid runtime side effects
+        # Attempt one-time import of reasoning helper
         try:
-            import main
-            self._main_get_relevant = main.get_relevant_documents_for_multidoc
+            from ..reasoning import get_relevant_documents_for_multidoc
+            self._main_get_relevant = get_relevant_documents_for_multidoc
         except Exception:
             pass
 

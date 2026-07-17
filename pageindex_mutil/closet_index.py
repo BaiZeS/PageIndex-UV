@@ -45,8 +45,6 @@ class ClosetIndex:
         self.retrieve_model = retrieve_model
         if jieba is None:
             logging.warning("jieba not installed; ClosetIndex search will be unavailable")
-        if hasattr(db, "ensure_closet_schema"):
-            db.ensure_closet_schema()
 
     def _extract_tags(
         self, doc_name: str, doc_description: str, node_titles: List[str]

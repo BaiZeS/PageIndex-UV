@@ -6,8 +6,6 @@ import asyncio
 import concurrent.futures
 from pathlib import Path
 
-import PyPDF2
-
 from .page_index import page_index
 from .page_index_md import md_to_tree
 from .retrieve import get_document, get_document_structure, get_page_content
@@ -103,6 +101,7 @@ class PageIndexClient:
                 if_add_doc_description='yes'
             )
             # Extract per-page text so queries don't need the original PDF
+            import PyPDF2
             pages = []
             with open(file_path, 'rb') as f:
                 pdf_reader = PyPDF2.PdfReader(f)
@@ -351,12 +350,9 @@ class PageIndexClient:
                 "pages": [],
             }
 
-        # Lazy-import main.py helpers (project root must be on sys.path)
+        # Import shared reasoning helpers
         try:
-            import main as _main
-            get_relevant_nodes = _main.get_relevant_nodes
-            pages_from_nodes = _main.pages_from_nodes
-            generate_answer = _main.generate_answer
+            from .reasoning import get_relevant_nodes, pages_from_nodes, generate_answer
         except ImportError:
             return {
                 "query": query,

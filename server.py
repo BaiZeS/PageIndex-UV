@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import uuid
+import hmac
 import asyncio
 import logging
 import shutil
@@ -32,8 +33,6 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 import mcp.types as types
 
-import openai
-from openai import OpenAI
 from pageindex_mutil import PageIndexClient
 from pageindex_mutil.utils import configure_llm, get_llm_config, ConfigLoader
 
@@ -50,6 +49,9 @@ WORKSPACE = os.getenv("WORKSPACE", "/app/data/workspace")
 DB_PATH = os.getenv("DB_PATH", "/app/data/index.db")
 # Static web console directory (module-relative so it resolves under Docker WORKDIR and local dev alike)
 WEB_DIR = Path(__file__).resolve().parent / "web"
+
+if not API_KEY:
+    logging.warning("API_KEY not set — server is running WITHOUT authentication")
 
 # ---------------------------------------------------------------------------
 # API Key middleware
@@ -68,7 +70,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
         if API_KEY:
             header_key = request.headers.get("X-API-Key", "")
-            if header_key != API_KEY:
+            if not hmac.compare_digest(header_key or "", API_KEY):
                 return JSONResponse(
                     {"error": "Invalid or missing API Key"},
                     status_code=403,
@@ -565,6 +567,17 @@ async def config_post_endpoint(request: Request) -> Response:
                 cred_fields["OPENAI_BASE_URL"] = base_url
             if cred_fields:
                 if web_config.DEFAULT_ENV.exists():
+                    # Warn if .env is world-readable before writing secrets
+                    try:
+                        mode = os.stat(web_config.DEFAULT_ENV).st_mode
+                        if mode & 0o004:  # world-readable
+                            logger.warning(
+                                ".env file is world-readable (mode %o) — "
+                                "consider restricting permissions to 0600",
+                                mode,
+                            )
+                    except OSError:
+                        pass
                     web_config.backup_file(web_config.DEFAULT_ENV)
                 web_config.set_env_fields(web_config.DEFAULT_ENV, cred_fields)
             persisted = True
@@ -626,6 +639,8 @@ async def config_test_endpoint(request: Request) -> Response:
 
     # Build a TEMP openai client — never mutate the shared `_client`/`_async_client`.
     # This keeps the ping read-only and lets the active client keep serving traffic.
+    from openai import OpenAI
+    import openai
     temp_client = OpenAI(api_key=api_key, base_url=base_url)
     start = _time.monotonic()
 
@@ -694,7 +709,13 @@ async def config_test_endpoint(request: Request) -> Response:
 
 
 # Global semaphore to limit concurrent indexing during batch uploads
-_UPLOAD_SEMAPHORE = asyncio.Semaphore(3)
+_upload_concurrency = int(os.getenv("UPLOAD_CONCURRENCY", "3"))
+try:
+    from pageindex_mutil.utils import ConfigLoader as _Cfg
+    _upload_concurrency = int(getattr(_Cfg().load(None), "upload_concurrency", _upload_concurrency))
+except Exception:
+    pass
+_UPLOAD_SEMAPHORE = asyncio.Semaphore(_upload_concurrency)
 
 
 def _determine_mode(filename: str) -> str:

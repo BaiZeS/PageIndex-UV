@@ -35,3 +35,13 @@ if_add_node_id: "yes"
 if_add_node_summary: "yes"
 if_add_doc_description: "no"
 if_add_node_text: "no"
+
+# Retrieval & server tuning (previously hardcoded)
+max_context_tokens: 16000
+upload_concurrency: 3
+max_top_nodes_per_doc: 8
+max_candidate_docs: 50
+max_super_tree_tokens: 6000
+summary_max_len: 100
+tau_high: 0.7
+tau_low: 0.4

@@ -2,10 +2,14 @@ import asyncio
 import json
 import re
 import os
-try:
-    from .utils import *
-except:
-    from utils import *
+from .utils import (
+    count_tokens,
+    structure_to_list,
+    write_node_id,
+    format_structure,
+    create_clean_structure_for_description,
+    ConfigLoader,
+)
 
 async def get_node_summary(node, summary_token_threshold=200, model=None):
     node_text = node.get('text')
@@ -86,25 +90,20 @@ def extract_node_text_content(node_list, markdown_lines):
         node['text'] = '\n'.join(markdown_lines[start_line:end_line]).strip()    
     return all_nodes
 
+
+def _find_all_children(parent_index, parent_level, node_list):
+    """Find all direct and indirect children of a parent node."""
+    children_indices = []
+    for i in range(parent_index + 1, len(node_list)):
+        current_level = node_list[i]['level']
+        if current_level <= parent_level:
+            break
+        children_indices.append(i)
+    return children_indices
+
+
 def update_node_list_with_text_token_count(node_list, model=None):
 
-    def find_all_children(parent_index, parent_level, node_list):
-        """Find all direct and indirect children of a parent node"""
-        children_indices = []
-        
-        # Look for children after the parent
-        for i in range(parent_index + 1, len(node_list)):
-            current_level = node_list[i]['level']
-            
-            # If we hit a node at same or higher level than parent, stop
-            if current_level <= parent_level:
-                break
-                
-            # This is a descendant
-            children_indices.append(i)
-        
-        return children_indices
-    
     # Make a copy to avoid modifying the original
     result_list = node_list.copy()
     
@@ -114,7 +113,7 @@ def update_node_list_with_text_token_count(node_list, model=None):
         current_level = current_node['level']
         
         # Get all children of this node
-        children_indices = find_all_children(i, current_level, result_list)
+        children_indices = _find_all_children(i, current_level, result_list)
         
         # Start with the node's own text
         node_text = current_node.get('text', '')
@@ -133,19 +132,6 @@ def update_node_list_with_text_token_count(node_list, model=None):
 
 
 def tree_thinning_for_index(node_list, min_node_token=None, model=None):
-    def find_all_children(parent_index, parent_level, node_list):
-        children_indices = []
-        
-        for i in range(parent_index + 1, len(node_list)):
-            current_level = node_list[i]['level']
-            
-            if current_level <= parent_level:
-                break
-                
-            children_indices.append(i)
-        
-        return children_indices
-    
     result_list = node_list.copy()
     nodes_to_remove = set()
     
@@ -159,7 +145,7 @@ def tree_thinning_for_index(node_list, min_node_token=None, model=None):
         total_tokens = current_node.get('text_token_count', 0)
         
         if total_tokens < min_node_token:
-            children_indices = find_all_children(i, current_level, result_list)
+            children_indices = _find_all_children(i, current_level, result_list)
             
             children_texts = []
             for child_index in sorted(children_indices):

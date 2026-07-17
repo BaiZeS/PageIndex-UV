@@ -25,6 +25,17 @@ class CRAGVerifier:
     def __init__(self, model: str, retrieve_model: str = None):
         self.model = model
         self.retrieve_model = retrieve_model
+        self._init_from_config()
+
+    def _init_from_config(self):
+        """Override class defaults with config.yaml values if present."""
+        try:
+            from ..utils import ConfigLoader
+            cfg = ConfigLoader().load(None)
+            self.TAU_HIGH = getattr(cfg, "tau_high", self.TAU_HIGH)
+            self.TAU_LOW = getattr(cfg, "tau_low", self.TAU_LOW)
+        except Exception:
+            pass
 
     def _score_retrieval(
         self, context: str, source_docs: int, covered_nodes: int

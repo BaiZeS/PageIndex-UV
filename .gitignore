@@ -36,6 +36,7 @@ logs/
 # ===== AI 助手本地配置(不提交) =====
 .claude/
 .superpowers/
+.mimocode/
 CLAUDE.md
 AGENTS.md
 

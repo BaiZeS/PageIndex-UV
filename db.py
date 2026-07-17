@@ -299,10 +299,6 @@ class PageIndexDB:
             rows = conn.execute(sql, (doc_id, *chunk)).fetchall()
             results.extend(rows)
         return [(r["page_number"], r["content"]) for r in results]
-    def ensure_closet_schema(self):
-        # closet_tags is already created by ensure_schema(); keep this method
-        # for callers that explicitly want to ensure the closet schema.
-        pass
 
     def insert_closet_tags(self, doc_id, records):
         if not records:

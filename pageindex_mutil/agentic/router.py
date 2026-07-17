@@ -31,17 +31,22 @@ class AgenticRouter:
             self.super_tree_index = client.super_tree_index
 
     # ------------------------------------------------------------------
-    # Lazy import of main.py helpers (avoid circular deps at import time)
+    # Lazy import of reasoning helpers (avoid circular deps at import time)
     # ------------------------------------------------------------------
     def _load_main_funcs(self):
         if self._main_funcs is None:
             try:
-                import main
+                from ..reasoning import (
+                    get_relevant_nodes,
+                    build_context_with_budget,
+                    generate_answer,
+                    pages_from_nodes,
+                )
                 self._main_funcs = {
-                    "get_relevant_nodes": main.get_relevant_nodes,
-                    "build_context_with_budget": main.build_context_with_budget,
-                    "generate_answer": main.generate_answer,
-                    "pages_from_nodes": main.pages_from_nodes,
+                    "get_relevant_nodes": get_relevant_nodes,
+                    "build_context_with_budget": build_context_with_budget,
+                    "generate_answer": generate_answer,
+                    "pages_from_nodes": pages_from_nodes,
                 }
             except ImportError:
                 self._main_funcs = {}
