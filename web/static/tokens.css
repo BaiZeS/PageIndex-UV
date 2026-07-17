@@ -1,0 +1,111 @@
+/* ============================================================================
+   PageIndex Console — Design Tokens
+   Hybrid: Editorial calm (Aesop/MUJI, C-school) + Builder SaaS details
+   (Linear/Vercel, A-school). Single light paper-warm theme. Tokens are
+   the single source of truth — never reference raw hex outside this file.
+   ========================================================================== */
+
+:root {
+  /* ── Surfaces (paper-warm, light) ─────────────────────────────────────── */
+  --bg:           #F7F2E7;   /* page — warm cream */
+  --bg-2:         #F0E9DA;   /* subtle paper texture / inset wells */
+  --surface:      #FFFFFF;   /* primary card */
+  --surface-2:    #FBF7EC;   /* raised inset, document-like */
+  --surface-3:    #F2ECDB;   /* hover on surface-2 */
+
+  /* ── Ink (text) ───────────────────────────────────────────────────────── */
+  --ink:          #1A1A1A;   /* primary */
+  --ink-2:        #3F3A33;   /* secondary */
+  --ink-muted:    #7A7166;   /* captions, labels */
+  --ink-faint:    #ADA395;   /* disabled, very light hints */
+  --ink-on-accent:#FBF7EC;   /* text on accent fill */
+
+  /* ── Accent (single, deep ink blue) ──────────────────────────────────── */
+  --accent:       #2E3D6B;
+  --accent-2:     #3F5290;
+  --accent-3:     #4D63A8;
+  --accent-soft:  rgba(46, 61, 107, 0.08);
+  --accent-line:  rgba(46, 61, 107, 0.20);
+  --accent-ring:  rgba(46, 61, 107, 0.28);
+
+  /* ── Status (muted, paper-friendly — never saturated) ────────────────── */
+  --success:      #5C8A6E;
+  --success-soft: rgba(92, 138, 110, 0.12);
+  --success-line: rgba(92, 138, 110, 0.30);
+
+  --warn:         #B8884A;
+  --warn-soft:    rgba(184, 136, 74, 0.12);
+  --warn-line:    rgba(184, 136, 74, 0.32);
+
+  --danger:       #B84A3E;
+  --danger-soft:  rgba(184, 74, 62, 0.10);
+  --danger-line:  rgba(184, 74, 62, 0.30);
+
+  /* ── Borders (warm hairlines — A's signature) ────────────────────────── */
+  --hairline:     #E5DED0;
+  --hairline-2:   #D6CDB9;
+  --hairline-3:   #C7BCA2;
+
+  /* ── Type ─────────────────────────────────────────────────────────────── */
+  --font-display: "Fraunces", "Cormorant Garamond", Georgia, "Songti SC",
+                  "Source Han Serif SC", serif;
+  --font-ui:      "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+                  "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Roboto,
+                  sans-serif;
+  --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas,
+                  monospace;
+
+  /* ── Type scale (clamp where helpful) ────────────────────────────────── */
+  --fs-display:   28px;
+  --fs-h1:        22px;
+  --fs-h2:        17px;
+  --fs-body:      15px;
+  --fs-small:     13px;
+  --fs-caption:   12px;
+  --fs-mono:      12px;
+  --lh-body:      1.65;
+  --lh-tight:     1.35;
+
+  /* ── Spacing (4px base) ──────────────────────────────────────────────── */
+  --s-1:  4px;
+  --s-2:  8px;
+  --s-3:  12px;
+  --s-4:  16px;
+  --s-5:  20px;
+  --s-6:  24px;
+  --s-7:  32px;
+  --s-8:  40px;
+  --s-9:  56px;
+
+  /* ── Radius (C generous + A precise) ─────────────────────────────────── */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 18px;
+  --r-pill: 999px;
+
+  /* ── Shadows (paper-soft, layered) ───────────────────────────────────── */
+  --shadow-0: none;
+  --shadow-1: 0 1px 2px rgba(40, 30, 15, 0.04);
+  --shadow-2: 0 1px 2px rgba(40, 30, 15, 0.04),
+              0 4px 14px rgba(40, 30, 15, 0.06);
+  --shadow-3: 0 1px 2px rgba(40, 30, 15, 0.05),
+              0 8px 28px rgba(40, 30, 15, 0.08);
+  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+
+  /* ── Motion (C's breath + A's precision) ─────────────────────────────── */
+  --ease:        cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out:    cubic-bezier(0.2, 0.7, 0.2, 1);
+  --dur-micro:   120ms;
+  --dur-panel:   240ms;
+  --dur-page:    360ms;
+
+  /* ── Z-index ─────────────────────────────────────────────────────────── */
+  --z-topbar: 50;
+  --z-popover: 100;
+  --z-toast: 200;
+
+  /* ── Layout ──────────────────────────────────────────────────────────── */
+  --w-shell: 1080px;
+  --h-topbar: 64px;
+}

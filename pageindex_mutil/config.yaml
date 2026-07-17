@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# LLM endpoint defaults (resolved centrally in pageindex_mutil/utils.py via
+# _resolve_llm_config / configure_llm):
+#   * OPENAI_API_KEY      -> standard OpenAI endpoint (https://api.openai.com/v1)
+#   * DASHSCOPE_API_KEY   -> DashScope compatible-mode endpoint
+#                            (https://dashscope.aliyuncs.com/compatible-mode/v1)
+#   * OPENAI_BASE_URL     -> overrides either of the above when set
+# The defaults below target the standard OpenAI endpoint. When using DashScope,
+# set MODEL_NAME=qwen-plus and DASHSCOPE_API_KEY via env (see .env.example).
+#
+# Model-name overrides (resolved in ConfigLoader.load):
+#   * MODEL_NAME            env var overrides `model` below
+#   * RETRIEVE_MODEL_NAME   env var overrides `retrieve_model` below
+#   Precedence (highest wins):
+#     1. caller-explicit kwarg to ConfigLoader().load({...})
+#     2. MODEL_NAME / RETRIEVE_MODEL_NAME env vars
+#     3. the `model` / `retrieve_model` values in THIS file
+#   This is the ONE resolution path shared by both the CLI (main.py) and the
+#   server path (PageIndexClient -> ConfigLoader), so the same MODEL_NAME env
+#   now takes effect in ALL paths.
+# ---------------------------------------------------------------------------
+model: "deepseek-v4-flash"
+retrieve_model: "deepseek-v4-flash"
+# Magic-number config keys (W6 FR4/NFR5): defaults match the prior hardcoded
+# values so existing deployments behave unchanged. page_index_md.py __main__
+# reads these via ConfigLoader; main.py reads the toc_* / max_* keys below.
+if_thinning: false
+thinning_threshold: 5000
+summary_token_threshold: 200
+if_summary: true
+toc_check_page_num: 20
+max_page_num_each_node: 10
+max_token_num_each_node: 20000
+if_add_node_id: "yes"
+if_add_node_summary: "yes"
+if_add_doc_description: "no"
+if_add_node_text: "no"
+
+# Retrieval & server tuning (previously hardcoded)
+max_context_tokens: 16000
+upload_concurrency: 3
+max_top_nodes_per_doc: 8
+max_candidate_docs: 50
+max_super_tree_tokens: 6000
+summary_max_len: 100
+tau_high: 0.7
+tau_low: 0.4

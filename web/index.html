@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PageIndex · 控制台</title>
+
+  <!-- Typography: Fraunces (display) + Inter (UI) + JetBrains Mono (data).
+       Preconnect cuts the cross-origin handshake on first paint. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+
+  <!-- Element Plus base styles (we override the chrome in our base.css) -->
+  <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+
+  <!-- Our design system: tokens → base/EP overrides → components -->
+  <link rel="stylesheet" href="/static/tokens.css">
+  <link rel="stylesheet" href="/static/base.css">
+  <link rel="stylesheet" href="/static/components.css">
+</head>
+<body>
+  <div id="app"></div>
+
+  <!-- ── Runtime: Vue 3 (full build, template compiler) + Element Plus ── -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://unpkg.com/element-plus"></script>
+
+  <!-- ── Our modules: lib → components → app, in dependency order ─────── -->
+  <script src="/static/lib/api.js"></script>
+  <script src="/static/lib/format.js"></script>
+  <script src="/static/lib/auth.js"></script>
+  <script src="/static/lib/upload.js"></script>
+  <script src="/static/lib/qa.js"></script>
+  <script src="/static/lib/config.js"></script>
+
+  <script src="/static/components/panel.js"></script>
+  <script src="/static/components/topbar.js"></script>
+  <script src="/static/components/confidence-meter.js"></script>
+  <script src="/static/components/upload-progress-list.js"></script>
+  <script src="/static/components/current-config-card.js"></script>
+  <script src="/static/components/docs-panel.js"></script>
+  <script src="/static/components/qa-panel.js"></script>
+  <script src="/static/components/config-panel.js"></script>
+  <script src="/static/components/tab-nav.js"></script>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

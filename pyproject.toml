@@ -1,0 +1,40 @@
+[project]
+name = "pageindex-uv"
+version = "0.1.0"
+description = "Document structure indexing and reasoning-based RAG with MCP service"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=2.8.0",
+    "pymupdf==1.26.4",
+    "pypdf2==3.0.1",
+    "python-dotenv==1.1.0",
+    "pyyaml==6.0.2",
+    "tiktoken==0.11.0",
+    "jieba>=0.42",
+    "mcp>=1.0.0",
+    "python-multipart>=0.0.9",
+]
+
+[[tool.uv.index]]
+name = "tencent"
+url = "https://mirrors.cloud.tencent.com/pypi/simple/"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["pageindex_mutil*"]
+
+[tool.setuptools.package-data]
+pageindex_mutil = ["config.yaml"]
