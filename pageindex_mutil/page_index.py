@@ -1014,7 +1014,9 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
         elif mode == 'process_toc_no_page_numbers':
             return await meta_processor(page_list, mode='process_no_toc', start_index=start_index, opt=opt, logger=logger)
         else:
-            raise Exception('Processing failed')
+            # All modes failed - return empty structure with warning
+            logger.info({'warning': 'All processing modes failed, returning minimal structure'})
+            return []
         
  
 async def process_large_node_recursively(node, page_list, opt=None, logger=None):
