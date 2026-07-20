@@ -235,6 +235,13 @@ class PageIndexClient:
                     doc_description=doc.get('doc_description', '')
                 )
                 self._uuid_to_db[doc_id] = db_doc_id
+                
+                # Save tree structure to database for persistence
+                if doc.get('structure'):
+                    from .utils import create_clean_structure_for_description
+                    tree_for_reasoning = create_clean_structure_for_description(doc['structure'])
+                    self.db.update_document_tree(db_doc_id, json.dumps(tree_for_reasoning, ensure_ascii=False))
+                
                 if self.closet_index and doc.get('structure'):
                     self.closet_index.add_document(
                         db_doc_id,
@@ -377,6 +384,39 @@ class PageIndexClient:
             if doc.get('path') and not os.path.isabs(doc['path']):
                 doc['path'] = str((self.workspace / doc['path']).resolve())
             self.documents[doc_id] = doc
+        
+        # Also load documents from database if available
+        if self.db:
+            try:
+                db_docs = self.db.get_all_documents()
+                for db_doc in db_docs:
+                    # Check if this document is already loaded from workspace
+                    found = False
+                    for uuid, db_id in self._uuid_to_db.items():
+                        if db_id == db_doc['id']:
+                            found = True
+                            # Update with tree_json if available
+                            if db_doc.get('tree_json'):
+                                self.documents[uuid]['structure'] = json.loads(db_doc['tree_json'])
+                            break
+                    
+                    if not found:
+                        # Document exists in DB but not in workspace - load it
+                        doc_id = str(uuid.uuid4())
+                        self._uuid_to_db[doc_id] = db_doc['id']
+                        self.documents[doc_id] = {
+                            'id': doc_id,
+                            'type': 'pdf',
+                            'doc_name': db_doc.get('pdf_name', ''),
+                            'doc_description': db_doc.get('doc_description', ''),
+                            'path': db_doc.get('pdf_path', ''),
+                        }
+                        if db_doc.get('tree_json'):
+                            self.documents[doc_id]['structure'] = json.loads(db_doc['tree_json'])
+                
+                logging.info("Loaded %d document(s) from database", len(db_docs))
+            except Exception as e:
+                logging.warning("Failed to load from database: %s", e)
 
     def _ensure_doc_loaded(self, doc_id: str):
         """Load full document JSON on demand (structure, pages, etc.)."""
