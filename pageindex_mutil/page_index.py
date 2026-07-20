@@ -1008,15 +1008,21 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
     if accuracy > 0.6 and len(incorrect_results) > 0:
         toc_with_page_number, incorrect_results = await fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorrect_results,start_index=start_index, max_attempts=3, model=opt.model, logger=logger)
         return toc_with_page_number
+    elif mode == 'process_no_toc':
+        # For no-TOC mode, accept the result even with lower accuracy
+        # This is the last resort for documents without table of contents
+        logger.info(f'process_no_toc: accepting result with accuracy {accuracy:.2%}')
+        if len(incorrect_results) > 0:
+            toc_with_page_number, _ = await fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorrect_results,start_index=start_index, max_attempts=2, model=opt.model, logger=logger)
+        return toc_with_page_number
     else:
         if mode == 'process_toc_with_page_numbers':
             return await meta_processor(page_list, mode='process_toc_no_page_numbers', toc_content=toc_content, toc_page_list=toc_page_list, start_index=start_index, opt=opt, logger=logger)
         elif mode == 'process_toc_no_page_numbers':
             return await meta_processor(page_list, mode='process_no_toc', start_index=start_index, opt=opt, logger=logger)
         else:
-            # All modes failed - return empty structure with warning
-            logger.info({'warning': 'All processing modes failed, returning minimal structure'})
-            return []
+            logger.error({'error': 'All processing modes failed', 'last_mode': mode})
+            raise Exception(f'Processing failed: all modes exhausted, last mode was {mode}')
         
  
 async def process_large_node_recursively(node, page_list, opt=None, logger=None):
