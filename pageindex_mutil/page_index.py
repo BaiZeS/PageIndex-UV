@@ -6,6 +6,7 @@ import random
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .utils import (
+    get_page_tokens,
     JsonLogger,
     llm_completion,
     llm_acompletion,
