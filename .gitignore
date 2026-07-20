@@ -42,3 +42,5 @@ AGENTS.md
 
 # ===== devkit 过程产物(handoff 交接文件,不提交) =====
 **/handoff.md
+# Runtime data
+data/
