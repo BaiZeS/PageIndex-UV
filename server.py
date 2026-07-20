@@ -47,6 +47,8 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "3000"))
 WORKSPACE = os.getenv("WORKSPACE", "/app/data/workspace")
 DB_PATH = os.getenv("DB_PATH", "/app/data/index.db")
+SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "hybrid")
+VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", "/app/data/vectors")
 # Static web console directory (module-relative so it resolves under Docker WORKDIR and local dev alike)
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
@@ -305,6 +307,77 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
                 delete_document_internal(c, db_id)
             return [types.TextContent(type="text", text=json.dumps({"success": True, "doc_id": doc_id}, ensure_ascii=False))]
 
+        elif name == "search_entities":
+            query = arguments.get("query", "")
+            if not query:
+                return [types.TextContent(type="text", text=json.dumps({"error": "query is required"}, ensure_ascii=False))]
+            
+            c = get_client()
+            if not c.db:
+                return [types.TextContent(type="text", text=json.dumps({"entities": []}, ensure_ascii=False))]
+            
+            entities = c.db.search_entities(query, limit=arguments.get("limit", 20))
+            return [types.TextContent(type="text", text=json.dumps({"entities": entities}, ensure_ascii=False, indent=2))]
+
+        elif name == "get_entity":
+            entity_name = arguments.get("name", "")
+            if not entity_name:
+                return [types.TextContent(type="text", text=json.dumps({"error": "name is required"}, ensure_ascii=False))]
+            
+            c = get_client()
+            if not c.db:
+                return [types.TextContent(type="text", text=json.dumps({"error": "Database not available"}, ensure_ascii=False))]
+            
+            entity = c.db.get_entity_by_name(entity_name)
+            if not entity:
+                return [types.TextContent(type="text", text=json.dumps({"error": f"Entity '{entity_name}' not found"}, ensure_ascii=False))]
+            
+            # Get relations
+            relations = c.db.get_entity_relations(entity["id"])
+            
+            # Get documents
+            documents = c.db.get_entity_documents(entity["id"])
+            
+            return [types.TextContent(type="text", text=json.dumps({
+                "entity": entity,
+                "relations": relations,
+                "documents": documents
+            }, ensure_ascii=False, indent=2))]
+
+        elif name == "get_document_entities":
+            doc_id = arguments.get("doc_id", "")
+            if not doc_id:
+                return [types.TextContent(type="text", text=json.dumps({"error": "doc_id is required"}, ensure_ascii=False))]
+            
+            c = get_client()
+            if not c.db:
+                return [types.TextContent(type="text", text=json.dumps({"error": "Database not available"}, ensure_ascii=False))]
+            
+            try:
+                doc_id_int = int(doc_id)
+            except ValueError:
+                return [types.TextContent(type="text", text=json.dumps({"error": "doc_id must be integer"}, ensure_ascii=False))]
+            
+            entities = c.db.get_document_entities(doc_id_int)
+            return [types.TextContent(type="text", text=json.dumps({"entities": entities}, ensure_ascii=False, indent=2))]
+
+        elif name == "get_related_documents":
+            doc_id = arguments.get("doc_id", "")
+            if not doc_id:
+                return [types.TextContent(type="text", text=json.dumps({"error": "doc_id is required"}, ensure_ascii=False))]
+            
+            c = get_client()
+            if not c.db:
+                return [types.TextContent(type="text", text=json.dumps({"error": "Database not available"}, ensure_ascii=False))]
+            
+            try:
+                doc_id_int = int(doc_id)
+            except ValueError:
+                return [types.TextContent(type="text", text=json.dumps({"error": "doc_id must be integer"}, ensure_ascii=False))]
+            
+            related = c.db.get_related_documents(doc_id_int, limit=arguments.get("limit", 10))
+            return [types.TextContent(type="text", text=json.dumps({"related_documents": related}, ensure_ascii=False, indent=2))]
+
         else:
             return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False))]
 
@@ -354,6 +427,52 @@ async def handle_list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "doc_id": {"type": "string", "description": "The document ID (UUID) to delete"},
+                },
+                "required": ["doc_id"],
+            },
+        ),
+        types.Tool(
+            name="search_entities",
+            description="Search for entities (people, projects, organizations) across all documents.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Entity name or keyword to search"},
+                    "limit": {"type": "integer", "description": "Maximum results", "default": 20},
+                },
+                "required": ["query"],
+            },
+        ),
+        types.Tool(
+            name="get_entity",
+            description="Get detailed information about an entity including its relationships and documents.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Entity name"},
+                },
+                "required": ["name"],
+            },
+        ),
+        types.Tool(
+            name="get_document_entities",
+            description="Get all entities mentioned in a specific document.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string", "description": "Document ID (integer)"},
+                },
+                "required": ["doc_id"],
+            },
+        ),
+        types.Tool(
+            name="get_related_documents",
+            description="Find documents related through shared entities.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string", "description": "Document ID (integer)"},
+                    "limit": {"type": "integer", "description": "Maximum results", "default": 10},
                 },
                 "required": ["doc_id"],
             },
@@ -878,7 +997,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
 
     _startup_workspace = workspace
     _startup_db_path = db_path
-    client = PageIndexClient(workspace=workspace, db_path=db_path)
+    client = PageIndexClient(workspace=workspace, db_path=db_path, search_backend=SEARCH_BACKEND, vector_db_path=VECTOR_DB_PATH)
     logger.info("PageIndexClient ready. Documents: %d", len(client.documents))
     yield
     logger.info("Shutting down...")

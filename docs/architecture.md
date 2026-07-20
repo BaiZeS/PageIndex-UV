@@ -24,10 +24,10 @@ PageIndex-UV is a **non-vector, reasoning-based RAG** tool over long documents (
 │   ┌──────────────────────┐        ┌──────────────────────────────┐      │
 │   │ pageindex_mutil/     │        │  db.py (SQLite cache)         │      │
 │   │  - super_tree.py     │        │  - nodes / pages / docs       │      │
-│   │  - pdf_parser        │        │  - get_all_documents         │      │
-│   │  - md_parser         │        │  - delete_document (cascade)  │      │
-│   │  - utils / config    │        └──────────────────────────────┘      │
-│   └──────────┬───────────┘                                               │
+│   │  - closet_index.py   │        │  - closet_tags / doc_keywords │      │
+│   │  - agentic/          │        │  - kb_identity                │      │
+│   │  - utils / config    │        │  - delete_document (cascade)  │      │
+│   └──────────┬───────────┘        └──────────────────────────────┘      │
 │              ▼                                                           │
 │   ┌─────────────────────────────────────────────────────────────────┐    │
 │   │  configure_llm()  →  OpenAI-compatible client  (Qwen / OpenAI)  │    │
@@ -42,19 +42,22 @@ PageIndex-UV is a **non-vector, reasoning-based RAG** tool over long documents (
 question
    │
    ▼
-Agentic Multi-Strategy Router   ←─── docs/superpowers/plans/2026-05-05-…
-   │  (selects tree-search vs TOC vs flat-search strategy)
+L0: Dual-Channel Prefilter (SuperTreeIndex)
+   │  Channel A: ClosetIndex (semantic tag matching)
+   │  Channel B: KeywordIndex (jieba inverted index)
    ▼
-Super-Tree reasoning (per selected doc)  ←─── LLM walks the doc's tree
-   │
+L1: Super-Tree Document Selection (LLM)
+   │  Based on mini-TOC + KB Identity
+   │  6000 tokens budget, max 50 candidates → 3-5 selected
    ▼
-selected_node_ids + page ranges
-   │
+L2: Per-Document Node Recall (AgenticRouter)
+   │  Independent tree reasoning per selected doc
+   │  Avoids multi-tree mixing in single prompt
    ▼
-SQLite lookup → page text snippets
-   │
+L3: Context Extraction
+   │  Page merging + 16K token budget truncation
    ▼
-LLM answer composition (with evidence)
+LLM Answer Composition (with evidence)
    │
    ▼
 { answer, confidence, matched_docs, selected_nodes, pages }
@@ -68,6 +71,41 @@ LLM answer composition (with evidence)
 - **All queries route through `client.search(query, top_k)`** — same code path whether invoked from CLI or MCP.
 - **The LLM client is rebuilt via `configure_llm()`** whenever the user changes the API key / base URL via the web console's model config tab. See [web-console-design-system.md](web-console-design-system.md) for the live-switch UX.
 
+## Key components
+
+### Super-Tree Retrieval v3
+
+The multi-document retrieval uses a four-layer architecture:
+
+1. **L0 Dual-Channel Prefilter** (`SuperTreeIndex.prefilter()`):
+   - **Channel A (Semantic)**: `ClosetIndex` matches query against `closet_tags` table using jieba tokenization
+   - **Channel B (Keyword)**: `KeywordIndex` matches query against `doc_keywords` table
+   - Results merged into candidate set (max 50 docs)
+
+2. **L1 Super-Tree Document Selection** (`SuperTreeIndex.select_documents()`):
+   - Builds mini-TOC (depth=1 nodes, max 8 per doc)
+   - Combines with KB Identity (knowledge base summary)
+   - Single LLM call selects 3-5 most relevant documents
+   - Token budget: 6000 tokens (auto-truncation if exceeded)
+
+3. **L2 Per-Document Node Recall**:
+   - Independent tree reasoning per selected document
+   - Uses `get_relevant_nodes()` for each doc's tree structure
+   - Max 5 nodes per document
+
+4. **L3 Context Extraction**:
+   - Converts nodes to page ranges
+   - Reads page text from SQLite `pages` table
+   - 16K token hard limit with priority-based truncation
+
+### Agentic Router (v2 fallback)
+
+When Super-Tree fails, `AgenticRouter.search()` falls back to:
+- **Plan**: Query analysis with HyDE
+- **Route**: Strategy selection (Metadata/Semantics/Description)
+- **Act**: Parallel strategy execution
+- **Verify**: CRAG verification with confidence thresholds
+
 ## Surface map
 
 | Surface | Path / Tool | Notes |
@@ -78,7 +116,21 @@ LLM answer composition (with evidence)
 | REST API | `GET /health`, `POST /upload`, `GET/DELETE /api/documents`, `POST /api/search`, `GET/POST /api/config`, `POST /api/config/test` | Used by the web console; same auth as MCP (`X-API-Key`) |
 | Auth | `APIKeyMiddleware` | Public: `/`, `/health`, `/static/*`. Gated: `/api/*`, `/sse`, `/messages/`, `/upload` |
 | Documents store | `WORKSPACE/` (PDF/MD) | Path from `.env` (`WORKSPACE=…`) |
-| Index cache | `DB_PATH` (SQLite) | Path from `.env`. Holds `nodes`, `pages`, `documents` tables |
+| Index cache | `DB_PATH` (SQLite) | Path from `.env`. Holds `nodes`, `pages`, `documents`, `closet_tags`, `doc_keywords`, `kb_identity` tables |
+
+## SQLite schema
+
+```sql
+-- Core tables
+documents (id, pdf_name, pdf_path, tree_json, doc_description, created_at)
+nodes (id, doc_id, node_id, title, summary, start_index, end_index, parent_node_id)
+pages (id, doc_id, page_number, content)
+
+-- Super-Tree v3 tables
+closet_tags (id, doc_id, tag_text, tag_token, confidence, source)
+doc_keywords (id, doc_id, keyword, field)
+kb_identity (id, identity_text, doc_count, updated_at)
+```
 
 ## Design doc layout
 

@@ -147,6 +147,43 @@ class PageIndexDB:
                     doc_count INTEGER NOT NULL DEFAULT 0,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                -- Entity and relationship tables for cross-document graph
+                CREATE TABLE IF NOT EXISTS entities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    aliases TEXT,
+                    doc_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(name, entity_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+                CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
+
+                CREATE TABLE IF NOT EXISTS entity_mentions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                    doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    node_id TEXT,
+                    context_snippet TEXT,
+                    confidence REAL DEFAULT 0.5,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_entity_mentions_doc ON entity_mentions(doc_id);
+                CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
+
+                CREATE TABLE IF NOT EXISTS entity_relations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                    predicate TEXT NOT NULL,
+                    object_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                    doc_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                    confidence REAL DEFAULT 0.5,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_entity_relations_subject ON entity_relations(subject_id);
+                CREATE INDEX IF NOT EXISTS idx_entity_relations_object ON entity_relations(object_id);
                 """
             )
             # Migrate: add doc_description if missing
@@ -431,3 +468,189 @@ class PageIndexDB:
         row = conn.execute("SELECT identity_text FROM kb_identity WHERE id = 1").fetchone()
         return row["identity_text"] if row else None
 
+
+
+    # ------------------------------------------------------------------
+    # Entity and relationship methods
+    # ------------------------------------------------------------------
+
+    def insert_entity(self, entity_type: str, name: str, aliases: list = None) -> int:
+        """Insert or get an entity. Returns entity ID."""
+        aliases_json = json.dumps(aliases or [], ensure_ascii=False)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO entities (entity_type, name, aliases)
+                VALUES (?, ?, ?)
+                ON CONFLICT(name, entity_type) DO UPDATE SET
+                    aliases = CASE 
+                        WHEN excluded.aliases != '[]' THEN excluded.aliases 
+                        ELSE entities.aliases 
+                    END
+                RETURNING id
+                """,
+                (entity_type, name, aliases_json)
+            )
+            row = cur.fetchone()
+            if row is None:
+                # Fallback: get existing
+                row = conn.execute(
+                    "SELECT id FROM entities WHERE name = ? AND entity_type = ?",
+                    (name, entity_type)
+                ).fetchone()
+            return row[0] if row else None
+
+    def insert_entity_mention(
+        self, entity_id: int, doc_id: int, 
+        node_id: str = None, context_snippet: str = None, 
+        confidence: float = 0.5
+    ) -> None:
+        """Insert an entity mention."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO entity_mentions (entity_id, doc_id, node_id, context_snippet, confidence)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (entity_id, doc_id, node_id, context_snippet, confidence)
+            )
+            # Update doc_count
+            conn.execute(
+                """
+                UPDATE entities SET doc_count = (
+                    SELECT COUNT(DISTINCT doc_id) FROM entity_mentions WHERE entity_id = ?
+                ) WHERE id = ?
+                """,
+                (entity_id, entity_id)
+            )
+
+    def insert_entity_relation(
+        self, subject_id: int, predicate: str, object_id: int,
+        doc_id: int = None, confidence: float = 0.5
+    ) -> None:
+        """Insert an entity relationship."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO entity_relations (subject_id, predicate, object_id, doc_id, confidence)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (subject_id, predicate, object_id, doc_id, confidence)
+            )
+
+    def get_entity_by_name(self, name: str) -> dict:
+        """Get an entity by name."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT * FROM entities WHERE name = ?", (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def search_entities(self, query: str, limit: int = 20) -> list:
+        """Search entities by name (partial match)."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT * FROM entities 
+            WHERE name LIKE ? OR aliases LIKE ?
+            ORDER BY doc_count DESC
+            LIMIT ?
+            """,
+            (f"%{query}%", f"%{query}%", limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_entity_relations(self, entity_id: int, direction: str = "both") -> list:
+        """Get relations for an entity.
+        
+        Args:
+            entity_id: Entity ID
+            direction: "outgoing", "incoming", or "both"
+        """
+        conn = self._connect()
+        results = []
+        
+        if direction in ("outgoing", "both"):
+            rows = conn.execute(
+                """
+                SELECT er.*, e1.name as subject_name, e2.name as object_name
+                FROM entity_relations er
+                JOIN entities e1 ON er.subject_id = e1.id
+                JOIN entities e2 ON er.object_id = e2.id
+                WHERE er.subject_id = ?
+                ORDER BY er.confidence DESC
+                """,
+                (entity_id,)
+            ).fetchall()
+            results.extend([dict(r) for r in rows])
+        
+        if direction in ("incoming", "both"):
+            rows = conn.execute(
+                """
+                SELECT er.*, e1.name as subject_name, e2.name as object_name
+                FROM entity_relations er
+                JOIN entities e1 ON er.subject_id = e1.id
+                JOIN entities e2 ON er.object_id = e2.id
+                WHERE er.object_id = ?
+                ORDER BY er.confidence DESC
+                """,
+                (entity_id,)
+            ).fetchall()
+            results.extend([dict(r) for r in rows])
+        
+        return results
+
+    def get_document_entities(self, doc_id: int) -> list:
+        """Get all entities mentioned in a document."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT e.*, em.context_snippet, em.confidence as mention_confidence
+            FROM entities e
+            JOIN entity_mentions em ON e.id = em.entity_id
+            WHERE em.doc_id = ?
+            ORDER BY em.confidence DESC
+            """,
+            (doc_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_entity_documents(self, entity_id: int) -> list:
+        """Get all documents mentioning an entity."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT d.*, em.context_snippet, em.confidence
+            FROM documents d
+            JOIN entity_mentions em ON d.id = em.doc_id
+            WHERE em.entity_id = ?
+            ORDER BY em.confidence DESC
+            """,
+            (entity_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_related_documents(self, doc_id: int, limit: int = 10) -> list:
+        """Get documents related through shared entities."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT d.*, COUNT(DISTINCT em.entity_id) as shared_entities
+            FROM documents d
+            JOIN entity_mentions em ON d.id = em.doc_id
+            WHERE em.entity_id IN (
+                SELECT entity_id FROM entity_mentions WHERE doc_id = ?
+            )
+            AND d.id != ?
+            GROUP BY d.id
+            ORDER BY shared_entities DESC
+            LIMIT ?
+            """,
+            (doc_id, doc_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_entity(self, entity_id: int) -> None:
+        """Delete an entity and its mentions/relations."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))

@@ -14,6 +14,12 @@ from .closet_index import ClosetIndex
 from .super_tree import SuperTreeIndex
 from .page_index_liteparse import is_liteparse_format, liteparse_to_tree
 
+# Import search backends
+from .search_backend import SearchBackend
+from .chroma_backend import ChromaSearchBackend
+from .hybrid_backend import HybridSearchBackend
+from .entity_extractor import EntityExtractor
+
 # Optional: db.py lives at project root; gracefully degrade if unavailable.
 try:
     from db import PageIndexDB
@@ -42,7 +48,9 @@ class PageIndexClient:
 
     For agent-based QA, see examples/agentic_vectorless_rag_demo.py.
     """
-    def __init__(self, api_key: str = None, model: str = None, retrieve_model: str = None, workspace: str = None, db_path: str = None):
+    def __init__(self, api_key: str = None, model: str = None, retrieve_model: str = None, 
+                 workspace: str = None, db_path: str = None,
+                 search_backend: str = "hybrid", vector_db_path: str = "./data/vectors"):
         # Delegate LLM credentials/endpoint to the unified config source in utils.
         # configure_llm() handles OPENAI_API_KEY + CHATGPT_API_KEY alias and rebuilds
         # the shared OpenAI/AsyncOpenAI clients.
@@ -76,6 +84,44 @@ class PageIndexClient:
             self.super_tree_index = SuperTreeIndex(self.db, self.model, self, self.retrieve_model)
             if AgenticRouter:
                 self.router = AgenticRouter(self, self.model, self.retrieve_model)
+            
+            # Initialize search backends (ChromaDB hybrid is required)
+            self._init_search_backends(search_backend, vector_db_path)
+
+    def _init_search_backends(self, search_backend: str, vector_db_path: str):
+        """Initialize search backends based on configuration."""
+        try:
+            # Always initialize ChromaDB backend
+            self.chroma_backend = ChromaSearchBackend(
+                db_path=vector_db_path,
+                embedding_model="local"
+            )
+            
+            if search_backend == "hybrid":
+                # Hybrid mode: combine vector + keyword
+                self.search_backend = HybridSearchBackend(
+                    self.db,
+                    self.chroma_backend
+                )
+                logging.info("Initialized hybrid search backend (ChromaDB + keywords)")
+            elif search_backend == "chroma":
+                # Vector-only mode
+                self.search_backend = self.chroma_backend
+                logging.info("Initialized ChromaDB vector search backend")
+            else:
+                # Default to ChromaDB (required)
+                self.search_backend = self.chroma_backend
+                logging.info("Initialized ChromaDB backend (default)")
+            
+            # Initialize entity extractor
+            self.entity_extractor = EntityExtractor(self.model, self.retrieve_model)
+                
+        except Exception as e:
+            logging.warning("Failed to initialize search backends: %s", e)
+            logging.warning("Vector search will be unavailable")
+            self.search_backend = None
+            self.chroma_backend = None
+            self.entity_extractor = None
 
     def index(self, file_path: str, mode: str = "auto") -> str:
         """Index a document. Returns a document_id."""
@@ -199,6 +245,55 @@ class PageIndexClient:
                 # Index Super-Tree keywords
                 if hasattr(self, 'super_tree_index') and self.super_tree_index:
                     self.super_tree_index.on_document_added(db_doc_id)
+                
+                # Index in vector search backend
+                if self.search_backend and doc.get('structure'):
+                    try:
+                        self.search_backend.index_document(
+                            db_doc_id,
+                            doc['structure'],
+                            doc.get('pages')
+                        )
+                    except Exception as e:
+                        logging.warning("Failed to index in search backend: %s", e)
+                
+                # Extract entities and relationships
+                if self.entity_extractor and doc.get('structure'):
+                    try:
+                        entities, relations = self.entity_extractor.extract_from_document(
+                            doc.get('doc_name', ''),
+                            doc.get('doc_description', ''),
+                            doc['structure']
+                        )
+                        
+                        # Store entities
+                        entity_ids = {}
+                        for entity in entities:
+                            eid = self.db.insert_entity(
+                                entity.entity_type,
+                                entity.name,
+                                entity.aliases
+                            )
+                            if eid:
+                                entity_ids[entity.name] = eid
+                                self.db.insert_entity_mention(
+                                    eid, db_doc_id, confidence=entity.confidence
+                                )
+                        
+                        # Store relations
+                        for rel in relations:
+                            subject_id = entity_ids.get(rel.subject)
+                            object_id = entity_ids.get(rel.object)
+                            if subject_id and object_id:
+                                self.db.insert_entity_relation(
+                                    subject_id, rel.predicate, object_id,
+                                    doc_id=db_doc_id, confidence=rel.confidence
+                                )
+                        
+                        logging.info("Extracted %d entities and %d relations for %s",
+                                   len(entities), len(relations), doc.get('doc_name'))
+                    except Exception as e:
+                        logging.warning("Entity extraction failed: %s", e)
             except Exception as e:
                 logging.warning("Failed to persist to db: %s", e)
 

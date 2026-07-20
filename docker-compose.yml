@@ -21,6 +21,8 @@ services:
       - PORT=3000
       - WORKSPACE=/app/data/workspace
       - DB_PATH=/app/data/index.db
+      - SEARCH_BACKEND=${SEARCH_BACKEND:-hybrid}
+      - VECTOR_DB_PATH=/app/data/vectors
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]

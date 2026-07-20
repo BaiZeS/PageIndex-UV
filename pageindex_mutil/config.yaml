@@ -50,3 +50,9 @@ tau_low: 0.4
 liteparse_ocr_enabled: true
 liteparse_ocr_language: "eng"
 liteparse_dpi: 150
+
+# Search backend configuration (ChromaDB hybrid is required)
+search_backend: "hybrid"  # hybrid | chroma
+vector_db_path: "./data/vectors"
+embedding_model: "local"  # local | ollama | openai
+embedding_dim: 768
