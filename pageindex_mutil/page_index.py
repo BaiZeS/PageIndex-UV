@@ -7,6 +7,7 @@ import random
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .utils import (
+    generate_summaries_for_structure,
     convert_physical_index_to_int,
     convert_page_to_int,
     get_page_tokens,
