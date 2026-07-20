@@ -7,8 +7,15 @@ import random
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .utils import (
+    convert_physical_index_to_int,
+    convert_page_to_int,
     get_page_tokens,
     JsonLogger,
+    add_node_text,
+    add_preface_if_needed,
+    generate_doc_description,
+    post_processing,
+    remove_structure_text,
     llm_completion,
     llm_acompletion,
     extract_json,
