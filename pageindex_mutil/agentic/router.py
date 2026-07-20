@@ -219,7 +219,20 @@ class AgenticRouter:
                 source_docs += 1
                 doc_pages_map[doc_id] = sorted(set(pages))
 
-        return "\n\n".join(contexts), all_nodes, source_docs, len(all_nodes), doc_pages_map
+        # Build pages with text content for UI display
+        pages_with_text = {}
+        for doc_id, page_nums in doc_pages_map.items():
+            doc = self.client.documents.get(doc_id)
+            if not doc or doc.get("type") != "pdf" or not doc.get("pages"):
+                pages_with_text[doc_id] = [{"page": p} for p in page_nums]
+                continue
+            page_map = {p["page"]: p["content"] for p in doc["pages"]}
+            pages_with_text[doc_id] = [
+                {"page": p, "text": (page_map.get(p, "") or "")[:500]}
+                for p in page_nums
+            ]
+
+        return "\n\n".join(contexts), all_nodes, source_docs, len(all_nodes), doc_pages_map, pages_with_text
 
     # ------------------------------------------------------------------
     # Super-Tree search
@@ -257,7 +270,7 @@ class AgenticRouter:
 
         # L2/L3: Act — tree search on selected documents (reuse existing _act_tree_search)
         try:
-            ctx, nodes, src_docs, cov_nodes, doc_pages_map = await self._act_tree_search(
+            ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = await self._act_tree_search(
                 query, selected_uuids
             )
         except Exception as e:
@@ -343,10 +356,7 @@ class AgenticRouter:
                 }
                 for n in nodes
             ],
-            "pages": [
-                {"doc_id": d, "pages": p}
-                for d, p in doc_pages_map.items()
-            ],
+            "pages": pages_with_text,
         }
 
     # ------------------------------------------------------------------
@@ -416,7 +426,7 @@ class AgenticRouter:
 
         # Act
         try:
-            ctx, nodes, src_docs, cov_nodes, doc_pages_map = await self._act_tree_search(
+            ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = await self._act_tree_search(
                 query, candidates
             )
         except Exception as e:
@@ -489,7 +499,7 @@ class AgenticRouter:
         if v.action == "expand" and len(fused) > top_k:
             expanded = [doc_id for doc_id, _ in fused[: top_k * 2]]
             try:
-                ctx2, nodes2, src2, cov2, doc_pages_map2 = await self._act_tree_search(
+                ctx2, nodes2, src2, cov2, doc_pages_map2, pages_with_text2 = await self._act_tree_search(
                     query, expanded
                 )
                 if ctx2:
@@ -519,7 +529,7 @@ class AgenticRouter:
                         ],
                         "pages": [
                             {"doc_id": d, "pages": p}
-                            for d, p in doc_pages_map2.items()
+                            for d, p in pages_with_text2.items()
                         ],
                     }
             except Exception as e:
@@ -542,10 +552,7 @@ class AgenticRouter:
                 }
                 for n in nodes
             ],
-            "pages": [
-                {"doc_id": d, "pages": p}
-                for d, p in doc_pages_map.items()
-            ],
+            "pages": pages_with_text,
         }
 
     # ------------------------------------------------------------------
