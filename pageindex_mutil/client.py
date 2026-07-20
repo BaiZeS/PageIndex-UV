@@ -553,10 +553,8 @@ class PageIndexClient:
                 }
                 for n in selected
             ],
-            "pages": {
-                doc_id: [
-                    {"page": p, "text": (page_map.get(p, "") or "")[:500]}
-                    for p in sorted(set(pages))
-                ]
-            },
+            "pages": [
+                {"doc_id": doc_id, "page": p, "text": (page_map.get(p, "") or "")[:500]}
+                for p in sorted(set(pages))
+            ],
         }

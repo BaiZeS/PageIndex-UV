@@ -220,17 +220,20 @@ class AgenticRouter:
                 doc_pages_map[doc_id] = sorted(set(pages))
 
         # Build pages with text content for UI display
-        pages_with_text = {}
+        pages_with_text = []
         for doc_id, page_nums in doc_pages_map.items():
             doc = self.client.documents.get(doc_id)
             if not doc or doc.get("type") != "pdf" or not doc.get("pages"):
-                pages_with_text[doc_id] = [{"page": p} for p in page_nums]
+                for p in page_nums:
+                    pages_with_text.append({"doc_id": doc_id, "page": p})
                 continue
             page_map = {p["page"]: p["content"] for p in doc["pages"]}
-            pages_with_text[doc_id] = [
-                {"page": p, "text": (page_map.get(p, "") or "")[:500]}
-                for p in page_nums
-            ]
+            for p in page_nums:
+                pages_with_text.append({
+                    "doc_id": doc_id,
+                    "page": p,
+                    "text": (page_map.get(p, "") or "")[:500]
+                })
 
         return "\n\n".join(contexts), all_nodes, source_docs, len(all_nodes), doc_pages_map, pages_with_text
 
