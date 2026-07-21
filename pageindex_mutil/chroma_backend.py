@@ -163,15 +163,23 @@ class ChromaSearchBackend(SearchBackend):
         if not results or not results["metadatas"]:
             return []
 
-        # Aggregate scores by document
-        doc_scores: Dict[int, float] = {}
+        # Aggregate scores by document using weighted max + avg strategy
+        doc_similarities: Dict[int, List[float]] = {}
         for metadata, distance in zip(results["metadatas"][0], results["distances"][0]):
             doc_id = metadata["doc_id"]
-            # Convert distance to similarity score (cosine distance)
             similarity = 1.0 - distance
-            # Take the maximum similarity per document
-            if doc_id not in doc_scores or similarity > doc_scores[doc_id]:
-                doc_scores[doc_id] = similarity
+            if doc_id not in doc_similarities:
+                doc_similarities[doc_id] = []
+            doc_similarities[doc_id].append(similarity)
+
+        doc_scores: Dict[int, float] = {}
+        for doc_id, sims in doc_similarities.items():
+            sims_sorted = sorted(sims, reverse=True)
+            max_sim = sims_sorted[0]
+            # Weighted combination: 60% max similarity + 40% average of top-3
+            top_k_sims = sims_sorted[:3]
+            avg_top_k = sum(top_k_sims) / len(top_k_sims)
+            doc_scores[doc_id] = max_sim * 0.6 + avg_top_k * 0.4
 
         # Sort by score and return top_k
         sorted_results = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)

@@ -34,6 +34,33 @@ except ImportError:
 META_INDEX = "_meta.json"
 
 
+class DocIdMapper:
+    """Centralized UUID ↔ DB ID mapping with bidirectional lookup."""
+
+    def __init__(self):
+        self._uuid_to_db: dict[str, int] = {}
+        self._db_to_uuid: dict[int, str] = {}
+
+    def register(self, uuid_id: str, db_id: int) -> None:
+        self._uuid_to_db[uuid_id] = db_id
+        self._db_to_uuid[db_id] = uuid_id
+
+    def unregister(self, uuid_id: str) -> int | None:
+        db_id = self._uuid_to_db.pop(uuid_id, None)
+        if db_id is not None:
+            self._db_to_uuid.pop(db_id, None)
+        return db_id
+
+    def to_db(self, uuid_id: str) -> int | None:
+        return self._uuid_to_db.get(uuid_id)
+
+    def to_uuid(self, db_id: int) -> str | None:
+        return self._db_to_uuid.get(db_id)
+
+    def items(self):
+        return self._uuid_to_db.items()
+
+
 def _normalize_retrieve_model(model: str) -> str:
     """Normalize model name for OpenAI-compatible endpoints."""
     if not model:
@@ -73,7 +100,7 @@ class PageIndexClient:
         self.closet_index = None
         self.super_tree_index = None
         self.router = None
-        self._uuid_to_db: dict[str, int] = {}
+        self._id_mapper = DocIdMapper()
 
         if self.workspace:
             self._load_workspace()
@@ -84,9 +111,14 @@ class PageIndexClient:
             self.super_tree_index = SuperTreeIndex(self.db, self.model, self, self.retrieve_model)
             if AgenticRouter:
                 self.router = AgenticRouter(self, self.model, self.retrieve_model)
-            
+
             # Initialize search backends (ChromaDB hybrid is required)
             self._init_search_backends(search_backend, vector_db_path)
+
+    @property
+    def _uuid_to_db(self):
+        """Backward-compatible access to the UUID→DB mapping."""
+        return self._id_mapper._uuid_to_db
 
     def _init_search_backends(self, search_backend: str, vector_db_path: str):
         """Initialize search backends based on configuration."""
@@ -234,7 +266,7 @@ class PageIndexClient:
                     pdf_path=file_path,
                     doc_description=doc.get('doc_description', '')
                 )
-                self._uuid_to_db[doc_id] = db_doc_id
+                self._id_mapper.register(doc_id, db_doc_id)
                 
                 # Save tree structure to database for persistence
                 if doc.get('structure'):
@@ -267,12 +299,22 @@ class PageIndexClient:
                 # Extract entities and relationships
                 if self.entity_extractor and doc.get('structure'):
                     try:
-                        entities, relations = self.entity_extractor.extract_from_document(
+                        result = self.entity_extractor.extract_from_document(
                             doc.get('doc_name', ''),
                             doc.get('doc_description', ''),
                             doc['structure']
                         )
-                        
+                        entities, relations, node_contexts = result
+
+                        # Build context snippet map for entities
+                        # (find the most relevant context snippet for each entity)
+                        def _find_context(entity_name, contexts):
+                            name_lower = entity_name.lower()
+                            for ctx in contexts:
+                                if name_lower in ctx.lower():
+                                    return ctx[:200]
+                            return None
+
                         # Store entities
                         entity_ids = {}
                         for entity in entities:
@@ -283,10 +325,13 @@ class PageIndexClient:
                             )
                             if eid:
                                 entity_ids[entity.name] = eid
+                                context_snippet = _find_context(entity.name, node_contexts)
                                 self.db.insert_entity_mention(
-                                    eid, db_doc_id, confidence=entity.confidence
+                                    eid, db_doc_id,
+                                    context_snippet=context_snippet,
+                                    confidence=entity.confidence
                                 )
-                        
+
                         # Store relations
                         for rel in relations:
                             subject_id = entity_ids.get(rel.subject)
@@ -296,7 +341,7 @@ class PageIndexClient:
                                     subject_id, rel.predicate, object_id,
                                     doc_id=db_doc_id, confidence=rel.confidence
                                 )
-                        
+
                         logging.info("Extracted %d entities and %d relations for %s",
                                    len(entities), len(relations), doc.get('doc_name'))
                     except Exception as e:
@@ -403,7 +448,7 @@ class PageIndexClient:
                     if not found:
                         # Document exists in DB but not in workspace - load it
                         doc_id = str(uuid.uuid4())
-                        self._uuid_to_db[doc_id] = db_doc['id']
+                        self._id_mapper.register(doc_id, db_doc['id'])
                         self.documents[doc_id] = {
                             'id': doc_id,
                             'type': 'pdf',
@@ -517,7 +562,10 @@ class PageIndexClient:
 
         # Import shared reasoning helpers
         try:
-            from .reasoning import get_relevant_nodes, pages_from_nodes, generate_answer
+            from .reasoning import (
+                get_relevant_nodes, pages_from_nodes, generate_answer,
+                build_context_for_doc,
+            )
         except ImportError:
             return {
                 "query": query,
@@ -556,25 +604,17 @@ class PageIndexClient:
                 "pages": [],
             }
 
+        # Rank nodes by relevance: prefer nodes with longer summaries
+        # (more detailed summaries indicate deeper coverage of the topic)
+        selected.sort(
+            key=lambda n: len(n.get("summary", "")),
+            reverse=True
+        )
+
         pages = pages_from_nodes(selected)
 
-        # Assemble context
-        ctx_parts = [f"\n=== Document: {doc.get('doc_name', '')} ===\n"]
-        if doc.get("type") == "pdf" and doc.get("pages"):
-            page_map = {p["page"]: p["content"] for p in doc["pages"]}
-            for p in sorted(set(pages)):
-                text = page_map.get(p, "")
-                if text:
-                    ctx_parts.append(f"\n--- Page {p} ---\n{text}")
-        elif doc.get("type") == "md":
-            for node in selected:
-                txt = node.get("text", "")
-                if txt:
-                    ctx_parts.append(
-                        f"\n--- {node.get('title', '')} ---\n{txt}"
-                    )
-
-        context = "".join(ctx_parts)
+        # Assemble context using shared helper
+        context = build_context_for_doc(doc, selected, pages)
         answer = generate_answer(query, context)
 
         return {

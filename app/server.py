@@ -268,13 +268,14 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
             c = get_client()
             docs = []
             for doc in db.get_all_documents():
-                db_id = str(doc.get("id", ""))
+                db_id = doc.get("id", "")
                 # Map DB id back to UUID if possible
-                doc_id = db_id
-                for uuid, mapped_db_id in c._uuid_to_db.items():
-                    if str(mapped_db_id) == db_id:
+                id_mapper = getattr(c, "_id_mapper", None)
+                doc_id = str(db_id)
+                if id_mapper:
+                    uuid = id_mapper.to_uuid(db_id)
+                    if uuid:
                         doc_id = uuid
-                        break
                 docs.append({
                     "id": doc_id,
                     "name": doc.get("pdf_name", ""),
@@ -303,7 +304,11 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
             if doc_id in c.documents:
                 del c.documents[doc_id]
 
-            db_id = c._uuid_to_db.pop(doc_id, None)
+            id_mapper = getattr(c, "_id_mapper", None)
+            if id_mapper:
+                db_id = id_mapper.unregister(doc_id)
+            else:
+                db_id = c._uuid_to_db.pop(doc_id, None)
             if db_id is not None:
                 # v1.1 spec §5.1.1: MCP and REST share delete_document_internal
                 # so behavior cannot drift between surfaces (AC10.6 / AC10.7).
@@ -514,12 +519,14 @@ async def handle_list_resources() -> list[types.Resource]:
 
     resources = []
     for doc in db.get_all_documents():
-        doc_id = str(doc.get("id", ""))
+        db_id_val = doc.get("id", "")
         # Map DB id back to UUID if possible
-        for uuid, db_id in c._uuid_to_db.items():
-            if str(db_id) == doc_id:
+        id_mapper = getattr(c, "_id_mapper", None)
+        doc_id = str(db_id_val)
+        if id_mapper:
+            uuid = id_mapper.to_uuid(db_id_val)
+            if uuid:
                 doc_id = uuid
-                break
         name = doc.get("pdf_name", "") or "Untitled"
         resources.append(
             types.Resource(

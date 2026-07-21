@@ -1,12 +1,13 @@
 # PageIndex-UV
 
-基于 [PageIndex](https://github.com/VectifyAI/PageIndex) 思想的文档结构化索引与推理问答工具。采用**非向量化（Vectorless）、推理驱动（Reasoning-based）**方式处理长文档（PDF/Markdown），所有核心代码内联在仓库中。
+基于 [PageIndex](https://github.com/VectifyAI/PageIndex) 思想的文档结构化索引与推理问答工具。采用**向量+结构化混合检索、推理驱动**方式处理长文档（PDF/Markdown），所有核心代码内联在仓库中。
 
 ## 核心特性
 
-- **零向量依赖**：纯结构化数据（JSON 树 + jieba 分词 + SQLite），无需 Embedding 或向量数据库
-- **多文档联合检索**：Super-Tree Retrieval v3 四层架构（L0 双通道预过滤 → L1 LLM 选档 → L2 逐文档节点推理 → L3 上下文提取）
+- **混合检索引擎**：四通道预过滤（语义标签 + 关键词倒排 + ChromaDB 向量 + 实体图谱），RRF 融合排序
+- **多文档联合检索**：Super-Tree Retrieval v3 四层架构（L0 四通道预过滤 → L1 LLM 选档 → L2 并行节点推理 → L3 按相关性排序上下文提取）
 - **SQLite 缓存加速**：节点元数据、页面文本、树结构持久化，避免重复解析 PDF
+- **实体知识图谱**：自动抽取文档实体与关系，支持跨文档实体驱动检索
 - **多格式支持**：PDF、Markdown、DOCX、PPTX、XLSX 等
 - **MCP 标准化服务**：通过 Model Context Protocol 对外暴露 RAG 能力，支持 Claude Desktop、Cursor 等 Agent 工具
 
@@ -78,7 +79,7 @@ API_KEY=testkey uv run python server.py
 | `PORT` | 否 | 监听端口（默认 `3000`） |
 | `WORKSPACE` | 否 | 文档存储目录（默认 `./data/workspace`） |
 | `DB_PATH` | 否 | SQLite 数据库路径（默认 `./data/index.db`） |
-| `SEARCH_BACKEND` | 否 | 搜索模式：`hybrid`（向量+关键词）或 `chroma`（纯向量，默认 `hybrid`） |
+| `SEARCH_BACKEND` | 否 | 搜索模式：`hybrid`（向量+关键词+标签，默认 `hybrid`）或 `chroma`（纯向量） |
 | `VECTOR_DB_PATH` | 否 | ChromaDB 存储目录（默认 `./data/vectors`） |
 
 > *至少配置一个 LLM API Key。优先级：显式参数 > `OPENAI_API_KEY` > `DASHSCOPE_API_KEY`。
@@ -135,25 +136,29 @@ API_KEY=testkey uv run python server.py
 │   ├── page_index_md.py       # Markdown 结构化索引
 │   ├── page_index_liteparse.py # 多格式解析
 │   ├── closet_index.py        # 语义标签索引
-│   ├── super_tree.py          # Super-Tree 检索 v3
-│   ├── client.py              # 统一入口（单/多文档检索）
+│   ├── super_tree.py          # Super-Tree 检索 v3（含四通道预过滤）
+│   ├── client.py              # 统一入口（单/多文档检索 + DocIdMapper）
 │   ├── search_backend.py      # 搜索后端接口
-│   ├── hybrid_backend.py      # 混合搜索后端（向量+关键词）
+│   ├── hybrid_backend.py      # 混合搜索后端（向量+关键词+标签 RRF 融合）
 │   ├── chroma_backend.py      # ChromaDB 向量搜索后端
-│   ├── entity_extractor.py    # 实体抽取
-│   ├── reasoning.py           # 推理逻辑
+│   ├── entity_extractor.py    # 实体/关系抽取 + 知识图谱
+│   ├── reasoning.py           # 推理逻辑（含共享上下文组装、LLM 缓存）
 │   ├── retrieve.py            # 单文档检索辅助
-│   ├── utils.py               # 工具函数
+│   ├── utils.py               # 工具函数（含 LLM 调用缓存）
 │   ├── config.yaml            # 索引/检索参数配置
 │   ├── migrations/            # 数据库迁移脚本
 │   └── agentic/               # Agentic 多策略路由
+│       ├── router.py          # 路由编排（并行节点召回 + HyDE）
+│       ├── planner.py         # 查询规划（HyDE + 查询变体）
+│       ├── strategies.py      # 检索策略（Metadata/Semantics/Description）
+│       └── verifier.py        # CRAG 答案验证
 ├── app/                       # 应用入口
 │   ├── __init__.py
 │   ├── main.py                # 交互式问答入口
 │   ├── server.py              # MCP 服务 + HTTP API
 │   ├── config_utils.py        # 纯函数配置工具
 │   └── config_service.py      # 运行时配置服务
-├── db.py                      # SQLite 缓存层
+├── db.py                      # SQLite 缓存层（含实体图谱表）
 ├── web/                       # Web 控制台（零构建）
 │   ├── index.html             # 入口 HTML
 │   └── static/                # 静态资源（Vue 3 + Element Plus）
@@ -169,7 +174,7 @@ API_KEY=testkey uv run python server.py
 
 ## 技术栈
 
-Python 3.12+ / uv / SQLite / PyMuPDF / OpenAI SDK / MCP SDK / Starlette + uvicorn / jieba / tiktoken
+Python 3.12+ / uv / SQLite / PyMuPDF / ChromaDB / sentence-transformers / OpenAI SDK / MCP SDK / Starlette + uvicorn / jieba / tiktoken
 
 ## 文档
 

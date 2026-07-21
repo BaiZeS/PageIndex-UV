@@ -27,12 +27,17 @@ class KeywordIndex:
             if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
         ]
 
-    def add_document(self, doc_id: int, doc_name: str, doc_description: str) -> None:
+    def add_document(self, doc_id: int, doc_name: str, doc_description: str,
+                     node_titles: List[str] = None) -> None:
         records = []
         for token in self._tokenize(doc_name):
             records.append((doc_id, token, "name"))
         for token in self._tokenize(doc_description or ""):
             records.append((doc_id, token, "description"))
+        if node_titles:
+            for title in node_titles:
+                for token in self._tokenize(title):
+                    records.append((doc_id, token, "node_title"))
         self.db.insert_doc_keywords(doc_id, records)
 
     def remove_document(self, doc_id: int) -> None:
@@ -156,6 +161,9 @@ class SuperTreeIndex:
 
     def _get_db_to_uuid(self) -> Dict[int, str]:
         """Build reverse mapping from db_id -> uuid."""
+        id_mapper = getattr(self.client, "_id_mapper", None)
+        if id_mapper:
+            return {db: uuid for uuid, db in id_mapper.items()}
         return {v: k for k, v in getattr(self.client, "_uuid_to_db", {}).items()}
 
     # ------------------------------------------------------------------
@@ -164,8 +172,16 @@ class SuperTreeIndex:
     def on_document_added(self, db_doc_id: int) -> None:
         doc = self.db.get_document_by_id(db_doc_id)
         if doc:
+            # Collect node titles from DB for keyword indexing
+            node_titles = []
+            try:
+                top_nodes = self.db.get_top_level_nodes(db_doc_id)
+                node_titles = [n.get("title", "") for n in top_nodes if n.get("title")]
+            except Exception:
+                pass
             self.keyword_index.add_document(
-                db_doc_id, doc.get("pdf_name", ""), doc.get("doc_description", "")
+                db_doc_id, doc.get("pdf_name", ""),
+                doc.get("doc_description", ""), node_titles
             )
         self.kb_identity.invalidate()
 
@@ -177,7 +193,13 @@ class SuperTreeIndex:
     # L0: Dual-channel prefilter
     # ------------------------------------------------------------------
     def prefilter(self, query: str) -> Dict[int, float]:
-        """Return candidate doc_ids with cumulative channel scores."""
+        """Return candidate doc_ids with cumulative channel scores.
+
+        Channels:
+          A: ClosetIndex semantic tag matching
+          B: KeywordIndex inverted index
+          C: Vector search via ChromaDB (if available)
+        """
         scores: Dict[int, float] = {}
 
         # Channel A: tag matching (ClosetIndex)
@@ -196,6 +218,33 @@ class SuperTreeIndex:
                 scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(score)
         except Exception as e:
             logging.warning("Keyword search failed: %s", e)
+
+        # Channel C: vector search (ChromaDB)
+        if hasattr(self.client, "search_backend") and self.client.search_backend:
+            try:
+                vector_results = self.client.search_backend.search(query, top_k=20)
+                for doc_id, score in vector_results:
+                    # Weight vector results higher for semantic understanding
+                    scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(score) * 1.5
+            except Exception as e:
+                logging.warning("Vector search failed in prefilter: %s", e)
+
+        # Channel D: entity graph matching
+        if hasattr(self.client, "db") and self.client.db:
+            try:
+                entities = self.client.db.search_entities(query, limit=10)
+                for entity in entities:
+                    entity_id = entity.get("id")
+                    if entity_id:
+                        # Find documents mentioning this entity
+                        mentions = self.client.db.get_entity_documents(entity_id)
+                        for mention in mentions:
+                            doc_id = mention.get("id")
+                            if doc_id:
+                                mention_conf = mention.get("confidence", 0.5)
+                                scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(mention_conf)
+            except Exception as e:
+                logging.warning("Entity graph search failed in prefilter: %s", e)
 
         return scores
 
@@ -319,10 +368,19 @@ class SuperTreeIndex:
                 summary = node.get("summary", "") or ""
                 if len(summary) > self._SUMMARY_MAX_LEN:
                     summary = summary[:self._SUMMARY_MAX_LEN] + "..."
-                top_nodes_out.append({
+                node_entry = {
                     "title": node.get("title", ""),
                     "summary": summary,
-                })
+                }
+                # Enrich with depth=2 children titles for finer granularity
+                child_titles = []
+                for child in node.get("nodes", [])[:5]:
+                    child_title = child.get("title", "")
+                    if child_title:
+                        child_titles.append(child_title)
+                if child_titles:
+                    node_entry["children"] = child_titles
+                top_nodes_out.append(node_entry)
 
             documents.append({
                 "doc_id": uuid,
@@ -348,10 +406,17 @@ class SuperTreeIndex:
 
         for doc in self.db.get_all_documents():
             try:
+                node_titles = []
+                try:
+                    top_nodes = self.db.get_top_level_nodes(doc["id"])
+                    node_titles = [n.get("title", "") for n in top_nodes if n.get("title")]
+                except Exception:
+                    pass
                 self.keyword_index.add_document(
                     doc["id"],
                     doc.get("pdf_name", ""),
                     doc.get("doc_description", ""),
+                    node_titles,
                 )
             except Exception as e:
                 logging.warning("Backfill failed for doc %s: %s", doc.get("pdf_name"), e)

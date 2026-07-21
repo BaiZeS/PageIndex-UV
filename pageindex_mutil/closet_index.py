@@ -12,10 +12,20 @@ from .utils import llm_completion, extract_json
 
 # Simple stopword set for Chinese/English mixed queries.
 _STOPWORDS = {
+    # Chinese stopwords
     "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一",
     "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着",
     "看", "好", "自己", "这", "那", "怎么", "什么", "如何", "吗", "呢",
     "吧", "啊", "哦", "嗯", "没有",
+    "将", "被", "让", "从", "与", "及", "等", "或", "该", "本", "其",
+    "但", "如", "则", "所", "对", "已", "经", "能", "可", "之", "以",
+    "中", "为", "而", "到", "地", "个", "时", "过", "作", "里", "用",
+    "道", "来", "还", "得", "起", "把", "生", "们", "子", "出", "里",
+    "只", "想", "头", "面", "天", "些", "么", "此", "些", "样", "大",
+    "没", "做", "只", "后", "前", "开", "成", "方", "如", "多", "定",
+    "同", "当", "使", "虽", "因", "由", "应", "物", "据", "按", "据",
+    "向", "于", "著", "等", "更", "最", "全", "都", "又", "再", "仍",
+    # English stopwords
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
     "have", "has", "had", "do", "does", "did", "will", "would", "shall",
     "should", "can", "could", "may", "might", "must", "to", "of", "in",
@@ -25,7 +35,10 @@ _STOPWORDS = {
     "while", "where", "when", "that", "which", "who", "whom", "whose",
     "what", "how", "why", "this", "these", "those", "it", "its", "they",
     "them", "their", "we", "us", "our", "you", "your", "he", "him", "his",
-    "she", "her", "i", "me", "my",
+    "she", "her", "i", "me", "my", "not", "no", "nor", "than", "too",
+    "very", "just", "about", "also", "back", "only", "then", "here",
+    "there", "some", "any", "each", "every", "all", "both", "few",
+    "more", "most", "other", "such", "own", "same",
 }
 
 

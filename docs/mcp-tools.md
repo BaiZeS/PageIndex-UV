@@ -4,13 +4,13 @@
 > Transport: HTTP + SSE (`GET /sse`, `POST /messages/?session_id=…`)
 > Auth: `X-API-Key` header (same as REST API)
 
-The server exposes **4 tools** and **N resources** (one per indexed document, URI scheme `document://<uuid>`).
+The server exposes **8 tools** and **N resources** (one per indexed document, URI scheme `document://<uuid>`).
 
 ## Tools
 
 ### `search`
 
-Multi-strategy RAG over indexed documents.
+Hybrid RAG over indexed documents using four-channel retrieval (semantic tags + keywords + vector search + entity graph).
 
 **Input**
 
@@ -31,7 +31,7 @@ Multi-strategy RAG over indexed documents.
     { "doc_id": "<uuid>", "doc_name": "<name>", "score": 0.91 }
   ],
   "selected_nodes": [
-    { "node_id": "...", "title": "...", "path": "...", "summary": "...",
+    { "node_id": "...", "title": "...", "summary": "...", "text": "...",
       "pages": [3, 4] }
   ],
   "pages": [
@@ -89,6 +89,96 @@ Remove a document from memory + DB + on-disk workspace.
 ```
 
 Same code path as the REST `DELETE /api/documents/{id}` and the web console's delete button. Disk cleanup + orphan migration are guaranteed by `db.delete_document` + `on_document_removed`.
+
+### `search_entities`
+
+Search for entities (people, projects, organizations, concepts) across all documents.
+
+**Input**
+
+```json
+{
+  "query": "<entity name or keyword>",
+  "limit": 20   // optional, default 20
+}
+```
+
+**Output**
+
+```json
+{
+  "entities": [
+    { "id": 1, "entity_type": "organization", "name": "...", "aliases": "...", "doc_count": 3 }
+  ]
+}
+```
+
+### `get_entity`
+
+Get detailed information about an entity including its relationships and documents.
+
+**Input**
+
+```json
+{ "name": "<entity name>" }
+```
+
+**Output**
+
+```json
+{
+  "entity": { "id": 1, "entity_type": "person", "name": "...", "doc_count": 2 },
+  "relations": [
+    { "subject_name": "Alice", "predicate": "works_on", "object_name": "Project X", "confidence": 0.9 }
+  ],
+  "documents": [
+    { "id": 1, "pdf_name": "...", "context_snippet": "...", "confidence": 0.8 }
+  ]
+}
+```
+
+### `get_document_entities`
+
+Get all entities mentioned in a specific document.
+
+**Input**
+
+```json
+{ "doc_id": "<document DB id (integer)>" }
+```
+
+**Output**
+
+```json
+{
+  "entities": [
+    { "id": 1, "entity_type": "concept", "name": "...", "context_snippet": "...", "mention_confidence": 0.9 }
+  ]
+}
+```
+
+### `get_related_documents`
+
+Find documents related through shared entities.
+
+**Input**
+
+```json
+{
+  "doc_id": "<document DB id (integer)>",
+  "limit": 10   // optional, default 10
+}
+```
+
+**Output**
+
+```json
+{
+  "related_documents": [
+    { "id": 2, "pdf_name": "...", "shared_entities": 5 }
+  ]
+}
+```
 
 ## Resources
 
@@ -154,7 +244,7 @@ asyncio.run(main())
 ## What you get back when something fails
 
 - **Wrong / missing API key**: HTTP 403 with `{"error":"Invalid or missing API Key"}` — surfaces before SSE opens.
-- **No documents indexed yet**: `search` returns a low-confidence answer explaining the search returned no candidates (router says "Super-Tree selection returned no documents"). Empty `matched_docs` / `selected_nodes` / `pages`.
+- **No documents indexed yet**: `search` returns a low-confidence answer explaining the search returned no candidates (router says "No relevant documents found in prefilter"). Empty `matched_docs` / `selected_nodes` / `pages`.
 - **Tool name typo**: MCP `tools/call` returns `[TextContent(type="text", text=JSON.stringify({"error":"Unknown tool: <name>"}))]`. Check the `name` field.
 - **Network drop / uvicorn restart**: SSE stream closes; client should reconnect with exponential backoff.
 

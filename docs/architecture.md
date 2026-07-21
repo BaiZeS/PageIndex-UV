@@ -42,23 +42,32 @@ PageIndex-UV is a **non-vector, reasoning-based RAG** tool over long documents (
 question
    │
    ▼
-L0: Dual-Channel Prefilter (SuperTreeIndex)
+HyDE: Query Expansion (Planner)
+   │  Generate hypothetical answer + query variants
+   ▼
+L0: Four-Channel Prefilter (SuperTreeIndex)
    │  Channel A: ClosetIndex (semantic tag matching)
-   │  Channel B: KeywordIndex (jieba inverted index)
+   │  Channel B: KeywordIndex (jieba inverted index, includes node titles)
+   │  Channel C: ChromaDB vector search (1.5x weight)
+   │  Channel D: Entity graph matching (cross-document relations)
    ▼
 L1: Super-Tree Document Selection (LLM)
-   │  Based on mini-TOC + KB Identity
+   │  Based on enriched mini-TOC (depth=1 + depth=2 child titles) + KB Identity
    │  6000 tokens budget, max 50 candidates → 3-5 selected
    ▼
-L2: Per-Document Node Recall (AgenticRouter)
-   │  Independent tree reasoning per selected doc
-   │  Avoids multi-tree mixing in single prompt
+L2: Parallel Per-Document Node Recall (AgenticRouter)
+   │  asyncio.gather parallel tree reasoning per selected doc
+   │  Results ranked by relevance (matched node count)
    ▼
-L3: Context Extraction
-   │  Page merging + 16K token budget truncation
+L3: Context Extraction (ranked by relevance)
+   │  Entity relationship enrichment + page merging
+   │  16K token budget truncation
    ▼
 LLM Answer Composition (with evidence)
    │
+   ▼
+CRAG Verification (verifier.py)
+   │  Confidence-based: answer / expand / refuse
    ▼
 { answer, confidence, matched_docs, selected_nodes, pages }
 ```
@@ -77,23 +86,27 @@ LLM Answer Composition (with evidence)
 
 The multi-document retrieval uses a four-layer architecture:
 
-1. **L0 Dual-Channel Prefilter** (`SuperTreeIndex.prefilter()`):
+1. **L0 Four-Channel Prefilter** (`SuperTreeIndex.prefilter()`):
    - **Channel A (Semantic)**: `ClosetIndex` matches query against `closet_tags` table using jieba tokenization
-   - **Channel B (Keyword)**: `KeywordIndex` matches query against `doc_keywords` table
+   - **Channel B (Keyword)**: `KeywordIndex` matches query against `doc_keywords` table (includes node titles, doc names, descriptions)
+   - **Channel C (Vector)**: ChromaDB vector search via `SearchBackend.search()` (1.5x weight for semantic understanding)
+   - **Channel D (Entity)**: Entity graph matching via `db.search_entities()` + `db.get_entity_documents()`
    - Results merged into candidate set (max 50 docs)
 
 2. **L1 Super-Tree Document Selection** (`SuperTreeIndex.select_documents()`):
-   - Builds mini-TOC (depth=1 nodes, max 8 per doc)
+   - Builds enriched mini-TOC (depth=1 nodes + depth=2 child titles, max 8 top nodes per doc)
    - Combines with KB Identity (knowledge base summary)
    - Single LLM call selects 3-5 most relevant documents
    - Token budget: 6000 tokens (auto-truncation if exceeded)
+   - HyDE integration: planner generates hypothetical answer for query expansion
 
-3. **L2 Per-Document Node Recall**:
-   - Independent tree reasoning per selected document
-   - Uses `get_relevant_nodes()` for each doc's tree structure
-   - Max 5 nodes per document
+3. **L2 Parallel Per-Document Node Recall** (`AgenticRouter._act_tree_search()`):
+   - `asyncio.gather` parallel tree reasoning per selected document
+   - Each doc's recall runs in a thread via `_recall_nodes_for_doc()`
+   - Results ranked by relevance score (matched node count / total nodes)
 
-4. **L3 Context Extraction**:
+4. **L3 Context Extraction** (ranked by relevance):
+   - Entity relationship enrichment from cross-document graph
    - Converts nodes to page ranges
    - Reads page text from SQLite `pages` table
    - 16K token hard limit with priority-based truncation
@@ -101,10 +114,30 @@ The multi-document retrieval uses a four-layer architecture:
 ### Agentic Router (v2 fallback)
 
 When Super-Tree fails, `AgenticRouter.search()` falls back to:
-- **Plan**: Query analysis with HyDE
-- **Route**: Strategy selection (Metadata/Semantics/Description)
-- **Act**: Parallel strategy execution
-- **Verify**: CRAG verification with confidence thresholds
+- **Plan**: Query analysis with HyDE (query type classification + query variants)
+- **Route**: Parallel strategy execution (Metadata/Semantics/Description)
+- **Act**: Parallel node recall + context assembly
+- **Verify**: CRAG verification with confidence thresholds (answer/expand/refuse)
+
+### Hybrid Search Backend
+
+`HybridSearchBackend` combines three search channels using Reciprocal Rank Fusion (RRF):
+- **Vector search**: ChromaDB with sentence-transformers embeddings
+- **Keyword search**: jieba inverted index on doc names, descriptions, and node titles
+- **Tag search**: ClosetIndex semantic tag matching
+
+Configurable weights per channel (default: vector 1.5x, keyword 1.0x, tag 1.0x).
+
+### Entity Knowledge Graph
+
+`EntityExtractor` automatically extracts entities (people, projects, organizations, concepts) and relationships from documents during indexing. Stored in SQLite tables (`entities`, `entity_mentions`, `entity_relations`). Used in:
+- L0 prefilter Channel D for entity-driven document recall
+- L3 context enrichment with cross-document entity relationships
+- MCP tools: `search_entities`, `get_entity`, `get_document_entities`, `get_related_documents`
+
+### DocIdMapper
+
+`DocIdMapper` class centralizes UUID ↔ DB ID bidirectional mapping. Replaces scattered `_uuid_to_db` dict usage across client.py, super_tree.py, router.py, and server.py.
 
 ## Surface map
 
@@ -128,8 +161,13 @@ pages (id, doc_id, page_number, content)
 
 -- Super-Tree v3 tables
 closet_tags (id, doc_id, tag_text, tag_token, confidence, source)
-doc_keywords (id, doc_id, keyword, field)
+doc_keywords (id, doc_id, keyword, field)  -- field: "name"|"description"|"node_title"
 kb_identity (id, identity_text, doc_count, updated_at)
+
+-- Entity knowledge graph tables
+entities (id, entity_type, name, aliases, doc_count, created_at)
+entity_mentions (id, entity_id, doc_id, node_id, context_snippet, confidence, created_at)
+entity_relations (id, subject_id, predicate, object_id, doc_id, confidence, created_at)
 ```
 
 ## Stability promise

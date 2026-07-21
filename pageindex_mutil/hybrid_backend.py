@@ -15,18 +15,21 @@ logger = logging.getLogger(__name__)
 class HybridSearchBackend(SearchBackend):
     """Hybrid search combining vector similarity and keyword matching."""
 
-    def __init__(self, db, chroma_backend: SearchBackend, rrf_k: int = 60):
+    def __init__(self, db, chroma_backend: SearchBackend, rrf_k: int = 60,
+                 weights: list = None):
         """Initialize hybrid backend.
-        
+
         Args:
             db: PageIndexDB instance for keyword/tag search
             chroma_backend: ChromaSearchBackend instance for vector search
             rrf_k: RRF constant for rank fusion (higher = less steep)
+            weights: Optional weights for [vector, keyword, tag] channels
         """
         self.db = db
         self.chroma = chroma_backend
         self.rrf_k = rrf_k
-        
+        self.channel_weights = weights or [1.5, 1.0, 1.0]
+
         # Import keyword search dependencies
         try:
             import jieba
@@ -139,13 +142,10 @@ class HybridSearchBackend(SearchBackend):
         keyword_results = self._keyword_search(query, top_k * 2)
         tag_results = self._tag_search(query, top_k * 2)
 
-        # Combine using RRF with weights
-        # Vector search gets higher weight for semantic understanding
-        # Keyword/tag search gets weight for exact matching
+        # Combine using RRF with configurable weights
         result_sets = [vector_results, keyword_results, tag_results]
-        weights = [1.5, 1.0, 1.0]  # Vector gets 1.5x weight
-        
-        fused_results = self._rrf_fusion(result_sets, weights)
+
+        fused_results = self._rrf_fusion(result_sets, self.channel_weights)
         
         # Return top_k results
         return fused_results[:top_k]

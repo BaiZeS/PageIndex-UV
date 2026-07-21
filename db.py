@@ -199,7 +199,9 @@ class PageIndexDB:
                 """
                 INSERT INTO documents (pdf_name, pdf_path, doc_description)
                 VALUES (?, ?, ?)
-                ON CONFLICT(pdf_name) DO UPDATE SET pdf_name = pdf_name
+                ON CONFLICT(pdf_name) DO UPDATE SET
+                    pdf_path = excluded.pdf_path,
+                    doc_description = COALESCE(excluded.doc_description, documents.doc_description)
                 RETURNING id
                 """,
                 (pdf_name, pdf_path, doc_description),
@@ -238,16 +240,8 @@ class PageIndexDB:
     def insert_pages(self, doc_id, page_records, chunk_size=50):
         with self._connect() as conn:
             conn.execute("DELETE FROM pages WHERE doc_id = ?", (doc_id,))
-            chunk = []
-            for record in page_records:
-                chunk.append(record)
-                if len(chunk) >= chunk_size:
-                    conn.executemany(
-                        "INSERT INTO pages (doc_id, page_number, content) VALUES (?, ?, ?)",
-                        chunk,
-                    )
-                    chunk = []
-            if chunk:
+            for i in range(0, len(page_records), chunk_size):
+                chunk = page_records[i:i + chunk_size]
                 conn.executemany(
                     "INSERT INTO pages (doc_id, page_number, content) VALUES (?, ?, ?)",
                     chunk,
@@ -343,19 +337,8 @@ class PageIndexDB:
             return
         with self._connect() as conn:
             conn.execute("DELETE FROM closet_tags WHERE doc_id = ?", (doc_id,))
-            chunk = []
-            for record in records:
-                chunk.append(record)
-                if len(chunk) >= 50:
-                    conn.executemany(
-                        """
-                        INSERT INTO closet_tags (doc_id, tag_text, tag_token, confidence, source)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        chunk,
-                    )
-                    chunk = []
-            if chunk:
+            for i in range(0, len(records), 100):
+                chunk = records[i:i + 100]
                 conn.executemany(
                     """
                     INSERT INTO closet_tags (doc_id, tag_text, tag_token, confidence, source)
@@ -409,16 +392,8 @@ class PageIndexDB:
             return
         with self._connect() as conn:
             conn.execute("DELETE FROM doc_keywords WHERE doc_id = ?", (doc_id,))
-            chunk = []
-            for record in records:
-                chunk.append(record)
-                if len(chunk) >= 50:
-                    conn.executemany(
-                        "INSERT INTO doc_keywords (doc_id, keyword, field) VALUES (?, ?, ?)",
-                        chunk,
-                    )
-                    chunk = []
-            if chunk:
+            for i in range(0, len(records), 100):
+                chunk = records[i:i + 100]
                 conn.executemany(
                     "INSERT INTO doc_keywords (doc_id, keyword, field) VALUES (?, ?, ?)",
                     chunk,

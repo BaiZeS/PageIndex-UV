@@ -15,13 +15,30 @@ from .utils import (
     ConfigLoader,
 )
 
-# Multi-doc context budget (configurable via config.yaml)
-_cfg = ConfigLoader().load(None)
-MAX_CONTEXT_TOKENS = getattr(_cfg, "max_context_tokens", 16000)
+# Lazy-loaded config values (avoid module-level side effects)
+_cfg_cache = None
 
-# Resolve model names (same precedence as before: env > config.yaml)
-MODEL_NAME = _cfg.model
-RETRIEVE_MODEL_NAME = _cfg.retrieve_model
+
+def _get_config():
+    global _cfg_cache
+    if _cfg_cache is None:
+        _cfg_cache = ConfigLoader().load(None)
+    return _cfg_cache
+
+
+def _get_max_context_tokens():
+    cfg = _get_config()
+    return getattr(cfg, "max_context_tokens", 16000)
+
+
+def _get_model_name():
+    cfg = _get_config()
+    return cfg.model
+
+
+def _get_retrieve_model_name():
+    cfg = _get_config()
+    return cfg.retrieve_model
 
 
 def _call_llm_json(prompt, extract_key=None, expect_list=False):
@@ -35,7 +52,7 @@ def _call_llm_json(prompt, extract_key=None, expect_list=False):
         return []
     try:
         response = client.chat.completions.create(
-            model=RETRIEVE_MODEL_NAME or MODEL_NAME,
+            model=_get_retrieve_model_name() or _get_model_name(),
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": prompt}
@@ -142,7 +159,7 @@ def generate_answer(question, context):
         """
     try:
         response = client.chat.completions.create(
-            model=RETRIEVE_MODEL_NAME or MODEL_NAME,
+            model=_get_retrieve_model_name() or _get_model_name(),
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": prompt}
@@ -197,3 +214,26 @@ Directly return the final JSON structure. Do not output anything else.
 If no documents seem relevant, return an empty list.
 """
     return _call_llm_json(prompt, extract_key='doc_ids')
+
+
+def build_context_for_doc(doc, selected_nodes, pages):
+    """Build context string for a single document from selected nodes and pages.
+
+    Shared logic used by both single-doc and multi-doc search paths.
+    Returns (context_string, pages_used).
+    """
+    ctx_parts = [f"\n=== Document: {doc.get('doc_name', '')} ===\n"]
+    if doc.get("type") == "pdf" and doc.get("pages"):
+        page_map = {p["page"]: p["content"] for p in doc["pages"]}
+        for p in sorted(set(pages)):
+            text = page_map.get(p, "")
+            if text:
+                ctx_parts.append(f"\n--- Page {p} ---\n{text}")
+    elif doc.get("type") == "md":
+        for node in selected_nodes:
+            txt = node.get("text", "")
+            if txt:
+                ctx_parts.append(f"\n--- {node.get('title', '')} ---\n{txt}")
+
+    context = "".join(ctx_parts) if len(ctx_parts) > 1 else ""
+    return context

@@ -3,7 +3,9 @@ import re
 import os
 import random
 import textwrap
+import hashlib
 from datetime import datetime
+from functools import lru_cache
 import time
 import json
 import PyPDF2
@@ -92,6 +94,36 @@ def get_llm_async_client():
 configure_llm()
 
 
+# ---------------------------------------------------------------------------
+# LLM call cache — avoids redundant calls for identical prompts.
+# ---------------------------------------------------------------------------
+_LLM_CACHE: dict = {}  # hash(prompt+model) -> (result, timestamp)
+_LLM_CACHE_TTL = 300   # seconds (5 minutes)
+_LLM_CACHE_MAX = 256   # max entries
+
+
+def _llm_cache_key(model: str, prompt: str) -> str:
+    raw = f"{model}:{prompt}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _llm_cache_get(key: str):
+    entry = _LLM_CACHE.get(key)
+    if entry and (time.monotonic() - entry[1]) < _LLM_CACHE_TTL:
+        return entry[0]
+    if entry:
+        del _LLM_CACHE[key]
+    return None
+
+
+def _llm_cache_set(key: str, value):
+    if len(_LLM_CACHE) >= _LLM_CACHE_MAX:
+        # Evict oldest entry
+        oldest_key = min(_LLM_CACHE, key=lambda k: _LLM_CACHE[k][1])
+        del _LLM_CACHE[oldest_key]
+    _LLM_CACHE[key] = (value, time.monotonic())
+
+
 def count_tokens(text, model=None):
     if not text:
         return 0
@@ -108,6 +140,16 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
         if return_finish_reason:
             return "", "error"
         return ""
+
+    # Check cache for non-history calls
+    if not chat_history:
+        cache_key = _llm_cache_key(model or "", prompt)
+        cached = _llm_cache_get(cache_key)
+        if cached is not None:
+            if return_finish_reason:
+                return cached, "cached"
+            return cached
+
     max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
     for i in range(max_retries):
@@ -118,6 +160,10 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 temperature=0,
             )
             content = response.choices[0].message.content
+            # Cache result for non-history calls
+            if not chat_history and content:
+                cache_key = _llm_cache_key(model or "", prompt)
+                _llm_cache_set(cache_key, content)
             if return_finish_reason:
                 finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
                 return content, finish_reason

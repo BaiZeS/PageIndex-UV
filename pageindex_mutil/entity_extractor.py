@@ -236,19 +236,20 @@ class EntityExtractor:
         structure: List[Dict]
     ) -> Tuple[List[Entity], List[EntityRelation]]:
         """Extract entities and relations from a document structure.
-        
+
         Args:
             doc_name: Document filename
             doc_description: Document description
             structure: Document tree structure
-            
+
         Returns:
             Tuple of (entities, relations)
         """
-        # Flatten structure to get titles and summaries
+        # Flatten structure to get titles, summaries, and context snippets
         node_titles = []
         node_summaries = []
-        
+        node_contexts = []  # (title, summary) pairs for context extraction
+
         def flatten_nodes(nodes, depth=0):
             for node in nodes:
                 title = node.get("title", "")
@@ -257,21 +258,23 @@ class EntityExtractor:
                     node_titles.append(title)
                 if summary:
                     node_summaries.append(summary)
-                
+                if title or summary:
+                    node_contexts.append(f"{title}: {summary}")
+
                 children = node.get("nodes", [])
-                if children and depth < 3:  # Limit depth
+                if children and depth < 3:
                     flatten_nodes(children, depth + 1)
-        
+
         flatten_nodes(structure)
-        
+
         # Extract entities
         entities = self.extract_entities(
             doc_name, doc_description, node_titles, node_summaries
         )
-        
+
         # Extract relations
         relations = self.extract_relations(
             doc_name, entities, node_titles, node_summaries
         )
-        
-        return entities, relations
+
+        return entities, relations, node_contexts

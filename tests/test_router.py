@@ -145,6 +145,12 @@ class TestSearchSuperTree:
         mock_st.select_documents = AsyncMock(return_value=["uuid-1"])
         router.super_tree_index = mock_st
 
+        # Mock planner to avoid LLM call for HyDE
+        from pageindex_mutil.agentic.planner import PlanResult
+        router.planner.plan = AsyncMock(return_value=PlanResult(
+            queries=["test query"], weights={}, query_type="factual"
+        ))
+
         # Mock _act_tree_search to return context
         router._act_tree_search = AsyncMock(return_value=(
             "some context",           # ctx
@@ -152,6 +158,7 @@ class TestSearchSuperTree:
             1,                        # src_docs
             1,                        # cov_nodes
             {"uuid-1": [1, 2]},       # doc_pages_map
+            [{"doc_id": "uuid-1", "page": 1}],  # pages_with_text
         ))
 
         # Mock verifier
@@ -168,8 +175,11 @@ class TestSearchSuperTree:
         assert result["answer"] == "test answer"
         assert result["confidence"] == "high"
         assert result["matched_docs"] == [{"doc_id": "uuid-1", "score": 1.0}]
-        assert result["selected_nodes"] == [{"node_id": "n1", "title": "Section 1"}]
-        assert result["pages"] == [{"doc_id": "uuid-1", "pages": [1, 2]}]
+        assert len(result["selected_nodes"]) == 1
+        assert result["selected_nodes"][0]["node_id"] == "n1"
+        assert result["selected_nodes"][0]["title"] == "Section 1"
+        assert len(result["pages"]) == 1
+        assert result["pages"][0]["doc_id"] == "uuid-1"
 
     @pytest.mark.asyncio
     async def test_act_phase_failure(self, router):
@@ -192,10 +202,17 @@ class TestSearchSuperTree:
         mock_st.select_documents = AsyncMock(return_value=["uuid-1"])
         router.super_tree_index = mock_st
 
+        # Mock planner to avoid LLM call for HyDE
+        from pageindex_mutil.agentic.planner import PlanResult
+        router.planner.plan = AsyncMock(return_value=PlanResult(
+            queries=["test query"], weights={}, query_type="factual"
+        ))
+
         router._act_tree_search = AsyncMock(return_value=(
             "some context",
             [{"node_id": "n1", "title": "Section 1"}],
-            1, 1, {"uuid-1": [1]}
+            1, 1, {"uuid-1": [1]},
+            [{"doc_id": "uuid-1", "page": 1}],
         ))
 
         mock_verify_result = MagicMock()
@@ -220,7 +237,8 @@ class TestSearchRouting:
         router.super_tree_index = mock_st
 
         router._act_tree_search = AsyncMock(return_value=(
-            "ctx", [{"node_id": "n1", "title": "T"}], 1, 1, {"uuid-1": [1]}
+            "ctx", [{"node_id": "n1", "title": "T"}], 1, 1, {"uuid-1": [1]},
+            [{"doc_id": "uuid-1", "page": 1}],
         ))
 
         mock_verify_result = MagicMock()
