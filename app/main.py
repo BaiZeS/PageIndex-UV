@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import glob
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from types import SimpleNamespace
@@ -56,6 +57,9 @@ if not get_llm_config()[0]:
 
 REASONING_TREE = 'tree'
 REASONING_TOC = 'toc_fallback'
+
+# Project root is one level up from app/
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def generate_structure(pdf_path, json_path):
@@ -556,7 +560,7 @@ Any other input is treated as a question and answered using multi-document RAG.
 # ---------------------------------------------------------------------------
 
 def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = str(PROJECT_ROOT)
     pdf_dir = os.path.join(base_dir, "tests", "pdfs")
     results_dir = os.path.join(base_dir, "tests", "results")
     logs_dir = ensure_logs_dir(base_dir)

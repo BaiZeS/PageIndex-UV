@@ -30,7 +30,7 @@ sys.modules.setdefault("PyPDF2", MagicMock())
 
 from db import PageIndexDB
 from pageindex_mutil.client import PageIndexClient
-import server as server_mod
+from app import server as server_mod
 
 
 # ---------------------------------------------------------------------------

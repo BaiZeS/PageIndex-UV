@@ -31,7 +31,7 @@ uv sync
 ### 交互式问答
 
 ```bash
-uv run main.py
+uv run python -m app.main
 ```
 
 支持命令：`/add <文件路径>` 索引文档、`/doc <编号>` 聚焦单文档、`/list` 查看列表。
@@ -39,7 +39,7 @@ uv run main.py
 ### MCP 服务
 
 ```bash
-uv run server.py
+uv run python -m app.server
 ```
 
 服务默认监听 `0.0.0.0:3000`，提供 SSE 传输的 MCP 协议端点和 HTTP API。
@@ -147,15 +147,20 @@ API_KEY=testkey uv run python server.py
 │   ├── config.yaml            # 索引/检索参数配置
 │   ├── migrations/            # 数据库迁移脚本
 │   └── agentic/               # Agentic 多策略路由
+├── app/                       # 应用入口
+│   ├── __init__.py
+│   ├── main.py                # 交互式问答入口
+│   ├── server.py              # MCP 服务 + HTTP API
+│   ├── config_utils.py        # 纯函数配置工具
+│   └── config_service.py      # 运行时配置服务
 ├── db.py                      # SQLite 缓存层
-├── main.py                    # 交互式问答入口
-├── server.py                  # MCP 服务 + HTTP API
 ├── web/                       # Web 控制台（零构建）
 │   ├── index.html             # 入口 HTML
 │   └── static/                # 静态资源（Vue 3 + Element Plus）
 ├── docs/                      # 项目文档
 ├── deploy/                    # 部署配置模板
 ├── tests/                     # 测试套件
+├── .github/workflows/         # CI/CD
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml
@@ -164,7 +169,7 @@ API_KEY=testkey uv run python server.py
 
 ## 技术栈
 
-Python 3.13+ / uv / SQLite / PyMuPDF / OpenAI SDK / MCP SDK / Starlette + uvicorn / jieba / tiktoken
+Python 3.12+ / uv / SQLite / PyMuPDF / OpenAI SDK / MCP SDK / Starlette + uvicorn / jieba / tiktoken
 
 ## 文档
 

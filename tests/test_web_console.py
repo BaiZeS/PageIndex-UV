@@ -4,11 +4,12 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-import web_config
-from web_config import (
+from app import config_utils as web_config
+from app import config_service
+from app.config_utils import (
     mask_key, backup_file, set_config_yaml_model, set_env_fields, read_yaml_model,
-    read_config_snapshot, derive_provider,
 )
+from app.config_service import read_config_snapshot, derive_provider
 
 
 def test_mask_key_hides_middle():
@@ -74,8 +75,8 @@ def test_read_snapshot_masks_key_and_reads_yaml(tmp_path, monkeypatch):
     yaml_p.write_text('model: "gpt-4.1-mini"\nretrieve_model: "gpt-4.1-mini"\n', encoding="utf-8")
     env_p = tmp_path / ".env"
     env_p.write_text("", encoding="utf-8")
-    monkeypatch.setattr(web_config, "get_llm_config", lambda: ("sk-fake000-not-a-real-key-9999", "http://h/v1"))
-    monkeypatch.setattr(web_config, "ConfigLoader", lambda: SimpleNamespace(load=lambda _: SimpleNamespace(model="gpt-4.1-mini", retrieve_model=None)))
+    monkeypatch.setattr(config_service, "get_llm_config", lambda: ("sk-fake000-not-a-real-key-9999", "http://h/v1"))
+    monkeypatch.setattr(config_service, "ConfigLoader", lambda: SimpleNamespace(load=lambda _: SimpleNamespace(model="gpt-4.1-mini", retrieve_model=None)))
     client = SimpleNamespace(db=_FakeDB())
     snap = read_config_snapshot(client, config_yaml_path=yaml_p, env_path=env_p)
     assert snap["api_key_masked"] == "sk-fake0****9999"
@@ -86,7 +87,7 @@ def test_read_snapshot_masks_key_and_reads_yaml(tmp_path, monkeypatch):
     assert "provider" in snap and "base_url" in snap and "env_overrides" in snap
 
 
-import server
+from app import server
 
 
 def _client_with_docs(monkeypatch, docs):
@@ -133,7 +134,7 @@ def test_search_rejects_missing_query(monkeypatch):
 
 
 def test_config_get_endpoint_masks_key(monkeypatch):
-    monkeypatch.setattr(web_config, "read_config_snapshot",
+    monkeypatch.setattr(config_service, "read_config_snapshot",
                         lambda client, **kw: {"api_key_masked": "sk-1234****5678",
                                               "has_api_key": True, "model": "m"})
     monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(db=None))
@@ -156,7 +157,7 @@ def test_config_post_dualwrite_model(monkeypatch, tmp_path):
     monkeypatch.setattr(web_config, "DEFAULT_ENV", env_p)
     calls = {}
     monkeypatch.setattr(server, "_rebuild_client", lambda **kw: calls.update(kw))
-    monkeypatch.setattr(web_config, "read_config_snapshot", lambda client, **kw: {"model": "new"})
+    monkeypatch.setattr(config_service, "read_config_snapshot", lambda client, **kw: {"model": "new"})
     monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(db=None))
     monkeypatch.setattr(server, "API_KEY", "")
     monkeypatch.delenv("MODEL_NAME", raising=False)
@@ -184,7 +185,7 @@ def test_config_post_credentials_env_and_runtime(monkeypatch, tmp_path):
     llm_calls = {}
     monkeypatch.setattr(server, "configure_llm",
                         lambda api_key=None, base_url=None: llm_calls.update(dict(api_key=api_key, base_url=base_url)))
-    monkeypatch.setattr(web_config, "read_config_snapshot", lambda client, **kw: {})
+    monkeypatch.setattr(config_service, "read_config_snapshot", lambda client, **kw: {})
     monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(db=None))
     monkeypatch.setattr(server, "API_KEY", "")
     from starlette.testclient import TestClient
@@ -203,7 +204,7 @@ def test_config_post_persist_false_runtime_only(monkeypatch, tmp_path):
     monkeypatch.setattr(web_config, "DEFAULT_CONFIG_YAML", tmp_path / "config.yaml")
     monkeypatch.setattr(web_config, "DEFAULT_ENV", env_p)
     monkeypatch.setattr(server, "_rebuild_client", lambda **kw: None)
-    monkeypatch.setattr(web_config, "read_config_snapshot", lambda client, **kw: {})
+    monkeypatch.setattr(config_service, "read_config_snapshot", lambda client, **kw: {})
     monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(db=None))
     monkeypatch.setattr(server, "API_KEY", "")
     from starlette.testclient import TestClient
@@ -226,7 +227,7 @@ def test_rollback_on_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(web_config, "DEFAULT_CONFIG_YAML", yaml_p)
     monkeypatch.setattr(web_config, "DEFAULT_ENV", env_p)
     monkeypatch.setattr(server, "_rebuild_client", lambda **kw: None)
-    monkeypatch.setattr(web_config, "read_config_snapshot", lambda client, **kw: {})
+    monkeypatch.setattr(config_service, "read_config_snapshot", lambda client, **kw: {})
     monkeypatch.setattr(server, "get_client", lambda: SimpleNamespace(db=None))
     monkeypatch.setattr(server, "API_KEY", "")
 

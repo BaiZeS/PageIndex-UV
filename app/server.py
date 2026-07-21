@@ -27,7 +27,8 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp
 import uvicorn
 
-import web_config
+from app import config_utils as web_config
+from app import config_service
 
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
@@ -35,6 +36,8 @@ import mcp.types as types
 
 from pageindex_mutil import PageIndexClient
 from pageindex_mutil.utils import configure_llm, get_llm_config, ConfigLoader
+from openai import OpenAI
+import openai
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pageindex-mcp")
@@ -49,8 +52,8 @@ WORKSPACE = os.getenv("WORKSPACE", "/app/data/workspace")
 DB_PATH = os.getenv("DB_PATH", "/app/data/index.db")
 SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "hybrid")
 VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", "/app/data/vectors")
-# Static web console directory (module-relative so it resolves under Docker WORKDIR and local dev alike)
-WEB_DIR = Path(__file__).resolve().parent / "web"
+# Static web console directory — one level up from app/
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 if not API_KEY:
     logging.warning("API_KEY not set — server is running WITHOUT authentication")
@@ -311,11 +314,11 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
             query = arguments.get("query", "")
             if not query:
                 return [types.TextContent(type="text", text=json.dumps({"error": "query is required"}, ensure_ascii=False))]
-            
+
             c = get_client()
             if not c.db:
                 return [types.TextContent(type="text", text=json.dumps({"entities": []}, ensure_ascii=False))]
-            
+
             entities = c.db.search_entities(query, limit=arguments.get("limit", 20))
             return [types.TextContent(type="text", text=json.dumps({"entities": entities}, ensure_ascii=False, indent=2))]
 
@@ -323,21 +326,21 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
             entity_name = arguments.get("name", "")
             if not entity_name:
                 return [types.TextContent(type="text", text=json.dumps({"error": "name is required"}, ensure_ascii=False))]
-            
+
             c = get_client()
             if not c.db:
                 return [types.TextContent(type="text", text=json.dumps({"error": "Database not available"}, ensure_ascii=False))]
-            
+
             entity = c.db.get_entity_by_name(entity_name)
             if not entity:
                 return [types.TextContent(type="text", text=json.dumps({"error": f"Entity '{entity_name}' not found"}, ensure_ascii=False))]
-            
+
             # Get relations
             relations = c.db.get_entity_relations(entity["id"])
-            
+
             # Get documents
             documents = c.db.get_entity_documents(entity["id"])
-            
+
             return [types.TextContent(type="text", text=json.dumps({
                 "entity": entity,
                 "relations": relations,
@@ -348,16 +351,16 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
             doc_id = arguments.get("doc_id", "")
             if not doc_id:
                 return [types.TextContent(type="text", text=json.dumps({"error": "doc_id is required"}, ensure_ascii=False))]
-            
+
             c = get_client()
             if not c.db:
                 return [types.TextContent(type="text", text=json.dumps({"error": "Database not available"}, ensure_ascii=False))]
-            
+
             try:
                 doc_id_int = int(doc_id)
             except ValueError:
                 return [types.TextContent(type="text", text=json.dumps({"error": "doc_id must be integer"}, ensure_ascii=False))]
-            
+
             entities = c.db.get_document_entities(doc_id_int)
             return [types.TextContent(type="text", text=json.dumps({"entities": entities}, ensure_ascii=False, indent=2))]
 
@@ -365,16 +368,16 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
             doc_id = arguments.get("doc_id", "")
             if not doc_id:
                 return [types.TextContent(type="text", text=json.dumps({"error": "doc_id is required"}, ensure_ascii=False))]
-            
+
             c = get_client()
             if not c.db:
                 return [types.TextContent(type="text", text=json.dumps({"error": "Database not available"}, ensure_ascii=False))]
-            
+
             try:
                 doc_id_int = int(doc_id)
             except ValueError:
                 return [types.TextContent(type="text", text=json.dumps({"error": "doc_id must be integer"}, ensure_ascii=False))]
-            
+
             related = c.db.get_related_documents(doc_id_int, limit=arguments.get("limit", 10))
             return [types.TextContent(type="text", text=json.dumps({"related_documents": related}, ensure_ascii=False, indent=2))]
 
@@ -624,7 +627,7 @@ async def search_endpoint(request: Request) -> Response:
 
 
 async def config_get_endpoint(request: Request) -> Response:
-    snap = web_config.read_config_snapshot(get_client())
+    snap = config_service.read_config_snapshot(get_client())
     return JSONResponse(snap)
 
 
@@ -714,7 +717,7 @@ async def config_post_endpoint(request: Request) -> Response:
                 logger.error("rollback restore failed for %s: %s", path, restore_err)
         return JSONResponse({"error": f"Persist failed: {e}", "applied": True,
                              "persisted": False}, status_code=500)
-    snap = web_config.read_config_snapshot(get_client())
+    snap = config_service.read_config_snapshot(get_client())
     snap.update({"applied": True, "persisted": persisted})
     return JSONResponse(snap)
 
@@ -758,8 +761,6 @@ async def config_test_endpoint(request: Request) -> Response:
 
     # Build a TEMP openai client — never mutate the shared `_client`/`_async_client`.
     # This keeps the ping read-only and lets the active client keep serving traffic.
-    from openai import OpenAI
-    import openai
     temp_client = OpenAI(api_key=api_key, base_url=base_url)
     start = _time.monotonic()
 
@@ -988,7 +989,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     except PermissionError:
         # Fallback to local data dir when running outside Docker
-        fallback = Path(__file__).parent / "data"
+        fallback = Path(__file__).resolve().parent.parent / "data"
         workspace = str(fallback / "workspace")
         db_path = str(fallback / "index.db")
         Path(workspace).mkdir(parents=True, exist_ok=True)
