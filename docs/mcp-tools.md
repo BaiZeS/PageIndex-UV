@@ -88,7 +88,7 @@ Remove a document from memory + DB + on-disk workspace.
 { "success": true, "doc_id": "<uuid>" }
 ```
 
-Same code path as the REST `DELETE /api/documents/{id}` and the web console's delete button (see `docs/design-docs/PageIndex/delete-path-integrity/`). Disk cleanup + orphan migration are guaranteed by `db.delete_document` + `on_document_removed`.
+Same code path as the REST `DELETE /api/documents/{id}` and the web console's delete button. Disk cleanup + orphan migration are guaranteed by `db.delete_document` + `on_document_removed`.
 
 ## Resources
 

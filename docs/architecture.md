@@ -132,25 +132,6 @@ doc_keywords (id, doc_id, keyword, field)
 kb_identity (id, identity_text, doc_count, updated_at)
 ```
 
-## Design doc layout
-
-All per-feature design work lives in `docs/design-docs/PageIndex/<feature>/{spec,tasks}.md`:
-
-```
-docs/design-docs/PageIndex/
-├── architecture-review-2026-06/review-report.md
-├── batch-upload/
-├── db-concurrency-hardening/
-├── delete-path-integrity/
-├── model-config-completion/
-├── non-vector-retrieval-optimization/
-├── project-refactor/
-├── super-tree-retrieval-v3/
-└── web-console/
-```
-
-The convention is `spec.md` (what & why) + `tasks.md` (how, broken into atomic tasks).
-
 ## Stability promise
 
 - **HTTP API** (`/api/*`) is the public contract for integrators; additive changes only within a major.

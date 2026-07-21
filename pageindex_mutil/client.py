@@ -68,15 +68,15 @@ class PageIndexClient:
         if self.workspace:
             self.workspace.mkdir(parents=True, exist_ok=True)
         self.documents = {}
-        if self.workspace:
-            self._load_workspace()
-
         # Optional persistent layer for agentic retrieval
         self.db = None
         self.closet_index = None
         self.super_tree_index = None
         self.router = None
         self._uuid_to_db: dict[str, int] = {}
+
+        if self.workspace:
+            self._load_workspace()
 
         if db_path and PageIndexDB:
             self.db = PageIndexDB(db_path)
