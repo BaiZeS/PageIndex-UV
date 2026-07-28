@@ -50,7 +50,7 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "3000"))
 WORKSPACE = os.getenv("WORKSPACE", "/app/data/workspace")
 DB_PATH = os.getenv("DB_PATH", "/app/data/index.db")
-SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "hybrid")
+SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "keyword")
 VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", "/app/data/vectors")
 # Static web console directory — one level up from app/
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -135,7 +135,7 @@ _startup_workspace = WORKSPACE
 _startup_db_path = DB_PATH
 
 
-def _rebuild_client(*, model=None, retrieve_model=None):
+def _rebuild_client(*, model=None, retrieve_model=None, search_backend=None):
     """Rebuild the global PageIndexClient with new model overrides.
 
     Credentials live in the shared utils client (configure_llm); only model
@@ -144,7 +144,7 @@ def _rebuild_client(*, model=None, retrieve_model=None):
     `client` pointing at the still-live old instance (not a closed one), so the
     server is not bricked until restart.
     """
-    global client
+    global client, SEARCH_BACKEND
     if client is None:
         return
     overrides = {}
@@ -152,10 +152,15 @@ def _rebuild_client(*, model=None, retrieve_model=None):
         overrides["model"] = model
     if retrieve_model:
         overrides["retrieve_model"] = retrieve_model
+    if search_backend:
+        overrides["search_backend"] = search_backend
+        SEARCH_BACKEND = search_backend
     if not overrides:
         return
     new_client = PageIndexClient(
-        workspace=_startup_workspace, db_path=_startup_db_path, **overrides
+        workspace=_startup_workspace, db_path=_startup_db_path,
+        search_backend=SEARCH_BACKEND, vector_db_path=VECTOR_DB_PATH,
+        **{k: v for k, v in overrides.items() if k not in ("search_backend",)},
     )  # if this raises, the old `client` is untouched
     try:
         client.close()
@@ -648,9 +653,10 @@ async def config_post_endpoint(request: Request) -> Response:
     retrieve_model = body.get("retrieve_model")
     api_key = body.get("api_key")
     base_url = body.get("base_url")
+    search_backend = body.get("search_backend")
 
     persisted = False
-    wrote_any = model or retrieve_model or api_key or base_url
+    wrote_any = model or retrieve_model or api_key or base_url or search_backend
     try:
         # 1) Runtime apply (immediate effect) + sync os.environ so the read-back
         #    snapshot (which reads os.getenv via ConfigLoader/get_llm_config) is
@@ -667,8 +673,10 @@ async def config_post_endpoint(request: Request) -> Response:
             os.environ["MODEL_NAME"] = model
         if retrieve_model:
             os.environ["RETRIEVE_MODEL_NAME"] = retrieve_model
-        if model or retrieve_model:
-            _rebuild_client(model=model, retrieve_model=retrieve_model)
+        if search_backend:
+            os.environ["SEARCH_BACKEND"] = search_backend
+        if model or retrieve_model or search_backend:
+            _rebuild_client(model=model, retrieve_model=retrieve_model, search_backend=search_backend)
 
         # 2) Persist to disk (per-file guarded backup -> targeted write -> verify).
         #    spec §5.4 step 4 + §7.2: on ANY failure in apply or persist, restore the
@@ -694,6 +702,8 @@ async def config_post_endpoint(request: Request) -> Response:
                 cred_fields["OPENAI_API_KEY"] = api_key
             if base_url:
                 cred_fields["OPENAI_BASE_URL"] = base_url
+            if search_backend:
+                cred_fields["SEARCH_BACKEND"] = search_backend
             if cred_fields:
                 if web_config.DEFAULT_ENV.exists():
                     # Warn if .env is world-readable before writing secrets

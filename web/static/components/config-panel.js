@@ -55,6 +55,13 @@
           <el-form-item label="Base URL">
             <el-input v-model="cfgForm.base_url" placeholder="未设置"></el-input>
           </el-form-item>
+          <el-form-item label="搜索后端">
+            <el-select v-model="cfgForm.search_backend" style="width: 100%">
+              <el-option label="keyword（关键词，快速无需模型）" value="keyword" />
+              <el-option label="hybrid（向量+关键词，需 [vector]）" value="hybrid" />
+              <el-option label="chroma（纯向量，需 [vector]）" value="chroma" />
+            </el-select>
+          </el-form-item>
           <el-form-item label="持久化">
             <el-switch v-model="cfgForm.persist"></el-switch>
           </el-form-item>

@@ -22,6 +22,10 @@
         <span class="current-field" :class="{ present: config.has_api_key }">
           key {{ config.has_api_key ? ('已设置 ' + (config.api_key_masked || '')) : '未设置' }}
         </span>
+        <span class="dot">·</span>
+        <span class="current-field">
+          <em>search</em> {{ config.search_backend || 'keyword' }}
+        </span>
       </div>
     `,
   };

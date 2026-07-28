@@ -16,8 +16,14 @@ from .page_index_liteparse import is_liteparse_format, liteparse_to_tree
 
 # Import search backends
 from .search_backend import SearchBackend
-from .chroma_backend import ChromaSearchBackend
-from .hybrid_backend import HybridSearchBackend
+from .keyword_backend import KeywordSearchBackend
+
+try:
+    from .chroma_backend import ChromaSearchBackend
+    from .hybrid_backend import HybridSearchBackend
+except ImportError:
+    ChromaSearchBackend = None
+    HybridSearchBackend = None
 from .entity_extractor import EntityExtractor
 
 # Optional: db.py lives at project root; gracefully degrade if unavailable.
@@ -123,31 +129,39 @@ class PageIndexClient:
     def _init_search_backends(self, search_backend: str, vector_db_path: str):
         """Initialize search backends based on configuration."""
         try:
-            # Always initialize ChromaDB backend
-            self.chroma_backend = ChromaSearchBackend(
-                db_path=vector_db_path,
-                embedding_model="local"
-            )
-            
-            if search_backend == "hybrid":
-                # Hybrid mode: combine vector + keyword
-                self.search_backend = HybridSearchBackend(
-                    self.db,
-                    self.chroma_backend
-                )
-                logging.info("Initialized hybrid search backend (ChromaDB + keywords)")
-            elif search_backend == "chroma":
-                # Vector-only mode
-                self.search_backend = self.chroma_backend
-                logging.info("Initialized ChromaDB vector search backend")
+            if search_backend == "keyword":
+                # Keyword-only mode: jieba + SQLite, no embedding model
+                self.chroma_backend = None
+                self.search_backend = KeywordSearchBackend(self.db)
+                logging.info("Initialized keyword search backend (jieba + tags)")
+            elif search_backend in ("hybrid", "chroma"):
+                if ChromaSearchBackend is None:
+                    logging.warning("chromadb/sentence-transformers not installed; falling back to keyword backend")
+                    self.chroma_backend = None
+                    self.search_backend = KeywordSearchBackend(self.db)
+                else:
+                    self.chroma_backend = ChromaSearchBackend(
+                        db_path=vector_db_path,
+                        embedding_model="local"
+                    )
+                    if search_backend == "hybrid":
+                        self.search_backend = HybridSearchBackend(
+                            self.db,
+                            self.chroma_backend
+                        )
+                        logging.info("Initialized hybrid search backend (ChromaDB + keywords)")
+                    else:
+                        self.search_backend = self.chroma_backend
+                        logging.info("Initialized ChromaDB vector search backend")
             else:
-                # Default to ChromaDB (required)
-                self.search_backend = self.chroma_backend
-                logging.info("Initialized ChromaDB backend (default)")
-            
+                # Default to keyword (fast, no model loading)
+                self.chroma_backend = None
+                self.search_backend = KeywordSearchBackend(self.db)
+                logging.info("Initialized keyword search backend (default)")
+
             # Initialize entity extractor
             self.entity_extractor = EntityExtractor(self.model, self.retrieve_model)
-                
+
         except Exception as e:
             logging.warning("Failed to initialize search backends: %s", e)
             logging.warning("Vector search will be unavailable")

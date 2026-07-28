@@ -20,6 +20,7 @@
       retrieve_model: "",
       api_key: "",
       base_url: "",
+      search_backend: "",
       persist: true,
     });
     const cfgMsg = ref("");
@@ -34,6 +35,7 @@
         cfgForm.retrieve_model = c.retrieve_model || "";
         cfgForm.api_key = "";
         cfgForm.base_url = c.base_url || "";
+        cfgForm.search_backend = c.search_backend || "keyword";
         cfgForm.persist = true;
       } catch (e) {
         global.ElementPlus.ElMessage.error(e.message);
@@ -47,6 +49,7 @@
       if (cfgForm.retrieve_model) body.retrieve_model = cfgForm.retrieve_model;
       if (cfgForm.api_key) body.api_key = cfgForm.api_key;
       if (cfgForm.base_url) body.base_url = cfgForm.base_url;
+      if (cfgForm.search_backend) body.search_backend = cfgForm.search_backend;
       try {
         await global.api("/api/config", { method: "POST", body });
         cfgMsg.value = "已应用" + (body.persist ? " 并持久化" : "（仅运行时）");

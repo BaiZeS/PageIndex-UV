@@ -79,7 +79,7 @@ API_KEY=testkey uv run python server.py
 | `PORT` | 否 | 监听端口（默认 `3000`） |
 | `WORKSPACE` | 否 | 文档存储目录（默认 `./data/workspace`） |
 | `DB_PATH` | 否 | SQLite 数据库路径（默认 `./data/index.db`） |
-| `SEARCH_BACKEND` | 否 | 搜索模式：`hybrid`（向量+关键词+标签，默认 `hybrid`）或 `chroma`（纯向量） |
+| `SEARCH_BACKEND` | 否 | 搜索模式：`keyword`（关键词+标签，默认，无需加载模型）、`hybrid`（向量+关键词+标签，需安装 `.[vector]`）、`chroma`（纯向量） |
 | `VECTOR_DB_PATH` | 否 | ChromaDB 存储目录（默认 `./data/vectors`） |
 
 > *至少配置一个 LLM API Key。优先级：显式参数 > `OPENAI_API_KEY` > `DASHSCOPE_API_KEY`。
@@ -139,8 +139,9 @@ API_KEY=testkey uv run python server.py
 │   ├── super_tree.py          # Super-Tree 检索 v3（含四通道预过滤）
 │   ├── client.py              # 统一入口（单/多文档检索 + DocIdMapper）
 │   ├── search_backend.py      # 搜索后端接口
-│   ├── hybrid_backend.py      # 混合搜索后端（向量+关键词+标签 RRF 融合）
-│   ├── chroma_backend.py      # ChromaDB 向量搜索后端
+│   ├── keyword_backend.py     # 关键词搜索后端（jieba + SQLite，默认）
+│   ├── hybrid_backend.py      # 混合搜索后端（向量+关键词+标签 RRF 融合，需 [vector]）
+│   ├── chroma_backend.py      # ChromaDB 向量搜索后端（需 [vector]）
 │   ├── entity_extractor.py    # 实体/关系抽取 + 知识图谱
 │   ├── reasoning.py           # 推理逻辑（含共享上下文组装、LLM 缓存）
 │   ├── retrieve.py            # 单文档检索辅助
@@ -174,7 +175,7 @@ API_KEY=testkey uv run python server.py
 
 ## 技术栈
 
-Python 3.12+ / uv / SQLite / PyMuPDF / ChromaDB / sentence-transformers / OpenAI SDK / MCP SDK / Starlette + uvicorn / jieba / tiktoken
+Python 3.12+ / uv / SQLite / PyMuPDF / OpenAI SDK / MCP SDK / Starlette + uvicorn / jieba / tiktoken / ChromaDB + sentence-transformers（可选，`pip install .[vector]`）
 
 ## 文档
 

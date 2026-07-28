@@ -1815,7 +1815,6 @@ name = "pageindex-uv"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
-    { name = "chromadb" },
     { name = "jieba" },
     { name = "liteparse" },
     { name = "mcp" },
@@ -1825,8 +1824,13 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "python-multipart" },
     { name = "pyyaml" },
-    { name = "sentence-transformers" },
     { name = "tiktoken" },
+]
+
+[package.optional-dependencies]
+vector = [
+    { name = "chromadb" },
+    { name = "sentence-transformers" },
 ]
 
 [package.dev-dependencies]
@@ -1837,7 +1841,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "chromadb", specifier = ">=0.4.0" },
+    { name = "chromadb", marker = "extra == 'vector'", specifier = ">=0.4.0" },
     { name = "jieba", specifier = ">=0.42" },
     { name = "liteparse", specifier = ">=2.6.0" },
     { name = "mcp", specifier = ">=1.0.0" },
@@ -1847,9 +1851,10 @@ requires-dist = [
     { name = "python-dotenv", specifier = "==1.1.0" },
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "pyyaml", specifier = "==6.0.2" },
-    { name = "sentence-transformers", specifier = ">=2.2.0" },
+    { name = "sentence-transformers", marker = "extra == 'vector'", specifier = ">=2.2.0" },
     { name = "tiktoken", specifier = "==0.11.0" },
 ]
+provides-extras = ["vector"]
 
 [package.metadata.requires-dev]
 dev = [

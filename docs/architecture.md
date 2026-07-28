@@ -119,10 +119,16 @@ When Super-Tree fails, `AgenticRouter.search()` falls back to:
 - **Act**: Parallel node recall + context assembly
 - **Verify**: CRAG verification with confidence thresholds (answer/expand/refuse)
 
-### Hybrid Search Backend
+### Search Backends
 
-`HybridSearchBackend` combines three search channels using Reciprocal Rank Fusion (RRF):
-- **Vector search**: ChromaDB with sentence-transformers embeddings
+Three search backends are available (configured via `SEARCH_BACKEND` env var):
+
+- **`keyword`** (default): `KeywordSearchBackend` — jieba tokenization + SQLite inverted index (`doc_keywords`) + ClosetIndex tags. Fast, zero model-loading overhead.
+- **`hybrid`**: `HybridSearchBackend` — combines vector + keyword + tag using Reciprocal Rank Fusion (RRF). Requires `pip install .[vector]`.
+- **`chroma`**: `ChromaSearchBackend` — ChromaDB vector search with sentence-transformers embeddings. Requires `pip install .[vector]`.
+
+`HybridSearchBackend` combines three search channels using RRF:
+- **Vector search**: ChromaDB with sentence-transformers embeddings (optional)
 - **Keyword search**: jieba inverted index on doc names, descriptions, and node titles
 - **Tag search**: ClosetIndex semantic tag matching
 
