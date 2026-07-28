@@ -30,12 +30,9 @@ data/
 Thumbs.db
 
 # Docs not needed in image
-docs/mempalace/
-PageIndex/tests/results/
 
 # Tests (optional, can include if you want tests in image)
 # PageIndex/tests/
 
 # Misc
-=2.8.0
 *.bak
