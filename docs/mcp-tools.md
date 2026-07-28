@@ -4,7 +4,7 @@
 > Transport: HTTP + SSE (`GET /sse`, `POST /messages/?session_id=…`)
 > Auth: `X-API-Key` header (same as REST API)
 
-The server exposes **9 tools** and **N resources** (one per indexed document, URI scheme `document://<uuid>`).
+The server exposes **10 tools** and **N resources** (one per indexed document, URI scheme `document://<uuid>`).
 
 ## Tools
 
@@ -179,6 +179,33 @@ Find documents related through shared entities.
   ]
 }
 ```
+
+### `get_relations`
+
+Get entity pairs connected by a specific relation type.
+
+**Input**
+
+```json
+{
+  "predicate": "works_on",
+  "limit": 20   // optional, default 20
+}
+```
+
+Common predicate types: `works_on`, `authored`, `related_to`, `mentions`, `part_of`, `manages`.
+
+**Output**
+
+```json
+{
+  "relations": [
+    { "subject_name": "Alice", "object_name": "Project X", "confidence": 0.95, "doc_id": 1 }
+  ]
+}
+```
+
+Results are sorted by confidence descending.
 
 ### `get_stats`
 

@@ -391,6 +391,17 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
             related = c.db.get_related_documents(doc_id_int, limit=arguments.get("limit", 10))
             return [types.TextContent(type="text", text=json.dumps({"related_documents": related}, ensure_ascii=False, indent=2))]
 
+        elif name == "get_relations":
+            predicate = arguments.get("predicate", "")
+            if not predicate:
+                return [types.TextContent(type="text", text=json.dumps({"error": "predicate is required"}, ensure_ascii=False))]
+            limit = arguments.get("limit", 20)
+            c = get_client()
+            if c.db is None:
+                return [types.TextContent(type="text", text=json.dumps({"error": "DB unavailable"}))]
+            relations = c.db.get_entities_by_relation(predicate, limit)
+            return [types.TextContent(type="text", text=json.dumps({"relations": relations}, ensure_ascii=False))]
+
         elif name == "get_stats":
             c = get_client()
             stats = {
@@ -506,6 +517,18 @@ async def handle_list_tools() -> list[types.Tool]:
                     "limit": {"type": "integer", "description": "Maximum results", "default": 10},
                 },
                 "required": ["doc_id"],
+            },
+        ),
+        types.Tool(
+            name="get_relations",
+            description="Get entity pairs connected by a specific relation type (e.g., works_on, authored, related_to)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "predicate": {"type": "string", "description": "Relation type (e.g., works_on, authored, related_to)"},
+                    "limit": {"type": "integer", "description": "Maximum results (default 20)", "default": 20},
+                },
+                "required": ["predicate"],
             },
         ),
         types.Tool(

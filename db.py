@@ -648,6 +648,24 @@ class PageIndexDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_entities_by_relation(self, predicate: str, limit: int = 20) -> list:
+        """Get entity pairs connected by a specific relation type."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT e1.name as subject_name, e2.name as object_name,
+                   er.confidence, er.doc_id
+            FROM entity_relations er
+            JOIN entities e1 ON er.subject_id = e1.id
+            JOIN entities e2 ON er.object_id = e2.id
+            WHERE er.predicate = ?
+            ORDER BY er.confidence DESC
+            LIMIT ?
+            """,
+            (predicate, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def delete_entity(self, entity_id: int) -> None:
         """Delete an entity and its mentions/relations."""
         with self._connect() as conn:
