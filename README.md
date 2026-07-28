@@ -74,7 +74,7 @@ API_KEY=testkey uv run python -m app.server
 | `OPENAI_API_KEY` | 是* | OpenAI API Key |
 | `DASHSCOPE_API_KEY` | 是* | 阿里云 DashScope API Key（与 OpenAI 二选一） |
 | `OPENAI_BASE_URL` | 否 | 自定义 LLM 端点 |
-| `MODEL_NAME` | 否 | 模型名（默认 `gpt-4.1-mini`） |
+| `MODEL_NAME` | 否 | 模型名（默认 `deepseek-v4-flash`） |
 | `HOST` | 否 | 监听地址（默认 `0.0.0.0`） |
 | `PORT` | 否 | 监听端口（默认 `3000`） |
 | `WORKSPACE` | 否 | 文档存储目录（默认 `./data/workspace`） |
