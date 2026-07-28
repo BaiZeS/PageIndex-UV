@@ -4,7 +4,9 @@ Provides fast document search using jieba tokenization + SQLite inverted
 index (doc_keywords) and ClosetIndex tags.  No embedding model required.
 """
 
+import hashlib
 import logging
+import time
 from typing import List, Tuple, Dict
 
 from .search_backend import SearchBackend
@@ -26,6 +28,10 @@ class KeywordSearchBackend(SearchBackend):
     ChromaDB / SentenceTransformer is too slow.
     """
 
+    _search_cache = {}  # hash(query+top_k) -> (result, timestamp)
+    _cache_ttl = 300  # 5 minutes
+    _cache_max = 128
+
     def __init__(self, db, keyword_weight: float = 1.0, tag_weight: float = 1.0):
         """
         Args:
@@ -38,6 +44,23 @@ class KeywordSearchBackend(SearchBackend):
         self.tag_weight = tag_weight
         if jieba is None:
             logger.warning("jieba not installed; KeywordSearchBackend will be unavailable")
+
+    def _cache_key(self, query: str, top_k: int) -> str:
+        return hashlib.md5(f"{query}:{top_k}".encode()).hexdigest()
+
+    def _cache_get(self, key: str):
+        entry = self._search_cache.get(key)
+        if entry and (time.monotonic() - entry[1]) < self._cache_ttl:
+            return entry[0]
+        if entry:
+            del self._search_cache[key]
+        return None
+
+    def _cache_set(self, key: str, value):
+        if len(self._search_cache) >= self._cache_max:
+            oldest_key = min(self._search_cache, key=lambda k: self._search_cache[k][1])
+            del self._search_cache[oldest_key]
+        self._search_cache[key] = (value, time.monotonic())
 
     def _tokenize(self, query: str) -> List[str]:
         if not query or jieba is None:
@@ -54,6 +77,12 @@ class KeywordSearchBackend(SearchBackend):
 
     def search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
         """Search using keyword + tag channels, fused by weighted sum."""
+        # Check cache first
+        cache_key = self._cache_key(query, top_k)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         tokens = self._tokenize(query)
         if not tokens:
             return []
@@ -74,8 +103,11 @@ class KeywordSearchBackend(SearchBackend):
         except Exception as e:
             logger.warning("Tag search failed: %s", e)
 
-        sorted_results = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return sorted_results[:top_k]
+        sorted_results = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+        # Cache result
+        self._cache_set(cache_key, sorted_results)
+        return sorted_results
 
     def remove_document(self, doc_id: int) -> None:
         """No-op: cleanup handled by existing code."""

@@ -4,7 +4,9 @@ Merges results from ChromaDB vector search and SQLite keyword/tag search
 using Reciprocal Rank Fusion (RRF) for improved retrieval accuracy.
 """
 
+import hashlib
 import logging
+import time
 from typing import List, Tuple, Dict, Optional
 
 from .search_backend import SearchBackend
@@ -14,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 class HybridSearchBackend(SearchBackend):
     """Hybrid search combining vector similarity and keyword matching."""
+
+    _search_cache = {}  # hash(query+top_k) -> (result, timestamp)
+    _cache_ttl = 300  # 5 minutes
+    _cache_max = 128
 
     def __init__(self, db, chroma_backend: SearchBackend, rrf_k: int = 60,
                  weights: list = None):
@@ -37,6 +43,23 @@ class HybridSearchBackend(SearchBackend):
         except ImportError:
             self.jieba = None
             logger.warning("jieba not installed; keyword search will be limited")
+
+    def _cache_key(self, query: str, top_k: int) -> str:
+        return hashlib.md5(f"{query}:{top_k}".encode()).hexdigest()
+
+    def _cache_get(self, key: str):
+        entry = self._search_cache.get(key)
+        if entry and (time.monotonic() - entry[1]) < self._cache_ttl:
+            return entry[0]
+        if entry:
+            del self._search_cache[key]
+        return None
+
+    def _cache_set(self, key: str, value):
+        if len(self._search_cache) >= self._cache_max:
+            oldest_key = min(self._search_cache, key=lambda k: self._search_cache[k][1])
+            del self._search_cache[oldest_key]
+        self._search_cache[key] = (value, time.monotonic())
 
     def _keyword_search(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
         """Perform keyword-based search using jieba and SQLite."""
@@ -136,6 +159,12 @@ class HybridSearchBackend(SearchBackend):
         if not query or not query.strip():
             return []
 
+        # Check cache first
+        cache_key = self._cache_key(query, top_k)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         # Run all search channels in parallel conceptually
         # (they're fast enough to run sequentially)
         vector_results = self.chroma.search(query, top_k * 2)
@@ -146,9 +175,13 @@ class HybridSearchBackend(SearchBackend):
         result_sets = [vector_results, keyword_results, tag_results]
 
         fused_results = self._rrf_fusion(result_sets, self.channel_weights)
-        
+
         # Return top_k results
-        return fused_results[:top_k]
+        result = fused_results[:top_k]
+
+        # Cache result
+        self._cache_set(cache_key, result)
+        return result
 
     def remove_document(self, doc_id: int) -> None:
         """Remove a document from both vector and keyword indices."""
