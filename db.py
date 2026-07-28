@@ -366,8 +366,20 @@ class PageIndexDB:
     def match_closet_tags(self, tokens, top_k=5):
         if not tokens:
             return []
-        results = []
         conn = self._connect()
+        if len(tokens) <= SQLITE_MAX_VARIABLE_NUMBER:
+            placeholders = ",".join("?" for _ in tokens)
+            sql = f"""
+                SELECT doc_id, SUM(confidence) AS score
+                FROM closet_tags
+                WHERE tag_token IN ({placeholders})
+                GROUP BY doc_id
+                ORDER BY score DESC
+                LIMIT ?
+            """
+            rows = conn.execute(sql, (*tokens, top_k)).fetchall()
+            return [(r["doc_id"], r["score"]) for r in rows]
+        results = []
         for i in range(0, len(tokens), SQLITE_MAX_VARIABLE_NUMBER):
             chunk = tokens[i:i + SQLITE_MAX_VARIABLE_NUMBER]
             placeholders = ",".join("?" for _ in chunk)
@@ -379,11 +391,9 @@ class PageIndexDB:
             """
             rows = conn.execute(sql, chunk).fetchall()
             results.extend(rows)
-        # Merge results from multiple chunks: re-aggregate scores by doc_id
         merged = {}
         for r in results:
             merged[r["doc_id"]] = merged.get(r["doc_id"], 0) + r["score"]
-        # Sort by score descending, take top_k
         sorted_docs = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:top_k]
         return sorted_docs
 
@@ -406,8 +416,20 @@ class PageIndexDB:
     def match_doc_keywords(self, tokens, top_k=10):
         if not tokens:
             return []
-        results = []
         conn = self._connect()
+        if len(tokens) <= SQLITE_MAX_VARIABLE_NUMBER:
+            placeholders = ",".join("?" for _ in tokens)
+            sql = f"""
+                SELECT doc_id, COUNT(*) AS score
+                FROM doc_keywords
+                WHERE keyword IN ({placeholders})
+                GROUP BY doc_id
+                ORDER BY score DESC
+                LIMIT ?
+            """
+            rows = conn.execute(sql, (*tokens, top_k)).fetchall()
+            return [(r["doc_id"], r["score"]) for r in rows]
+        results = []
         for i in range(0, len(tokens), SQLITE_MAX_VARIABLE_NUMBER):
             chunk = tokens[i:i + SQLITE_MAX_VARIABLE_NUMBER]
             placeholders = ",".join("?" for _ in chunk)
