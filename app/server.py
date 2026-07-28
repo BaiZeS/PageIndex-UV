@@ -547,14 +547,35 @@ async def handle_list_resources() -> list[types.Resource]:
 # HTTP endpoints (non-MCP)
 # ---------------------------------------------------------------------------
 async def health_endpoint(request: Request) -> Response:
+    import time as _time
+    start = _time.monotonic()
+
     c = get_client()
     doc_count = 0
+    db_status = "ok"
+    entity_count = 0
+
     if c.db is not None:
         try:
-            doc_count = len(c.db.get_all_documents())
-        except Exception:
-            pass
-    return JSONResponse({"status": "ok", "documents": doc_count})
+            docs = c.db.get_all_documents()
+            doc_count = len(docs)
+            conn = c.db._connect()
+            entity_count = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+        except Exception as e:
+            db_status = f"error: {e}"
+    else:
+        db_status = "unavailable"
+
+    latency_ms = int((_time.monotonic() - start) * 1000)
+
+    return JSONResponse({
+        "status": "ok",
+        "documents": doc_count,
+        "entities": entity_count,
+        "db_status": db_status,
+        "latency_ms": latency_ms,
+        "search_backend": os.getenv("SEARCH_BACKEND", "keyword"),
+    })
 
 
 async def documents_endpoint(request: Request) -> Response:
