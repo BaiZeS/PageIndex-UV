@@ -41,6 +41,12 @@ def _get_retrieve_model_name():
     return cfg.retrieve_model
 
 
+# Module-level aliases expected by app/main.py
+MAX_CONTEXT_TOKENS = _get_max_context_tokens()
+MODEL_NAME = _get_model_name()
+RETRIEVE_MODEL_NAME = _get_retrieve_model_name()
+
+
 def _call_llm_json(prompt, extract_key=None, expect_list=False):
     """Generic LLM JSON caller.
 

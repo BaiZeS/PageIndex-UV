@@ -164,12 +164,12 @@ class TestRetrieveModelWiringMainPy:
         else:
             monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
         # Clear cached main module so MODEL_NAME/RETRIEVE_MODEL_NAME re-resolve.
-        mods_to_del = [k for k in list(sys.modules) if k == "main" or k.startswith("pageindex_mutil.utils")]
+        mods_to_del = [k for k in list(sys.modules) if k == "main" or k.startswith("pageindex_mutil.utils") or k == "pageindex_mutil.reasoning" or k == "app.main"]
         for k in mods_to_del:
             del sys.modules[k]
         import pageindex_mutil.utils as utils_mod
         importlib.reload(utils_mod)
-        import main as main_mod
+        import app.main as main_mod
         importlib.reload(main_mod)
         return main_mod
 
@@ -184,6 +184,10 @@ class TestRetrieveModelWiringMainPy:
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = mock_resp
         main_mod.get_llm_client = lambda: mock_client
+        # Also patch the reference inside pageindex_mutil.reasoning where
+        # _call_llm_json / generate_answer are actually defined.
+        import pageindex_mutil.reasoning as reasoning_mod
+        reasoning_mod.get_llm_client = lambda: mock_client
         return mock_client
 
     def test_call_llm_json_uses_retrieve_model_when_set(self, monkeypatch):
@@ -207,6 +211,8 @@ class TestRetrieveModelWiringMainPy:
         # Simulate the null/empty retrieve_model case (config.yaml retrieve_model
         # could be null, or RETRIEVE_MODEL_NAME env empty).
         main_mod.RETRIEVE_MODEL_NAME = None
+        import pageindex_mutil.reasoning as reasoning_mod
+        reasoning_mod._get_retrieve_model_name = lambda: None
         mock_client = self._mock_client(main_mod, '{"key": ["val"]}')
         main_mod._call_llm_json("prompt", extract_key="key")
         assert mock_client.chat.completions.create.call_args[1]["model"] == "m"
@@ -222,6 +228,8 @@ class TestRetrieveModelWiringMainPy:
         """NFR4: RETRIEVE_MODEL_NAME None/empty -> model=MODEL_NAME (the `or` fallback)."""
         main_mod = self._import_main_with_env(monkeypatch, retrieve_model="r-model", model="m")
         main_mod.RETRIEVE_MODEL_NAME = None
+        import pageindex_mutil.reasoning as reasoning_mod
+        reasoning_mod._get_retrieve_model_name = lambda: None
         mock_client = self._mock_client(main_mod, "answer")
         main_mod.generate_answer("q", "ctx")
         assert mock_client.chat.completions.create.call_args[1]["model"] == "m"
