@@ -1,39 +1,50 @@
 # Architecture
 
-PageIndex-UV is a **non-vector, reasoning-based RAG** tool over long documents (PDF / Markdown). It exposes both an interactive CLI and an MCP server, backed by a shared `PageIndexClient` runtime.
+PageIndex-UV is a **hybrid retrieval RAG** tool over long documents (PDF / Markdown / DOCX / PPTX / XLSX). It supports keyword, vector (ChromaDB), and hybrid search backends with reasoning-based document selection. It exposes both an interactive CLI and an MCP server, backed by a shared `PageIndexClient` runtime.
 
 ## At a glance
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          Entry points                                    │
-│   ┌──────────────────────┐    ┌───────────────────────────────────────┐  │
-│   │ main.py  (CLI REPL)  │    │ server.py  (Starlette HTTP+SSE MCP)    │  │
-│   │  /add /list /doc …   │    │  /sse  /messages/  /upload  /api/…     │  │
-│   └──────────┬───────────┘    └───────────────────┬───────────────────┘  │
-│              │                                    │                       │
-│              └──────────────┬─────────────────────┘                       │
-│                             ▼                                             │
-│                ┌────────────────────────────────┐                         │
-│                │      PageIndexClient  (singleton,  in-process)         │ │
-│                │  - documents  - uuid ↔ db_id map  - LLM client         │ │
-│                └──────────────┬─────────────────────┘                   │
-│                             │                                             │
-│              ┌──────────────┴──────────────────┐                         │
-│              ▼                                 ▼                         │
-│   ┌──────────────────────┐        ┌──────────────────────────────┐      │
-│   │ pageindex_mutil/     │        │  db.py (SQLite cache)         │      │
-│   │  - super_tree.py     │        │  - nodes / pages / docs       │      │
-│   │  - closet_index.py   │        │  - closet_tags / doc_keywords │      │
-│   │  - agentic/          │        │  - kb_identity                │      │
-│   │  - utils / config    │        │  - delete_document (cascade)  │      │
-│   └──────────┬───────────┘        └──────────────────────────────┘      │
-│              ▼                                                           │
-│   ┌─────────────────────────────────────────────────────────────────┐    │
-│   │  configure_llm()  →  OpenAI-compatible client  (Qwen / OpenAI)  │    │
-│   │  resolved from: explicit arg > OPENAI_API_KEY > DASHSCOPE_API_KEY│   │
-│   └─────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Entry points                                        │
+│   ┌──────────────────────┐    ┌───────────────────────────────────────────┐  │
+│   │ main.py  (CLI REPL)  │    │ server.py  (Starlette HTTP+SSE MCP)        │  │
+│   │  /add /list /doc …   │    │  /sse  /messages/  /upload  /api/…         │  │
+│   └──────────┬───────────┘    └───────────────────┬───────────────────────┘  │
+│              │                                    │                           │
+│              └──────────────┬─────────────────────┘                           │
+│                             ▼                                                 │
+│                ┌────────────────────────────────────┐                         │
+│                │      PageIndexClient  (singleton,  in-process)             │ │
+│                │  - documents  - uuid ↔ db_id map  - LLM client             │ │
+│                └──────────────┬─────────────────────┘                       │
+│                             │                                                 │
+│        ┌────────────────────┼────────────────────┐                           │
+│        ▼                    ▼                    ▼                           │
+│  ┌──────────────┐  ┌──────────────────┐  ┌──────────────────────┐           │
+│  │ pageindex_   │  │  db.py (SQLite)   │  │  Search Backends     │           │
+│  │ mutil/       │  │  - nodes/pages    │  │  - keyword (default) │           │
+│  │ - super_tree │  │  - closet_tags    │  │  - hybrid (RRF)      │           │
+│  │ - closet_idx │  │  - doc_keywords   │  │  - chroma (vector)   │           │
+│  │ - agentic/   │  │  - kb_identity    │  └──────────────────────┘           │
+│  │ - utils/conf │  │  - entities       │                                     │
+│  └──────┬───────┘  │  - entity_mentions│  ┌──────────────────────┐           │
+│         │          │  - entity_relations│  │  Entity Knowledge    │           │
+│         │          └──────────────────┘  │  Graph               │           │
+│         │                                │  - entity_extractor  │           │
+│         ▼                                │  - cross-doc linking │           │
+│  ┌──────────────────────┐                └──────────────────────┘           │
+│  │  LiteParse            │                                                   │
+│  │  (multi-format parser)│                                                   │
+│  │  DOCX/PPTX/XLSX/ODT  │                                                   │
+│  │  images/HTML → Markdown│                                                  │
+│  └──────────────────────┘                                                    │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐    │
+│   │  configure_llm()  →  OpenAI-compatible client  (Qwen / OpenAI)      │    │
+│   │  resolved from: explicit arg > OPENAI_API_KEY > DASHSCOPE_API_KEY    │   │
+│   └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Core pipeline (per question)
@@ -154,7 +165,7 @@ Configurable weights per channel (default: vector 1.5x, keyword 1.0x, tag 1.0x).
 | MCP (SSE) | `GET /sse`, `POST /messages/` | Tools: `search`, `list_documents`, `get_document`, `delete_document`. See [mcp-tools.md](mcp-tools.md) |
 | REST API | `GET /health`, `POST /upload`, `GET/DELETE /api/documents`, `POST /api/search`, `GET/POST /api/config`, `POST /api/config/test` | Used by the web console; same auth as MCP (`X-API-Key`) |
 | Auth | `APIKeyMiddleware` | Public: `/`, `/health`, `/static/*`. Gated: `/api/*`, `/sse`, `/messages/`, `/upload` |
-| Documents store | `WORKSPACE/` (PDF/MD) | Path from `.env` (`WORKSPACE=…`) |
+| Documents store | `WORKSPACE/` (PDF/MD/DOCX/PPTX/XLSX/images/HTML) | Path from `.env` (`WORKSPACE=…`). LiteParse handles non-PDF/MD formats. |
 | Index cache | `DB_PATH` (SQLite) | Path from `.env`. Holds `nodes`, `pages`, `documents`, `closet_tags`, `doc_keywords`, `kb_identity` tables |
 
 ## SQLite schema
