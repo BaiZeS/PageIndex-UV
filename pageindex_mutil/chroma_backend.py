@@ -54,7 +54,27 @@ class ChromaSearchBackend(SearchBackend):
         # Initialize embedding model
         self.embedding_model = embedding_model
         self._embedder = None
-        
+
+        # Track embedding model identity to prevent dimension mismatches
+        stored_model = self.collection.metadata.get("embedding_model")
+        if stored_model and stored_model != embedding_model:
+            logger.warning(
+                "Embedding model changed from '%s' to '%s'. "
+                "Existing vectors may be incompatible. "
+                "Consider clearing the vector database.",
+                stored_model, embedding_model
+            )
+
+        # Update stored model identity on first use
+        if not stored_model:
+            # Exclude hnsw:space — ChromaDB rejects distance-function changes
+            safe_meta = {
+                k: v for k, v in self.collection.metadata.items()
+                if k != "hnsw:space"
+            }
+            safe_meta["embedding_model"] = embedding_model
+            self.collection.modify(metadata=safe_meta)
+
         logger.info("ChromaDB backend initialized at %s", self.db_path)
 
     def _get_embedder(self):
