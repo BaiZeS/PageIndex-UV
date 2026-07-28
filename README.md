@@ -63,7 +63,7 @@ docker compose logs -f
 ### 本地开发
 
 ```bash
-API_KEY=testkey uv run python server.py
+API_KEY=testkey uv run python -m app.server
 ```
 
 ### 环境变量
