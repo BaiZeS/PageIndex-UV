@@ -4,7 +4,7 @@
 > Transport: HTTP + SSE (`GET /sse`, `POST /messages/?session_id=…`)
 > Auth: `X-API-Key` header (same as REST API)
 
-The server exposes **8 tools** and **N resources** (one per indexed document, URI scheme `document://<uuid>`).
+The server exposes **9 tools** and **N resources** (one per indexed document, URI scheme `document://<uuid>`).
 
 ## Tools
 
@@ -179,6 +179,25 @@ Find documents related through shared entities.
   ]
 }
 ```
+
+### `get_stats`
+
+Get knowledge base statistics: document count, entity count, relation count, and active search backend.
+
+**Input**: none.
+
+**Output**
+
+```json
+{
+  "documents": 12,
+  "entities": 347,
+  "relations": 891,
+  "search_backend": "keyword"
+}
+```
+
+If the database is unavailable, `documents`, `entities`, and `relations` default to `0`. If a DB query fails, an `error` field is included with the details.
 
 ## Resources
 

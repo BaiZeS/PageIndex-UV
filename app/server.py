@@ -391,6 +391,24 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
             related = c.db.get_related_documents(doc_id_int, limit=arguments.get("limit", 10))
             return [types.TextContent(type="text", text=json.dumps({"related_documents": related}, ensure_ascii=False, indent=2))]
 
+        elif name == "get_stats":
+            c = get_client()
+            stats = {
+                "documents": 0,
+                "entities": 0,
+                "relations": 0,
+                "search_backend": os.getenv("SEARCH_BACKEND", "keyword"),
+            }
+            if c.db is not None:
+                try:
+                    stats["documents"] = len(c.db.get_all_documents())
+                    conn = c.db._connect()
+                    stats["entities"] = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+                    stats["relations"] = conn.execute("SELECT COUNT(*) FROM entity_relations").fetchone()[0]
+                except Exception as e:
+                    stats["error"] = str(e)
+            return [types.TextContent(type="text", text=json.dumps(stats, ensure_ascii=False))]
+
         else:
             return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False))]
 
@@ -488,6 +506,15 @@ async def handle_list_tools() -> list[types.Tool]:
                     "limit": {"type": "integer", "description": "Maximum results", "default": 10},
                 },
                 "required": ["doc_id"],
+            },
+        ),
+        types.Tool(
+            name="get_stats",
+            description="Get knowledge base statistics (document count, entity count, relation count, search backend)",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
             },
         ),
     ]
