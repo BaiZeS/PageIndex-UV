@@ -48,15 +48,27 @@
         </div>
 
         <article v-else-if="answer" class="answer-card">
-          <confidence-meter :confidence="answer.confidence" />
-          <p class="answer-text">{{ answer.answer }}</p>
+          <div class="answer-header">
+            <div class="answer-header-left">
+              <span class="answer-icon">💬</span>
+              <span class="answer-label">回答</span>
+            </div>
+            <confidence-meter :confidence="answer.confidence" />
+          </div>
+          <div class="answer-body">
+            <p class="answer-text">{{ answer.answer }}</p>
+          </div>
 
           <!-- T13 (FR11): evidence chain — accordion of matched docs with
                selected_nodes + page snippets. -->
           <component :is="evidenceModule(answer)" v-if="answer" />
         </article>
 
-        <div v-else class="empty-hint">输入问题后点击「提问」查看检索结果。</div>
+        <div v-else class="empty-hint">
+          <div class="empty-hint-icon">🔍</div>
+          <div class="empty-hint-text">输入问题后点击「提问」查看检索结果</div>
+          <div class="empty-hint-hint">支持快捷键 Ctrl/Cmd + Enter 发送</div>
+        </div>
       </panel>
     `,
   };
