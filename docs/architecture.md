@@ -134,9 +134,9 @@ When Super-Tree fails, `AgenticRouter.search()` falls back to:
 
 Three search backends are available (configured via `SEARCH_BACKEND` env var):
 
-- **`keyword`** (default): `KeywordSearchBackend` — jieba tokenization + SQLite inverted index (`doc_keywords`) + ClosetIndex tags. Fast, zero model-loading overhead.
-- **`hybrid`**: `HybridSearchBackend` — combines vector + keyword + tag using Reciprocal Rank Fusion (RRF). Requires `pip install .[vector]`.
-- **`chroma`**: `ChromaSearchBackend` — ChromaDB vector search with sentence-transformers embeddings. Requires `pip install .[vector]`.
+- **`keyword`** (default): `KeywordSearchBackend` — jieba tokenization + SQLite inverted index (`doc_keywords`) + ClosetIndex tags. Fast, zero model-loading overhead. Includes LRU search result caching (5min TTL, 128 entries max).
+- **`hybrid`**: `HybridSearchBackend` — combines vector + keyword + tag using Reciprocal Rank Fusion (RRF). Requires `pip install .[vector]`. Includes LRU search result caching.
+- **`chroma`**: `ChromaSearchBackend` — ChromaDB vector search with sentence-transformers embeddings. Requires `pip install .[vector]`. Tracks embedding model identity to prevent dimension mismatches.
 
 `HybridSearchBackend` combines three search channels using RRF:
 - **Vector search**: ChromaDB with sentence-transformers embeddings (optional)
@@ -150,7 +150,7 @@ Configurable weights per channel (default: vector 1.5x, keyword 1.0x, tag 1.0x).
 `EntityExtractor` automatically extracts entities (people, projects, organizations, concepts) and relationships from documents during indexing. Stored in SQLite tables (`entities`, `entity_mentions`, `entity_relations`). Used in:
 - L0 prefilter Channel D for entity-driven document recall
 - L3 context enrichment with cross-document entity relationships
-- MCP tools: `search_entities`, `get_entity`, `get_document_entities`, `get_related_documents`
+- MCP tools: `search_entities`, `get_entity`, `get_document_entities`, `get_related_documents`, `get_relations`, `get_stats`
 
 ### DocIdMapper
 

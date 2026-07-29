@@ -88,7 +88,7 @@ API_KEY=testkey uv run python -m app.server
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/health` | GET | 健康检查 |
+| `/health` | GET | 健康检查（返回文档数、实体数、数据库状态、延迟） |
 | `/upload` | POST | 上传文件并索引（multipart/form-data） |
 | `/sse` | GET | MCP SSE 连接端点 |
 | `/messages/` | POST | MCP JSON-RPC 消息通道 |
@@ -108,6 +108,12 @@ API_KEY=testkey uv run python -m app.server
 | `list_documents` | 无 | 列出已索引文档 |
 | `get_document` | `doc_id` | 获取文档元数据和结构 |
 | `delete_document` | `doc_id` | 删除文档及索引 |
+| `search_entities` | `query`, `limit` | 搜索实体（人物/项目/组织/概念） |
+| `get_entity` | `name` | 获取实体详情及关系 |
+| `get_document_entities` | `doc_id` | 获取文档中的所有实体 |
+| `get_related_documents` | `doc_id`, `limit` | 查找通过实体关联的文档 |
+| `get_relations` | `predicate`, `limit` | 按关系类型查询实体对 |
+| `get_stats` | 无 | 获取知识库统计信息 |
 
 详见 [docs/mcp-tools.md](docs/mcp-tools.md)。
 
