@@ -449,31 +449,40 @@ class PageIndexClient:
             try:
                 db_docs = self.db.get_all_documents()
                 for db_doc in db_docs:
-                    # Check if this document is already loaded from workspace
-                    found = False
-                    for uuid, db_id in self._uuid_to_db.items():
-                        if db_id == db_doc['id']:
-                            found = True
-                            # Update with tree_json if available
-                            if db_doc.get('tree_json'):
-                                self.documents[uuid]['structure'] = json.loads(db_doc['tree_json'])
+                    db_doc_id = db_doc['id']
+                    pdf_name = db_doc.get('pdf_name', '')
+                    pdf_path = db_doc.get('pdf_path', '')
+                    
+                    # Try to find matching workspace document by pdf_name or pdf_path
+                    found_uuid = None
+                    for uuid, doc in self.documents.items():
+                        if (doc.get('doc_name') == pdf_name or 
+                            doc.get('path') == pdf_path):
+                            found_uuid = uuid
                             break
                     
-                    if not found:
-                        # Document exists in DB but not in workspace - load it
+                    if found_uuid:
+                        # Document already loaded from workspace - register mapping
+                        self._id_mapper.register(found_uuid, db_doc_id)
+                        # Update with tree_json if available
+                        if db_doc.get('tree_json'):
+                            self.documents[found_uuid]['structure'] = json.loads(db_doc['tree_json'])
+                    else:
+                        # Document exists in DB but not in workspace - create entry
                         doc_id = str(uuid.uuid4())
-                        self._id_mapper.register(doc_id, db_doc['id'])
+                        self._id_mapper.register(doc_id, db_doc_id)
                         self.documents[doc_id] = {
                             'id': doc_id,
                             'type': 'pdf',
-                            'doc_name': db_doc.get('pdf_name', ''),
+                            'doc_name': pdf_name,
                             'doc_description': db_doc.get('doc_description', ''),
-                            'path': db_doc.get('pdf_path', ''),
+                            'path': pdf_path,
                         }
                         if db_doc.get('tree_json'):
                             self.documents[doc_id]['structure'] = json.loads(db_doc['tree_json'])
                 
-                logging.info("Loaded %d document(s) from database", len(db_docs))
+                logging.info("Loaded %d document(s) from database, %d mappings registered", 
+                           len(db_docs), len(self._uuid_to_db))
             except Exception as e:
                 logging.warning("Failed to load from database: %s", e)
 
