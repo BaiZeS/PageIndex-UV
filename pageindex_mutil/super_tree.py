@@ -289,6 +289,14 @@ class SuperTreeIndex:
         super_tree = self._build_super_tree(truncated)
         kb_identity = self.kb_identity.get_identity()
 
+        # 预算保护：超限时缩减候选，避免 L1 打分 prompt 过长。
+        tree_json = json.dumps(super_tree, ensure_ascii=False)
+        total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
+        while total_tokens > self._MAX_SUPER_TREE_TOKENS and len(super_tree["documents"]) > 5:
+            super_tree["documents"].pop()
+            tree_json = json.dumps(super_tree, ensure_ascii=False)
+            total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
+
         prompt = f"""你是一个文档检索相关性评分专家。给定用户问题、知识库概览和候选文档结构，请为每个候选文档给出 0.0-1.0 的相关性分数。
 
 [知识库概览]
@@ -327,7 +335,6 @@ class SuperTreeIndex:
             return []
 
         scored = []
-        db_to_uuid = self._get_db_to_uuid()
         for item in ranked:
             if not isinstance(item, dict):
                 continue
