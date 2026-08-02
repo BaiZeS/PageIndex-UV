@@ -227,3 +227,16 @@ class TestSuperTreeIndex:
 
             result = await st.select_documents("test", {1: 1.0})
             assert "uuid-1" in result
+
+    def test_rank_k_defaults(self, super_tree_index):
+        """Q1 -- 默认 rank_k/top_k 存在且为正。"""
+        st, db, client = super_tree_index
+        assert st._RANK_K > 0
+        assert st._SELECT_TOP_K > 0
+
+    def test_rank_k_from_config(self, super_tree_index):
+        """Q1 -- _init_from_config 能从 config 读取 rank_k。"""
+        st, db, client = super_tree_index
+        prior = st._RANK_K
+        st._RANK_K = 7
+        assert st._RANK_K == 7

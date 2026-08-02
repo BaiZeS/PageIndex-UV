@@ -28,7 +28,7 @@ class KeywordIndex:
         ]
 
     def add_document(self, doc_id: int, doc_name: str, doc_description: str,
-                     node_titles: List[str] = None) -> None:
+                     node_titles: List[str] = None, content: str = None) -> None:
         records = []
         for token in self._tokenize(doc_name):
             records.append((doc_id, token, "name"))
@@ -38,6 +38,11 @@ class KeywordIndex:
             for title in node_titles:
                 for token in self._tokenize(title):
                     records.append((doc_id, token, "node_title"))
+        # Index full document body (unique tokens) so keyword search covers content,
+        # not just titles/descriptions — critical for short-passage retrieval.
+        if content:
+            for token in set(self._tokenize(content)):
+                records.append((doc_id, token, "content"))
         self.db.insert_doc_keywords(doc_id, records)
 
     def remove_document(self, doc_id: int) -> None:
@@ -136,6 +141,8 @@ class SuperTreeIndex:
     _MAX_CANDIDATE_DOCS = 50
     _MAX_SUPER_TREE_TOKENS = 6000
     _SUMMARY_MAX_LEN = 100
+    _RANK_K = 12
+    _SELECT_TOP_K = 5
 
     def __init__(self, db, model: str, client, retrieve_model: str = None):
         self.db = db
@@ -156,6 +163,8 @@ class SuperTreeIndex:
             self._MAX_CANDIDATE_DOCS = getattr(cfg, "max_candidate_docs", self._MAX_CANDIDATE_DOCS)
             self._MAX_SUPER_TREE_TOKENS = getattr(cfg, "max_super_tree_tokens", self._MAX_SUPER_TREE_TOKENS)
             self._SUMMARY_MAX_LEN = getattr(cfg, "summary_max_len", self._SUMMARY_MAX_LEN)
+            self._RANK_K = getattr(cfg, "rank_k", self._RANK_K)
+            self._SELECT_TOP_K = getattr(cfg, "select_top_k", self._SELECT_TOP_K)
         except Exception:
             pass
 
@@ -179,9 +188,15 @@ class SuperTreeIndex:
                 node_titles = [n.get("title", "") for n in top_nodes if n.get("title")]
             except Exception:
                 pass
+            # Collect full document body for content-level keyword indexing
+            content = ""
+            try:
+                content = self.db.get_document_content(db_doc_id)
+            except Exception:
+                pass
             self.keyword_index.add_document(
                 db_doc_id, doc.get("pdf_name", ""),
-                doc.get("doc_description", ""), node_titles
+                doc.get("doc_description", ""), node_titles, content=content
             )
         self.kb_identity.invalidate()
 
