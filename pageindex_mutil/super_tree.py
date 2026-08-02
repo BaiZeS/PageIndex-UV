@@ -284,7 +284,8 @@ class SuperTreeIndex:
         if not candidate_db_ids:
             return []
 
-        truncated = self._truncate_candidates(candidate_db_ids)
+        # 粗选：限到 _RANK_K 再打分，控制打分 prompt 体积。
+        truncated = self._truncate_candidates(candidate_db_ids)[: self._RANK_K]
 
         super_tree = self._build_super_tree(truncated)
         kb_identity = self.kb_identity.get_identity()
@@ -345,13 +346,14 @@ class SuperTreeIndex:
                 score = float(item.get("score", 0.0))
             except (TypeError, ValueError):
                 continue
+            # 服务端强制相关性阈值：低于 0.5 视为无关，提升难负样本精确率
+            if score < 0.5:
+                continue
             scored.append((doc_id, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        try:
-            top_k = max(1, min(int(data.get("top_k", self._SELECT_TOP_K)), len(scored)))
-        except (TypeError, ValueError):
-            top_k = self._SELECT_TOP_K
+        # top_k 固定为配置值，不被 LLM 返回值控制，保证契约"取前 _SELECT_TOP_K"
+        top_k = min(self._SELECT_TOP_K, len(scored))
 
         return [doc_id for doc_id, _s in scored[:top_k]]
 

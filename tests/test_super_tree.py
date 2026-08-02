@@ -256,6 +256,30 @@ class TestSuperTreeIndex:
         result = await st._score_candidates("test", {})
         assert result == []
 
+    @pytest.mark.asyncio
+    async def test_score_candidates_filters_below_threshold(self, super_tree_index):
+        """Q1 -- 服务端强制 >=0.5 阈值：低于阈值的候选被过滤，即使排在前面。"""
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            # 高分在前但低分(uuid-b 0.4)低于阈值，应被剔除；LLM 谎称 top_k=10 也不应超配。
+            mock_llm.return_value = json.dumps({
+                "ranked": [
+                    {"doc_id": "uuid-a", "score": 0.9},
+                    {"doc_id": "uuid-b", "score": 0.4},
+                    {"doc_id": "uuid-c", "score": 0.8},
+                ],
+                "top_k": 10,
+            })
+            st, db, client = super_tree_index
+            client.documents = {"uuid-a": {"id": "uuid-a"}, "uuid-b": {"id": "uuid-b"}, "uuid-c": {"id": "uuid-c"}}
+            client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2, "uuid-c": 3}
+            for i in (1, 2, 3):
+                db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
+            result = await st._score_candidates("test", {1: 1.0, 2: 1.0, 3: 1.0})
+            assert "uuid-b" not in result  # 0.4 低于阈值被过滤
+            # 两个达标候选，LLM 说 top_k=10，但配置 _SELECT_TOP_K=5 仍上限
+            assert set(result) == {"uuid-a", "uuid-c"}
+            assert len(result) == 2
+
     def test_rank_k_defaults(self, super_tree_index):
         """Q1 -- 默认 rank_k/top_k 存在且为正。"""
         st, db, client = super_tree_index
