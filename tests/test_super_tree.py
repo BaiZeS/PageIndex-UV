@@ -219,7 +219,7 @@ class TestSuperTreeIndex:
     @pytest.mark.asyncio
     async def test_select_documents(self, super_tree_index):
         with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
-            mock_llm.return_value = '{"doc_ids": ["uuid-1"]}'
+            mock_llm.return_value = '{"ranked": [{"doc_id": "uuid-1", "score": 0.9, "reason": "x"}], "top_k": 1}'
             st, db, client = super_tree_index
             client.documents = {"uuid-1": {"id": "uuid-1", "doc_name": "test.pdf"}}
             client._uuid_to_db = {"uuid-1": 1}
@@ -227,6 +227,34 @@ class TestSuperTreeIndex:
 
             result = await st.select_documents("test", {1: 1.0})
             assert "uuid-1" in result
+
+    @pytest.mark.asyncio
+    async def test_select_documents_returns_topk_scored(self, super_tree_index):
+        """Q1 -- 打分式精排按相关性分数取前 _SELECT_TOP_K，仍返回 uuid 列表。"""
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = json.dumps({
+                "ranked": [
+                    {"doc_id": "uuid-a", "score": 0.9, "reason": "直接相关"},
+                    {"doc_id": "uuid-b", "score": 0.6, "reason": "部分相关"},
+                    {"doc_id": "uuid-c", "score": 0.2, "reason": "弱相关"},
+                ],
+                "top_k": 2,
+            })
+            st, db, client = super_tree_index
+            client.documents = {"uuid-a": {"id": "uuid-a"}, "uuid-b": {"id": "uuid-b"}, "uuid-c": {"id": "uuid-c"}}
+            client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2, "uuid-c": 3}
+            for i in (1, 2, 3):
+                db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
+            result = await st.select_documents("test", {1: 1.0, 2: 1.0, 3: 1.0})
+            assert set(result) == {"uuid-a", "uuid-b"}
+            assert "uuid-c" not in result
+
+    @pytest.mark.asyncio
+    async def test_score_candidates_empty(self, super_tree_index):
+        """Q1 -- 空候选返回空列表，不调用 LLM。"""
+        st, db, client = super_tree_index
+        result = await st._score_candidates("test", {})
+        assert result == []
 
     def test_rank_k_defaults(self, super_tree_index):
         """Q1 -- 默认 rank_k/top_k 存在且为正。"""

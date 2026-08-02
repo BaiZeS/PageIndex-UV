@@ -275,25 +275,21 @@ class SuperTreeIndex:
     # ------------------------------------------------------------------
     # L1: Super-Tree document selection
     # ------------------------------------------------------------------
-    async def select_documents(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
+    async def _score_candidates(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
+        """Q1：对候选文档做显式相关性打分，返回降序列出的 top-k uuid。
+
+        相较于旧逻辑让 LLM 直接吐 doc_id，这里让 LLM 对每篇给出
+        相关性分数与理由，按分数取前 _SELECT_TOP_K，提升难负样本下的精确率。
+        """
         if not candidate_db_ids:
             return []
 
         truncated = self._truncate_candidates(candidate_db_ids)
+
         super_tree = self._build_super_tree(truncated)
         kb_identity = self.kb_identity.get_identity()
 
-        # Token budget check
-        tree_json = json.dumps(super_tree, ensure_ascii=False)
-        total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
-        if total_tokens > self._MAX_SUPER_TREE_TOKENS:
-            logging.warning("Super-Tree exceeds token budget (%d), truncating docs", total_tokens)
-            while total_tokens > self._MAX_SUPER_TREE_TOKENS and len(super_tree["documents"]) > 5:
-                super_tree["documents"].pop()
-                tree_json = json.dumps(super_tree, ensure_ascii=False)
-                total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
-
-        prompt = f"""你是一个文档检索专家。给定以下用户问题、知识库概览和候选文档结构，请选出最可能包含答案的 3-5 个文档。
+        prompt = f"""你是一个文档检索相关性评分专家。给定用户问题、知识库概览和候选文档结构，请为每个候选文档给出 0.0-1.0 的相关性分数。
 
 [知识库概览]
 {kb_identity}
@@ -302,17 +298,19 @@ class SuperTreeIndex:
 {query}
 
 [候选文档结构]
-{tree_json}
+{json.dumps(super_tree, ensure_ascii=False)}
 
 要求：
-1. 基于文档的顶层章节标题和摘要判断相关性
-2. 优先选择直接相关文档，次选间接相关文档
-3. 如果知识库概览显示没有相关主题，返回空列表
+1. 分数越高代表文档越可能包含答案；只给 >=0.5 的候选保留，其余可在 ranked 中省略。
+2. 用一句话说明理由。
 
 返回JSON格式：
 {{
-  "thinking": "推理过程...",
-  "doc_ids": ["uuid-1", "uuid-2", ...]
+  "ranked": [
+    {{"doc_id": "uuid-1", "score": 0.9, "reason": "直接相关"}},
+    ...
+  ],
+  "top_k": {self._SELECT_TOP_K}
 }}
 直接返回最终JSON结构，不要输出其他内容。"""
 
@@ -320,23 +318,40 @@ class SuperTreeIndex:
         if not response:
             return []
 
-        # Parse JSON response (handles markdown code blocks, etc.)
         data = extract_json(response)
         if not isinstance(data, dict):
-            data = {}
-        doc_ids = data.get("doc_ids", [])
+            return []
 
-        # Map back to UUIDs
-        uuid_results = []
+        ranked = data.get("ranked", [])
+        if not isinstance(ranked, list) or not ranked:
+            return []
+
+        scored = []
         db_to_uuid = self._get_db_to_uuid()
-        for doc_id in doc_ids:
-            if isinstance(doc_id, int):
-                uuid = db_to_uuid.get(doc_id)
-                if uuid:
-                    uuid_results.append(uuid)
-            elif isinstance(doc_id, str):
-                uuid_results.append(doc_id)
-        return uuid_results
+        for item in ranked:
+            if not isinstance(item, dict):
+                continue
+            doc_id = item.get("doc_id")
+            if not doc_id:
+                continue
+            try:
+                score = float(item.get("score", 0.0))
+            except (TypeError, ValueError):
+                continue
+            scored.append((doc_id, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        try:
+            top_k = max(1, min(int(data.get("top_k", self._SELECT_TOP_K)), len(scored)))
+        except (TypeError, ValueError):
+            top_k = self._SELECT_TOP_K
+
+        return [doc_id for doc_id, _s in scored[:top_k]]
+
+    async def select_documents(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
+        if not candidate_db_ids:
+            return []
+        return await self._score_candidates(query, candidate_db_ids)
 
     # ------------------------------------------------------------------
     # Super-Tree builder
