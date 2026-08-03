@@ -39,6 +39,7 @@ async def generate_summaries_for_structure_md(structure, summary_token_threshold
 
 def extract_nodes_from_markdown(markdown_content):
     header_pattern = r'^(#{1,6})\s+(.+)$'
+    bold_heading_pattern = r'^\*\*(.+?)\*\*\s*$'
     code_block_pattern = r'^```'
     node_list = []
     
@@ -63,6 +64,14 @@ def extract_nodes_from_markdown(markdown_content):
             if match:
                 title = match.group(2).strip()
                 node_list.append({'node_title': title, 'line_num': line_num})
+                continue
+
+            # 阶段2：无 # 结构时，独立粗体行视为一级标题（对齐原版 PageIndex）
+            bold_match = re.match(bold_heading_pattern, stripped_line)
+            if bold_match:
+                title = bold_match.group(1).strip()
+                if title:
+                    node_list.append({'node_title': title, 'line_num': line_num})
 
     return node_list, lines
 
