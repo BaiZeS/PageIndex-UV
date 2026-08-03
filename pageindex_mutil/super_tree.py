@@ -275,6 +275,62 @@ class SuperTreeIndex:
     # ------------------------------------------------------------------
     # L1: Super-Tree document selection
     # ------------------------------------------------------------------
+    async def _select_tag_sets(self, query: str, candidate_db_ids: Dict[int, float]) -> Dict[int, float]:
+        """阶段3 形态1：按领域标签把候选文档聚类，LLM 选相关集合，返回命中文档。
+
+        复用 closet_tags 已有的领域级语义标签，把 L0 候选按标签聚成集合，
+        让 LLM 先选相关集合，再只对命中集合做 L1 精排——减少难负样本干扰。
+        LLM 失败时保留全部候选（不误伤）。
+        """
+        if not candidate_db_ids:
+            return {}
+
+        # 聚合同一标签下的候选文档
+        tag_to_docs: Dict[str, list] = {}
+        for db_id in candidate_db_ids:
+            try:
+                tags = self.db.get_doc_tags(db_id)
+            except Exception:
+                tags = []
+            for t in tags:
+                tag_to_docs.setdefault(t["tag_text"], []).append(db_id)
+
+        if not tag_to_docs:
+            return candidate_db_ids
+
+        tag_list = "\n".join(f"- {tag}（{len(docs)}篇）" for tag, docs in tag_to_docs.items())
+        prompt = f"""你是一个文档检索领域选择器。给定查询和候选领域标签，选出与查询最相关的 1-3 个领域。
+
+[用户问题]
+{query}
+
+[候选领域标签]
+{tag_list}
+
+返回JSON格式：
+{{"tags": ["领域标签1", "领域标签2"]}}
+只返回与查询相关的领域，直接返回JSON，不要其他内容。"""
+
+        response = await llm_acompletion(self.retrieve_model or self.model, prompt)
+        if not response:
+            return candidate_db_ids
+
+        data = extract_json(response)
+        if not isinstance(data, dict):
+            return candidate_db_ids
+
+        selected_tags = data.get("tags", [])
+        if not isinstance(selected_tags, list) or not selected_tags:
+            return candidate_db_ids
+
+        keep = set()
+        for tag in selected_tags:
+            for db_id in tag_to_docs.get(str(tag), []):
+                keep.add(db_id)
+        if not keep:
+            return candidate_db_ids
+        return {db_id: candidate_db_ids[db_id] for db_id in keep}
+
     async def _score_candidates(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
         """Q1：对候选文档做显式相关性打分，返回降序列出的 top-k uuid。
 
@@ -360,7 +416,9 @@ class SuperTreeIndex:
     async def select_documents(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
         if not candidate_db_ids:
             return []
-        return await self._score_candidates(query, candidate_db_ids)
+        # 阶段3 形态1：先按领域标签选集合，缩小候选再精排
+        narrowed = await self._select_tag_sets(query, candidate_db_ids)
+        return await self._score_candidates(query, narrowed)
 
     # ------------------------------------------------------------------
     # Super-Tree builder
