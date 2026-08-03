@@ -110,3 +110,37 @@ async def test_md_to_tree_falls_back_to_semantic_sections(tmp_path):
         m.assert_called_once()
         titles = [n.get("title") for n in result["structure"]]
         assert titles == ["第一章", "第二章"]
+
+
+@pytest.mark.asyncio
+async def test_summaries_concurrency_limited():
+    """阶段4 -- 摘要生成用信号量限流，避免并发风暴；结果仍正确汇总。"""
+    from unittest.mock import patch
+    import asyncio
+
+    structure = [
+        {"title": chr(65 + i), "text": "x" * 2000, "nodes": []}
+        for i in range(6)
+    ]
+    active = 0
+    max_active = 0
+
+    async def fake_summary(node, model=None):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return f"summary:{node['title']}"
+
+    with patch.object(mod, "generate_node_summary", new=fake_summary), \
+             patch.object(mod, "structure_to_list", side_effect=lambda s: (
+                 [s] if isinstance(s, dict) else s
+             )):
+        await mod.generate_summaries_for_structure_md(
+            structure, summary_token_threshold=200, model=None
+        )
+    # 并发被限制在信号量上限内（当前实现无限制会并发到 6）
+    assert max_active <= 2
+    # 结果仍正确
+    assert all(n["summary"] == f"summary:{n['title']}" for n in structure)

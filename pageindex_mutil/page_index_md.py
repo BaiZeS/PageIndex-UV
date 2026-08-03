@@ -28,8 +28,14 @@ async def get_node_summary(node, summary_token_threshold=200, model=None):
 
 async def generate_summaries_for_structure_md(structure, summary_token_threshold, model=None):
     nodes = structure_to_list(structure)
-    tasks = [get_node_summary(node, summary_token_threshold=summary_token_threshold, model=model) for node in nodes]
-    summaries = await asyncio.gather(*tasks)
+    # 阶段4：信号量限流，避免对海量叶子全量并发触发 LLM 限流/429。
+    sem = asyncio.Semaphore(2)
+
+    async def _limited(node):
+        async with sem:
+            return await get_node_summary(node, summary_token_threshold=summary_token_threshold, model=model)
+
+    summaries = await asyncio.gather(*[_limited(node) for node in nodes])
     
     for node, summary in zip(nodes, summaries):
         if not node.get('nodes'):
