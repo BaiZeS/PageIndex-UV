@@ -143,6 +143,7 @@ class SuperTreeIndex:
     _SUMMARY_MAX_LEN = 100
     _RANK_K = 12
     _SELECT_TOP_K = 5
+    _SCORE_RATIO = 0.5
 
     def __init__(self, db, model: str, client, retrieve_model: str = None):
         self.db = db
@@ -165,6 +166,7 @@ class SuperTreeIndex:
             self._SUMMARY_MAX_LEN = getattr(cfg, "summary_max_len", self._SUMMARY_MAX_LEN)
             self._RANK_K = getattr(cfg, "rank_k", self._RANK_K)
             self._SELECT_TOP_K = getattr(cfg, "select_top_k", self._SELECT_TOP_K)
+            self._SCORE_RATIO = getattr(cfg, "score_ratio", self._SCORE_RATIO)
         except Exception:
             pass
 
@@ -402,16 +404,22 @@ class SuperTreeIndex:
                 score = float(item.get("score", 0.0))
             except (TypeError, ValueError):
                 continue
-            # 服务端强制相关性阈值：低于 0.5 视为无关，提升难负样本精确率
-            if score < 0.5:
-                continue
             scored.append((doc_id, score))
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        # top_k 固定为配置值，不被 LLM 返回值控制，保证契约"取前 _SELECT_TOP_K"
-        top_k = min(self._SELECT_TOP_K, len(scored))
+        if not scored:
+            return []
 
-        return [doc_id for doc_id, _s in scored[:top_k]]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        s_max = scored[0][1]
+        # 自适应相对阈值：保留分数 >= 最高分*ratio 的候选。
+        # 若最高分过低（整个查询弱），则保留 top-k 兜底，避免误杀。
+        if s_max < 0.3:
+            result = [doc_id for doc_id, _s in scored[: self._SELECT_TOP_K]]
+        else:
+            threshold = s_max * self._SCORE_RATIO
+            result = [doc_id for doc_id, s in scored if s >= threshold]
+        # top_k 固定为配置值，不被 LLM 返回值控制，保证契约"取前 _SELECT_TOP_K"
+        return result[: self._SELECT_TOP_K]
 
     async def select_documents(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
         if not candidate_db_ids:

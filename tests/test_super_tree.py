@@ -257,10 +257,10 @@ class TestSuperTreeIndex:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_score_candidates_filters_below_threshold(self, super_tree_index):
-        """Q1 -- 服务端强制 >=0.5 阈值：低于阈值的候选被过滤，即使排在前面。"""
+    async def test_score_candidates_filters_below_relative_threshold(self, super_tree_index):
+        """Q1 -- 相对阈值(>=最高分*ratio)：远低于最高分的候选被过滤，即使排在前面。"""
         with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
-            # 高分在前但低分(uuid-b 0.4)低于阈值，应被剔除（验证过滤与返回顺序无关）。
+            # s_max=0.9 → 阈值 0.45，uuid-b(0.4) 被过滤；uuid-c(0.8) 保留。
             mock_llm.return_value = json.dumps({
                 "ranked": [
                     {"doc_id": "uuid-a", "score": 0.9},
@@ -275,8 +275,49 @@ class TestSuperTreeIndex:
             for i in (1, 2, 3):
                 db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
             result = await st._score_candidates("test", {1: 1.0, 2: 1.0, 3: 1.0})
-            assert "uuid-b" not in result  # 0.4 低于阈值被过滤
+            assert "uuid-b" not in result  # 0.4 < 0.9*0.5 被过滤
             assert set(result) == {"uuid-a", "uuid-c"}
+
+    @pytest.mark.asyncio
+    async def test_score_candidates_keeps_close_high_scores(self, super_tree_index):
+        """Q1 -- 强域：分数都偏高且相对接近时不去除，避免误伤边界相关文档。"""
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            # s_max=0.9 → 阈值 0.45，三者都 >= 0.45，全部保留（不误杀强域）。
+            mock_llm.return_value = json.dumps({
+                "ranked": [
+                    {"doc_id": "uuid-a", "score": 0.9},
+                    {"doc_id": "uuid-b", "score": 0.6},
+                    {"doc_id": "uuid-c", "score": 0.5},
+                ],
+                "top_k": 10,
+            })
+            st, db, client = super_tree_index
+            client.documents = {"uuid-a": {"id": "uuid-a"}, "uuid-b": {"id": "uuid-b"}, "uuid-c": {"id": "uuid-c"}}
+            client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2, "uuid-c": 3}
+            for i in (1, 2, 3):
+                db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
+            result = await st._score_candidates("test", {1: 1.0, 2: 1.0, 3: 1.0})
+            assert set(result) == {"uuid-a", "uuid-b", "uuid-c"}
+
+    @pytest.mark.asyncio
+    async def test_score_candidates_weak_query_keeps_topk(self, super_tree_index):
+        """Q1 -- 弱查询(最高分<0.3)：保留 top-k 兜底，不因绝对阈值误杀。"""
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = json.dumps({
+                "ranked": [
+                    {"doc_id": "uuid-a", "score": 0.25},
+                    {"doc_id": "uuid-b", "score": 0.2},
+                    {"doc_id": "uuid-c", "score": 0.15},
+                ],
+                "top_k": 10,
+            })
+            st, db, client = super_tree_index
+            client.documents = {"uuid-a": {"id": "uuid-a"}, "uuid-b": {"id": "uuid-b"}, "uuid-c": {"id": "uuid-c"}}
+            client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2, "uuid-c": 3}
+            for i in (1, 2, 3):
+                db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
+            result = await st._score_candidates("test", {1: 1.0, 2: 1.0, 3: 1.0})
+            assert set(result) == {"uuid-a", "uuid-b", "uuid-c"}
 
     @pytest.mark.asyncio
     async def test_score_candidates_caps_top_k_at_config(self, super_tree_index):

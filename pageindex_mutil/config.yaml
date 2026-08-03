@@ -47,6 +47,7 @@ tau_high: 0.7
 tau_low: 0.4
 rank_k: 12
 select_top_k: 5
+score_ratio: 0.5
 
 # LiteParse multi-format parsing
 liteparse_ocr_enabled: true
