@@ -1,6 +1,9 @@
 import importlib.util
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 # Preload pageindex_mutil.utils minimal stub so page_index_md's imports resolve.
 _mutil = Path(__file__).parent.parent / "pageindex_mutil"
@@ -20,6 +23,8 @@ utils_mod.print_json = lambda *a, **k: None
 utils_mod.print_toc = lambda *a, **k: None
 utils_mod.generate_node_summary = lambda *a, **k: None
 utils_mod.generate_doc_description = lambda *a, **k: None
+utils_mod.llm_completion = lambda *a, **k: None
+utils_mod.extract_json = lambda text: json.loads(text) if text else None
 
 spec = importlib.util.spec_from_file_location("pageindex_mutil.page_index_md", _mutil / "page_index_md.py")
 mod = importlib.util.module_from_spec(spec)
@@ -50,3 +55,58 @@ def test_bold_in_paragraph_ignored():
     md = "This is **emphasized** text inline, not a heading.\n"
     nodes, _ = extract_nodes_from_markdown(md)
     assert nodes == []
+
+
+def test_semantic_sections_empty_text():
+    """阶段2 -- 空文本返回空列表，不调 LLM。"""
+    assert mod.semantic_sections_from_markdown("") == []
+    assert mod.semantic_sections_from_markdown("   \n\n  ") == []
+
+
+def test_semantic_sections_parses_llm_output():
+    """阶段2 -- LLM 返回章节 JSON 时解析为 {title, line_num} 列表。"""
+    from unittest.mock import patch
+    mock_out = json.dumps([
+        {"title": "引言", "line_num": 1},
+        {"title": "方法", "line_num": 5},
+        {"title": "结论", "line_num": 20},
+    ])
+    with patch.object(mod, "llm_completion", return_value=mock_out) as m, \
+         patch.object(mod, "extract_json", side_effect=json.loads):
+        secs = mod.semantic_sections_from_markdown("无标题文本\n" * 30)
+        assert secs == [
+            {"title": "引言", "line_num": 1},
+            {"title": "方法", "line_num": 5},
+            {"title": "结论", "line_num": 20},
+        ]
+        m.assert_called_once()
+
+
+def test_semantic_sections_llm_failure_returns_empty():
+    """阶段2 -- LLM 失败/返回非法时返回空列表（不崩溃）。"""
+    from unittest.mock import patch
+    with patch.object(mod, "llm_completion", return_value="not json"):
+        assert mod.semantic_sections_from_markdown("some text") == []
+
+
+@pytest.mark.asyncio
+async def test_md_to_tree_falls_back_to_semantic_sections(tmp_path):
+    """阶段2 -- 无标题(空树) MD 走语义切分分支，生成非空树。"""
+    from unittest.mock import patch
+    md = tmp_path / "notes.md"
+    md.write_text("第一段内容\n更多内容\n\n第二段内容\n结束内容\n", encoding="utf-8")
+
+    async def _noop(structure, **kwargs):
+        return structure
+
+    with patch.object(mod, "semantic_sections_from_markdown",
+                      return_value=[{"title": "第一章", "line_num": 1},
+                                    {"title": "第二章", "line_num": 4}]) as m, \
+         patch.object(mod, "generate_summaries_for_structure_md", new=_noop):
+        result = await mod.md_to_tree(
+            str(md), if_add_node_summary='yes', summary_token_threshold=200,
+            if_add_node_id='yes', model=None,
+        )
+        m.assert_called_once()
+        titles = [n.get("title") for n in result["structure"]]
+        assert titles == ["第一章", "第二章"]

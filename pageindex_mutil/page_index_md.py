@@ -13,6 +13,8 @@ from .utils import (
     print_toc,
     generate_node_summary,
     generate_doc_description,
+    llm_completion,
+    extract_json,
 )
 
 async def get_node_summary(node, summary_token_threshold=200, model=None):
@@ -35,6 +37,48 @@ async def generate_summaries_for_structure_md(structure, summary_token_threshold
         else:
             node['prefix_summary'] = summary
     return structure
+
+
+def semantic_sections_from_markdown(markdown_content, model=None):
+    """阶段2：对无标题结构的 markdown 做 LLM 语义章节切分。
+
+    返回 [{title, line_num}] 列表（按文档顺序），供 build_tree_from_nodes 建树。
+    与 PageIndex 原版 process_no_toc 的 generate_toc_init 同构：无显式结构时，
+    由 LLM 从正文提取语义章节边界，使短文档也长成树。失败返回空列表。
+    """
+    if not markdown_content or not markdown_content.strip():
+        return []
+
+    prompt = (
+        "你是一个文档结构分析专家。给定一段没有标题的 markdown 文本，"
+        "请将其切分为若干个语义连贯的章节，并给出每个章节的起始行号。\n\n"
+        "文本：\n" + markdown_content[:8000] + "\n\n"
+        "要求：\n"
+        "1. 按语义主题切分（如 3-8 个章节），每章节给出简短标题。\n"
+        "2. line_num 为该章节在文本中的起始行号（从 1 开始，按 \\n 分行）。\n"
+        "3. 章节按文档顺序排列。\n\n"
+        "返回JSON格式：\n"
+        '[{"title": "章节标题", "line_num": 1}, ...]\n'
+        "直接返回最终JSON数组，不要输出其他内容。"
+    )
+    try:
+        response = llm_completion(model, prompt)
+        if not response:
+            return []
+        data = extract_json(response)
+        if not isinstance(data, list):
+            return []
+        sections = []
+        for item in data:
+            if isinstance(item, dict) and item.get("title"):
+                try:
+                    line_num = int(item.get("line_num", 1))
+                except (TypeError, ValueError):
+                    line_num = 1
+                sections.append({"title": item["title"].strip(), "line_num": line_num})
+        return sections
+    except Exception:
+        return []
 
 
 def extract_nodes_from_markdown(markdown_content):
@@ -257,6 +301,22 @@ async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_ad
     
     print(f"Building tree from nodes...")
     tree_structure = build_tree_from_nodes(nodes_with_content)
+
+    # 阶段2：无标题/无标记结构时（空树），用 LLM 语义章节切分重建树，
+    # 使短、无结构文档也能长成树参与 Super-Tree 检索。
+    if not tree_structure:
+        sections = semantic_sections_from_markdown(markdown_content, model=model)
+        if sections:
+            semantic_nodes = [
+                {
+                    "title": s["title"],
+                    "line_num": s.get("line_num", 1),
+                    "level": 1,
+                    "text": "",
+                }
+                for s in sections
+            ]
+            tree_structure = build_tree_from_nodes(semantic_nodes)
 
     if if_add_node_id == 'yes':
         write_node_id(tree_structure)
