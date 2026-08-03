@@ -49,6 +49,24 @@ class TestKBIdentity:
         assert tmp_db.get_kb_identity() is None
 
 
+class TestClosetTags:
+    def test_get_doc_tags(self, tmp_db):
+        doc_id = tmp_db.insert_document("test.pdf", "/tmp/test.pdf")
+        tmp_db.insert_closet_tags(doc_id, [
+            (doc_id, "容器编排", "容器 编排", 0.95, "llm"),
+            (doc_id, "微服务", "微服务", 0.8, "llm"),
+        ])
+        tags = tmp_db.get_doc_tags(doc_id)
+        assert tags == [
+            {"tag_text": "容器编排", "confidence": 0.95},
+            {"tag_text": "微服务", "confidence": 0.8},
+        ]
+
+    def test_get_doc_tags_empty(self, tmp_db):
+        doc_id = tmp_db.insert_document("test.pdf", "/tmp/test.pdf")
+        assert tmp_db.get_doc_tags(doc_id) == []
+
+
 def _count_rows(db, table, doc_id):
     """Count child-table rows for a given doc_id (helper for cascade tests)."""
     conn = db._connect()

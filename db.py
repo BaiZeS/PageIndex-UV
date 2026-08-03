@@ -315,6 +315,15 @@ class PageIndexDB:
         ).fetchall()
         return [(r["page_number"], r["content"]) for r in rows]
 
+    def get_document_content(self, doc_id):
+        """Return the full text content of a document (concatenated pages)."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT content FROM pages WHERE doc_id = ? ORDER BY page_number",
+            (doc_id,),
+        ).fetchall()
+        return "\n".join(r["content"] for r in rows if r["content"])
+
     def get_pages_by_numbers(self, doc_id, page_numbers):
         if not page_numbers:
             return []
@@ -350,6 +359,16 @@ class PageIndexDB:
     def delete_closet_tags(self, doc_id):
         with self._connect() as conn:
             conn.execute("DELETE FROM closet_tags WHERE doc_id = ?", (doc_id,))
+
+    def get_doc_tags(self, doc_id):
+        """返回某文档的语义标签列表：[{tag_text, confidence}]（按置信度降序）。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag_text, confidence FROM closet_tags WHERE doc_id = ? "
+                "ORDER BY confidence DESC",
+                (doc_id,),
+            ).fetchall()
+        return [{"tag_text": r[0], "confidence": r[1]} for r in rows]
 
     def delete_document(self, doc_id: int) -> None:
         """Delete a document and cascade-delete its child rows.
