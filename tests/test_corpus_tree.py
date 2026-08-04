@@ -70,6 +70,7 @@ M_SPLIT = "簇拆分"
 M_MERGE = "簇合并裁定"
 M_ATTACH = "挂簇裁定"
 M_UPPER = "上层结构"
+M_SIMILAR = "过相似"
 
 
 @pytest.fixture
@@ -264,7 +265,7 @@ class TestDeterministicGrouping:
         assert by_title["前端开发"] == {d3}
 
     def test_grouping_issues_no_llm_calls(self, tmp_db):
-        """分组是纯倒排 group-by：除标签归一外不产生 LLM 调用。"""
+        """分组是纯倒排 group-by：除标签归一与合并保护外不产生 LLM 调用。"""
         for i in range(4):
             _add_doc(tmp_db, f"a{i}.pdf", [("风险管理", 0.9)])
             _add_doc(tmp_db, f"b{i}.pdf", [("前端开发", 0.9)])
@@ -274,10 +275,11 @@ class TestDeterministicGrouping:
         ]})})
         with patch.object(corpus_tree_mod, "llm_completion", side_effect=fake):
             CorpusTreeBuilder(tmp_db, model="m", cluster_min=1).rebuild()
-        # 只发生归一化一类 LLM 调用（无合并/拆分/分组/挂簇裁定）
+        # 只发生归一化与合并保护（过相似合并）两类 LLM 调用
+        # （无拆分/过小合并/分组/挂簇裁定）
         assert len(fake.calls) >= 1
         for _, prompt in fake.calls:
-            assert M_NORM in prompt
+            assert M_NORM in prompt or M_SIMILAR in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +411,80 @@ class TestClusterSizeBounds:
         assert len(_leaf_clusters(tree)) == 1
         events = tmp_db.get_corpus_tree_events()
         assert any(e["event_type"] == "merge_skipped" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# 合并保护：过相似的兄弟簇合并（[S3.1] 细而不碎·主动闸门）
+# ---------------------------------------------------------------------------
+
+
+class TestSimilarMergeProtection:
+    """过相似兄弟簇合并：LLM 语义裁定，宁缺毋滥；失败/无把握时不合并。"""
+
+    def _two_adequate_siblings(self, tmp_db):
+        """构造两个规模达标（≥cluster_min）的兄弟簇，各 2 篇文档。"""
+        d1 = [_add_doc(tmp_db, f"a{i}.pdf", [("风险管理", 0.9)]) for i in range(2)]
+        d2 = [_add_doc(tmp_db, f"b{i}.pdf", [("风控管理", 0.9)]) for i in range(2)]
+        norm = json.dumps({"groups": [
+            {"canonical": "风险管理", "synonyms": ["风险管理"]},
+            {"canonical": "风控管理", "synonyms": ["风控管理"]},
+        ]})
+        return d1, d2, norm
+
+    def test_similar_pair_merged_memberships_moved_event_recorded(self, tmp_db):
+        """(a) LLM 返回过相似簇对 → 合并、membership 迁移、merge_similar 记录、覆盖不丢。"""
+        d1, d2, norm = self._two_adequate_siblings(tmp_db)
+        fake = _route_llm({
+            M_NORM: norm,
+            M_SIMILAR: json.dumps({"pairs": [["风险管理", "风控管理"]]}),
+        })
+        with patch.object(corpus_tree_mod, "llm_completion", side_effect=fake):
+            tree = CorpusTreeBuilder(tmp_db, model="m", cluster_min=2, cluster_max=50).rebuild()
+        # 两个过相似簇合并为一个，全部文档迁入幸存簇
+        leaves = _leaf_clusters(tree)
+        assert len(leaves) == 1
+        assert len(leaves[0]["docs"]) == 4
+        assert _all_doc_ids(tree) == set(d1) | set(d2)
+        # 记录 merge_similar 处置事件
+        events = tmp_db.get_corpus_tree_events(event_type="merge_similar")
+        assert len(events) == 1
+        # 每个文档仍有归属（覆盖不丢）
+        for did in list(d1) + list(d2):
+            assert len(tmp_db.get_corpus_doc_memberships(did)) >= 1
+
+    def test_similar_empty_pairs_no_merge(self, tmp_db):
+        """(b) LLM 返回空列表 → 不合并（宁缺毋滥）。"""
+        d1, d2, norm = self._two_adequate_siblings(tmp_db)
+        fake = _route_llm({
+            M_NORM: norm,
+            M_SIMILAR: json.dumps({"pairs": []}),
+        })
+        with patch.object(corpus_tree_mod, "llm_completion", side_effect=fake):
+            tree = CorpusTreeBuilder(tmp_db, model="m", cluster_min=2, cluster_max=50).rebuild()
+        # 两簇保持独立
+        leaves = _leaf_clusters(tree)
+        assert len(leaves) == 2
+        assert _all_doc_ids(tree) == set(d1) | set(d2)
+        assert tmp_db.get_corpus_tree_events(event_type="merge_similar") == []
+
+    def test_similar_llm_failure_no_merge_no_crash(self, tmp_db):
+        """(c) LLM 失败（抛异常）→ 不合并、不崩溃（自动造的树错了比没有树更糟）。"""
+        d1, d2, norm = self._two_adequate_siblings(tmp_db)
+
+        def _boom(prompt):
+            raise RuntimeError("LLM unavailable")
+
+        fake = _route_llm({
+            M_NORM: norm,
+            M_SIMILAR: _boom,
+        })
+        with patch.object(corpus_tree_mod, "llm_completion", side_effect=fake):
+            tree = CorpusTreeBuilder(tmp_db, model="m", cluster_min=2, cluster_max=50).rebuild()
+        # 两簇保持独立，建树不崩溃
+        leaves = _leaf_clusters(tree)
+        assert len(leaves) == 2
+        assert _all_doc_ids(tree) == set(d1) | set(d2)
+        assert tmp_db.get_corpus_tree_events(event_type="merge_similar") == []
 
 
 # ---------------------------------------------------------------------------

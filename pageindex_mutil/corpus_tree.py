@@ -11,10 +11,10 @@
       ⑥ 增量：新文档标签先匹配已有规范集，不中再 LLM 单点裁定；
          簇卡界每次插入时评估（超上限→拆分）
 
-细而不碎（[S3.1]）：簇大小双向卡界——过小→合并、过大→拆分，LLM 语义裁定；
-合并裁定保守（LLM 不可用时不盲目合并：自动造的树错了比没有树更糟）。
-全程无向量：分组是纯倒排 group-by，LLM 只用于标签归一与递归建树，
-每次调用输入有界。
+细而不碎（[S3.1]）：簇大小双向卡界——过小→合并、过大→拆分；合并保护——
+过相似的兄弟簇合并；均 LLM 语义裁定。合并裁定保守（LLM 不可用时不盲目合并：
+自动造的树错了比没有树更糟）。全程无向量：分组是纯倒排 group-by，LLM 用于
+标签归一、递归建树与合并/拆分裁定，每次调用输入有界。
 """
 import json
 import logging
@@ -94,6 +94,8 @@ class CorpusTreeBuilder:
         self._enforce_size_bounds()
         # ④ 上层结构递归生成（簇数过多时才分批 init/continue）
         self._build_upper_structure(root_id)
+        # [S3.1] 合并保护：过相似的兄弟簇合并（宁缺毋滥，LLM 失败不合并）
+        self._merge_similar_siblings()
         return self.get_tree()
 
     def update_for_document(self, doc_id) -> None:
@@ -427,6 +429,103 @@ class CorpusTreeBuilder:
             if c["title"] == title:
                 return True, c
         return True, None
+
+    # ------------------------------------------------------------------
+    # [S3.1] 合并保护：过相似的兄弟簇合并（宁缺毋滥，全程无向量）
+    # ------------------------------------------------------------------
+
+    def _merge_similar_siblings(self) -> None:
+        """合并保护：对每个兄弟簇集合各做一次"过相似簇对"LLM 裁定并合并。
+
+        兄弟集合 = ROOT 的直接簇孩子 + 每个分组（group）的簇孩子。
+        仅处理规模达标（≥ cluster_min）的簇；LLM 失败/无把握时一律不合并
+        （自动造的树错了比没有树更糟）。
+        """
+        nodes = self.db.get_corpus_tree_nodes()
+        root_id = next((n["id"] for n in nodes if n["kind"] == "root"), None)
+        if root_id is None:
+            return
+        parent_ids = [root_id] + [n["id"] for n in nodes if n["kind"] == "group"]
+        for parent_id in parent_ids:
+            siblings = [
+                n for n in self.db.get_corpus_tree_nodes()
+                if n["parent_id"] == parent_id and n["kind"] == "cluster"
+            ]
+            self._merge_similar_set(siblings)
+
+    def _merge_similar_set(self, siblings: List[dict]) -> None:
+        counts = self._node_doc_counts()
+        adequate = [s for s in siblings if counts.get(s["id"], 0) >= self.cluster_min]
+        if len(adequate) < 2:
+            return
+        pairs = self._llm_similar_pairs(adequate)
+        if not pairs:
+            return
+        merged_away = set()
+        for target, victim in pairs:
+            if target["id"] in merged_away or victim["id"] in merged_away:
+                continue
+            self._apply_similar_merge(victim, target)
+            merged_away.add(victim["id"])
+
+    def _apply_similar_merge(self, victim: dict, target: dict) -> None:
+        """把 victim 的软归属迁入 target，删除 victim，保留 target 标题/摘要。"""
+        docs = self.db.get_corpus_node_docs(victim["id"])
+        target_weights = dict(self.db.get_corpus_node_docs(target["id"]))
+        for did, w in docs:
+            self.db.add_corpus_membership(
+                did, target["id"], max(w, target_weights.get(did, 0.0)))
+        self.db.delete_corpus_memberships_for_node(victim["id"])
+        self.db.delete_corpus_tree_node(victim["id"])
+        self.db.insert_corpus_tree_event(
+            target["id"], "merge_similar",
+            json.dumps({"from": victim["title"], "into": target["title"],
+                        "docs": len(docs)}, ensure_ascii=False))
+
+    def _llm_similar_pairs(self, siblings: List[dict]) -> Optional[List[tuple]]:
+        """一次有界 LLM 调用找出过相似簇对；失败/非法返回空（不合并）。
+
+        返回 (target, victim) 对列表：保留规模较大者为目标（同规模取 id 小者）。
+        """
+        prompt = f"""你是一个主题聚类专家（合并保护·过相似兄弟簇合并）。以下是同一父节点下的一组主题簇，其中可能存在语义高度重复（近乎同义）的簇对。请找出这些过相似的簇对，以便合并。
+
+簇列表：
+{json.dumps(self._nodes_info(siblings), ensure_ascii=False)}
+
+要求：
+1. 只配对语义高度重复（近乎同义、可视为同一主题）的簇，宁缺毋滥
+2. 仅部分相关或语义不同的簇不要配对
+3. 每个簇最多出现在一个配对中
+4. 没有过相似簇对时返回空列表
+
+返回JSON格式：{{"pairs": [["簇标题A", "簇标题B"], ...]}}
+直接返回最终JSON结构，不要输出其他内容。"""
+        data = self._llm_json(prompt)
+        if not isinstance(data, dict):
+            return []
+        raw_pairs = data.get("pairs")
+        if not isinstance(raw_pairs, list):
+            return []
+        by_title = {s["title"]: s for s in siblings}
+        counts = self._node_doc_counts()
+        pairs = []
+        used = set()
+        for p in raw_pairs:
+            if not isinstance(p, (list, tuple)) or len(p) != 2:
+                continue
+            a, b = str(p[0]).strip(), str(p[1]).strip()
+            if a == b or a not in by_title or b not in by_title:
+                continue
+            if a in used or b in used:
+                continue
+            na, nb = by_title[a], by_title[b]
+            ca, cb = counts.get(na["id"], 0), counts.get(nb["id"], 0)
+            if ca < cb or (ca == cb and na["id"] > nb["id"]):
+                na, nb = nb, na
+            used.add(a)
+            used.add(b)
+            pairs.append((na, nb))
+        return pairs
 
     # ------------------------------------------------------------------
     # ④ 上层结构递归生成（init/continue 模式）
