@@ -234,6 +234,16 @@ class AgenticRouter:
 
         build_ctx = self._load_main_funcs().get("build_context_for_doc")
 
+        # P0: 多文档上下文 token 预算——doc_results 已按相关度降序，预算满即停，
+        # 保住最相关文档，避免多文档全文拼接冲爆上下文窗口。
+        from ..utils import count_tokens as _count_tokens
+        try:
+            from ..reasoning import _get_max_context_tokens as _get_max_ctx
+            _max_ctx_tokens = _get_max_ctx()
+        except Exception:
+            _max_ctx_tokens = 16000
+        _used_ctx_tokens = 0
+
         for result in doc_results:
             doc_id = result["doc_id"]
             doc = result["doc"]
@@ -260,7 +270,13 @@ class AgenticRouter:
                 context = "".join(ctx_parts) if len(ctx_parts) > 1 else ""
 
             if context:
+                _ctx_tokens = _count_tokens(context)
+                # 已有上下文且加本篇会超预算 → 停止（doc_results 按相关度降序）
+                if contexts and _used_ctx_tokens + _ctx_tokens > _max_ctx_tokens:
+                    logging.info("[SuperTree] context budget reached; stop adding docs (%d kept)", len(contexts))
+                    break
                 contexts.append(context)
+                _used_ctx_tokens += _ctx_tokens
                 all_nodes.extend(selected)
                 source_docs += 1
                 doc_pages_map[doc_id] = sorted(set(pages))
@@ -303,6 +319,64 @@ class AgenticRouter:
         return "\n\n".join(contexts), all_nodes, source_docs, len(all_nodes), doc_pages_map, pages_with_text
 
     # ------------------------------------------------------------------
+    # Content-based lexical fallback (robustness for structureless docs)
+    # ------------------------------------------------------------------
+    def _content_fallback(self, query: str, top_k: int) -> list:
+        """BM25 over raw document content; used when the structure-based pipeline
+        yields nothing (e.g. short/structureless passages), so search never returns
+        empty just because a document has no hierarchical structure."""
+        import math, os
+        docs = getattr(self.client, "documents", {})
+        items = []
+        for uuid_id, info in docs.items():
+            content = ""
+            try:
+                pages = info.get("pages")
+                if pages:
+                    content = "\n".join(p.get("content", "") for p in pages if isinstance(p, dict))
+            except Exception:
+                pass
+            if not content:
+                path = info.get("path")
+                if path and os.path.exists(path):
+                    try:
+                        with open(path, encoding="utf-8") as f:
+                            content = f.read()
+                    except Exception:
+                        content = ""
+            if not content:
+                content = f"{info.get('doc_name','') or ''} {info.get('doc_description','') or ''}"
+            items.append((uuid_id, content))
+        if not items:
+            return []
+        try:
+            import jieba
+            tok = lambda t: [x for x in jieba.lcut(t or "") if x.strip()]
+        except Exception:
+            tok = lambda t: (t or "").split()
+        qt = tok(query)
+        dt = [tok(c) for _, c in items]
+        lens = [len(x) for x in dt]
+        avgdl = sum(lens) / len(lens) if lens else 1
+        df = {}
+        for toks in dt:
+            for t in set(toks):
+                df[t] = df.get(t, 0) + 1
+        n = len(items); k1 = 1.5; b = 0.75
+        def idf(t):
+            return math.log((n - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5) + 1)
+        scored = []
+        for i, (uuid_id, _c) in enumerate(items):
+            tf = {}
+            for t in dt[i]:
+                tf[t] = tf.get(t, 0) + 1
+            s = sum(idf(q) * (tf.get(q, 0) * (k1 + 1)) / (tf.get(q, 0) + k1 * (1 - b + b * lens[i] / avgdl))
+                    for q in qt if tf.get(q, 0) > 0)
+            scored.append((uuid_id, s))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [{"doc_id": u, "score": float(s)} for u, s in scored[:top_k] if s > 0]
+
+    # ------------------------------------------------------------------
     # Super-Tree search
     # ------------------------------------------------------------------
     async def _search_super_tree(self, query: str, top_k: int = 3) -> Dict:
@@ -333,6 +407,18 @@ class AgenticRouter:
         logging.info("[SuperTree] L0 candidates=%d", len(candidate_db_ids))
 
         if not candidate_db_ids:
+            fallback = self._content_fallback(query, top_k)
+            if fallback:
+                logging.info("[SuperTree] prefilter empty; content fallback -> %d docs", len(fallback))
+                return {
+                    "query": query,
+                    "mode": "multi",
+                    "answer": "",
+                    "confidence": "low",
+                    "matched_docs": fallback,
+                    "selected_nodes": [],
+                    "pages": [],
+                }
             return {
                 "query": query,
                 "mode": "multi",
@@ -347,6 +433,18 @@ class AgenticRouter:
         selected_uuids = await self.super_tree_index.select_documents(query, candidate_db_ids)
         logging.info("[SuperTree] L1 selected=%d docs: %s", len(selected_uuids), selected_uuids)
         if not selected_uuids:
+            fallback = self._content_fallback(query, top_k)
+            if fallback:
+                logging.info("[SuperTree] L1 empty; content fallback -> %d docs", len(fallback))
+                return {
+                    "query": query,
+                    "mode": "multi",
+                    "answer": "",
+                    "confidence": "low",
+                    "matched_docs": fallback,
+                    "selected_nodes": [],
+                    "pages": [],
+                }
             return {
                 "query": query,
                 "mode": "multi",

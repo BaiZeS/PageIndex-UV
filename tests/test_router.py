@@ -289,3 +289,41 @@ class TestSearchRouting:
         result = await router.search("test query", top_k=3)
         assert result["answer"] == "v2 answer"
         router._search_v2.assert_awaited_once_with("test query", 3)
+
+
+class TestActTreeSearchBudget:
+    """P0: 多文档上下文 token 预算——按相关度降序，预算满即停。"""
+
+    @pytest.mark.asyncio
+    async def test_context_budget_caps_docs(self, router):
+        import sys
+        import types
+
+        # count_tokens 已被 mock 为 len//4 → 每篇上下文 400 字符 = 100 token
+        # 预算设 150 → 只容得下 1 篇，第 2 篇会超 → 被预算截停
+        reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
+        reasoning_stub._get_max_context_tokens = lambda: 150
+        sys.modules["pageindex_mutil.reasoning"] = reasoning_stub
+
+        router._main_funcs = {
+            "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
+            "pages_from_nodes": lambda n: [1],
+        }
+
+        async def fake_recall(query, doc_id):
+            return {
+                "doc_id": doc_id,
+                "doc": {"doc_name": doc_id, "type": "md"},
+                "structure": [{"node_id": "n1"}],
+                "selected": [{"node_id": "n1", "text": "x" * 400}],
+                "pages": [1],
+                "relevance_score": 1.0,
+            }
+
+        router._recall_nodes_for_doc = fake_recall
+
+        _ctx, _nodes, src_docs, _cov, _dpm, _pwt = await router._act_tree_search(
+            "q", ["d1", "d2", "d3"]
+        )
+        # 预算 150、每篇 100 token → 仅 1 篇入上下文，其余被预算截停
+        assert src_docs == 1
