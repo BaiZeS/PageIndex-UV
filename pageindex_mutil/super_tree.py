@@ -149,6 +149,8 @@ class SuperTreeIndex:
     _REASON_KEEP_PER_GROUP = 3  # map 阶段每组保留的篇数
     # 三层重构-L0：各通道召回 top-k（并集召回，宁多勿漏，精排交给选择层）
     _L0_CHANNEL_TOPK = 30
+    # 三层重构-层级：集合标签匹配的软路由加权（加性提升，绝不硬删候选）
+    _HIERARCHY_BOOST_WEIGHT = 1.0
 
     def __init__(self, db, model: str, client, retrieve_model: str = None):
         self.db = db
@@ -175,6 +177,7 @@ class SuperTreeIndex:
             self._REASON_GROUP_SIZE = getattr(cfg, "reason_group_size", self._REASON_GROUP_SIZE)
             self._REASON_KEEP_PER_GROUP = getattr(cfg, "reason_keep_per_group", self._REASON_KEEP_PER_GROUP)
             self._L0_CHANNEL_TOPK = getattr(cfg, "l0_channel_topk", self._L0_CHANNEL_TOPK)
+            self._HIERARCHY_BOOST_WEIGHT = getattr(cfg, "hierarchy_boost_weight", self._HIERARCHY_BOOST_WEIGHT)
         except Exception:
             pass
 
@@ -535,11 +538,49 @@ class SuperTreeIndex:
         db_to_uuid = self._get_db_to_uuid()
         return [db_to_uuid[d] for d in selected_dbids if d in db_to_uuid]
 
+    def _hierarchy_boost(self, query: str, candidate_db_ids: Dict[int, float]) -> Dict[int, float]:
+        """三层重构-层级：集合标签软路由。
+
+        以 closet_tags 为"集合"层（每个标签=一个集合，文档软归属多个集合）。
+        对候选文档，若其集合标签与查询词有重叠，则按标签置信度加性提升分数。
+        软路由：只加权、绝不删除候选（吸取 H03 查询期硬过滤误删的教训）。
+        """
+        if not candidate_db_ids or jieba is None:
+            return candidate_db_ids
+
+        query_tokens = {
+            t.strip().lower() for t in jieba.lcut(query)
+            if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
+        }
+        if not query_tokens:
+            return candidate_db_ids
+
+        boosted: Dict[int, float] = {}
+        for db_id, score in candidate_db_ids.items():
+            boost = 0.0
+            try:
+                tags = self.db.get_doc_tags(db_id)
+            except Exception:
+                tags = []
+            for t in tags:
+                tag_text = t.get("tag_text", "")
+                if not tag_text:
+                    continue
+                tag_tokens = {
+                    x.strip().lower() for x in jieba.lcut(tag_text)
+                    if len(x.strip()) > 1
+                }
+                if query_tokens & tag_tokens:
+                    boost += float(t.get("confidence", 0.5))
+            boosted[db_id] = float(score) + boost * self._HIERARCHY_BOOST_WEIGHT
+        return boosted
+
     async def select_documents(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
         if not candidate_db_ids:
             return []
-        # 三层重构-选择层：推理式 map-reduce 选档（替代打分排序与查询期标签硬过滤）
-        return await self._select_documents_reasoning(query, candidate_db_ids)
+        # 三层重构-层级：集合标签软路由加权（不删候选），再推理式 map-reduce 选档
+        boosted = self._hierarchy_boost(query, candidate_db_ids)
+        return await self._select_documents_reasoning(query, boosted)
 
     # ------------------------------------------------------------------
     # Super-Tree builder

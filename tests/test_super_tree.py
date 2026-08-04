@@ -270,6 +270,23 @@ class TestSuperTreeIndex:
             result = await st.select_documents("test", {i: 1.0 for i in range(1, 10)})
         assert set(result) == {"uuid-1", "uuid-5", "uuid-9"}
 
+    def test_hierarchy_boost_soft_routing(self, super_tree_index):
+        """三层重构-层级：匹配查询的集合标签加性提升，绝不删除候选（软路由）。"""
+        st, db, client = super_tree_index
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        d2 = db.insert_document("b.pdf", "/tmp/b.pdf")
+        db.insert_closet_tags(d1, [(d1, "金融风控", "金融 风控", 0.9, "llm")])
+        boosted = st._hierarchy_boost("金融风控合规", {d1: 1.0, d2: 1.0})
+        # 标签匹配的 doc1 被提升；doc2 保持原分；两者都保留（不硬删）
+        assert boosted[d1] > boosted[d2]
+        assert d1 in boosted and d2 in boosted
+        assert boosted[d2] == 1.0
+
+    def test_hierarchy_boost_empty_candidates(self, super_tree_index):
+        """三层重构-层级：空候选原样返回。"""
+        st, db, client = super_tree_index
+        assert st._hierarchy_boost("q", {}) == {}
+
     @pytest.mark.asyncio
     async def test_score_candidates_empty(self, super_tree_index):
         """Q1 -- 空候选返回空列表，不调用 LLM。"""
