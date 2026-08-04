@@ -185,6 +185,49 @@ class PageIndexDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_entity_relations_subject ON entity_relations(subject_id);
                 CREATE INDEX IF NOT EXISTS idx_entity_relations_object ON entity_relations(object_id);
+
+                -- Corpus tree (P1): unified corpus-level topic hierarchy.
+                -- 文档→节点 is the real trunk; cluster layers above are inferred
+                -- scaffolding. Soft membership makes doc→cluster a DAG, so a doc
+                -- may attach to multiple clusters with weights (never hard-dropped).
+                CREATE TABLE IF NOT EXISTS corpus_tree_nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_id INTEGER REFERENCES corpus_tree_nodes(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    summary TEXT,
+                    level INTEGER NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'cluster',
+                    tag TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_corpus_tree_nodes_parent
+                    ON corpus_tree_nodes(parent_id);
+
+                CREATE TABLE IF NOT EXISTS corpus_tree_membership (
+                    doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    node_id INTEGER NOT NULL REFERENCES corpus_tree_nodes(id) ON DELETE CASCADE,
+                    weight REAL NOT NULL DEFAULT 1.0,
+                    PRIMARY KEY (doc_id, node_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_corpus_tree_membership_node
+                    ON corpus_tree_membership(node_id);
+
+                -- Canonical tag set + synonym mapping (tag normalization).
+                CREATE TABLE IF NOT EXISTS corpus_tag_norm (
+                    raw_tag TEXT PRIMARY KEY,
+                    canonical_tag TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_corpus_tag_norm_canonical
+                    ON corpus_tag_norm(canonical_tag);
+
+                -- Disposition records for cluster merge/split decisions.
+                CREATE TABLE IF NOT EXISTS corpus_tree_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id INTEGER,
+                    event_type TEXT NOT NULL,
+                    detail TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
             # Migrate: add doc_description if missing
@@ -485,7 +528,161 @@ class PageIndexDB:
         row = conn.execute("SELECT identity_text FROM kb_identity WHERE id = 1").fetchone()
         return row["identity_text"] if row else None
 
+    # ------------------------------------------------------------------
+    # Corpus tree methods (P1)
+    # ------------------------------------------------------------------
 
+    def corpus_tree_clear(self):
+        """Delete the whole corpus tree (nodes, memberships, events)."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM corpus_tree_membership")
+            conn.execute("DELETE FROM corpus_tree_nodes")
+            conn.execute("DELETE FROM corpus_tree_events")
+
+    def insert_corpus_tree_node(self, parent_id, title, summary, level,
+                                kind="cluster", tag=None):
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO corpus_tree_nodes (parent_id, title, summary, level, kind, tag)
+                VALUES (?, ?, ?, ?, ?, ?)
+                RETURNING id
+                """,
+                (parent_id, title, summary, level, kind, tag),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise RuntimeError("Failed to insert corpus tree node")
+            return row[0]
+
+    def update_corpus_tree_node(self, node_id, parent_id=None, title=None,
+                                summary=None, level=None):
+        """Update only the provided (non-None) fields of a corpus tree node."""
+        fields, values = [], []
+        if parent_id is not None:
+            fields.append("parent_id = ?")
+            values.append(parent_id)
+        if title is not None:
+            fields.append("title = ?")
+            values.append(title)
+        if summary is not None:
+            fields.append("summary = ?")
+            values.append(summary)
+        if level is not None:
+            fields.append("level = ?")
+            values.append(level)
+        if not fields:
+            return
+        values.append(node_id)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE corpus_tree_nodes SET {', '.join(fields)} WHERE id = ?",
+                values,
+            )
+
+    def delete_corpus_tree_node(self, node_id):
+        with self._connect() as conn:
+            conn.execute("DELETE FROM corpus_tree_nodes WHERE id = ?", (node_id,))
+
+    def get_corpus_tree_nodes(self):
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT * FROM corpus_tree_nodes ORDER BY level, id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_corpus_membership(self, doc_id, node_id, weight=1.0):
+        """Upsert a soft doc→cluster edge (a doc may attach to many clusters)."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO corpus_tree_membership (doc_id, node_id, weight)
+                VALUES (?, ?, ?)
+                ON CONFLICT(doc_id, node_id) DO UPDATE SET weight = excluded.weight
+                """,
+                (doc_id, node_id, weight),
+            )
+
+    def delete_corpus_memberships_for_node(self, node_id):
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM corpus_tree_membership WHERE node_id = ?", (node_id,)
+            )
+
+    def get_corpus_node_docs(self, node_id):
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT doc_id, weight FROM corpus_tree_membership WHERE node_id = ? "
+            "ORDER BY doc_id",
+            (node_id,),
+        ).fetchall()
+        return [(r["doc_id"], r["weight"]) for r in rows]
+
+    def get_corpus_doc_memberships(self, doc_id):
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT node_id, weight FROM corpus_tree_membership WHERE doc_id = ? "
+            "ORDER BY node_id",
+            (doc_id,),
+        ).fetchall()
+        return [(r["node_id"], r["weight"]) for r in rows]
+
+    def get_all_corpus_memberships(self):
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT doc_id, node_id, weight FROM corpus_tree_membership "
+            "ORDER BY doc_id, node_id"
+        ).fetchall()
+        return [(r["doc_id"], r["node_id"], r["weight"]) for r in rows]
+
+    def set_corpus_tag_norm_map(self, mapping):
+        """Replace the whole raw_tag→canonical_tag mapping."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM corpus_tag_norm")
+            conn.executemany(
+                "INSERT INTO corpus_tag_norm (raw_tag, canonical_tag) VALUES (?, ?)",
+                [(raw, canonical) for raw, canonical in mapping.items()],
+            )
+
+    def upsert_corpus_tag_norm(self, raw_tag, canonical_tag):
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO corpus_tag_norm (raw_tag, canonical_tag) VALUES (?, ?)
+                ON CONFLICT(raw_tag) DO UPDATE SET canonical_tag = excluded.canonical_tag
+                """,
+                (raw_tag, canonical_tag),
+            )
+
+    def get_corpus_tag_norm_map(self):
+        conn = self._connect()
+        rows = conn.execute("SELECT raw_tag, canonical_tag FROM corpus_tag_norm").fetchall()
+        return {r["raw_tag"]: r["canonical_tag"] for r in rows}
+
+    def get_corpus_canonical_tags(self):
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT DISTINCT canonical_tag FROM corpus_tag_norm ORDER BY canonical_tag"
+        ).fetchall()
+        return [r["canonical_tag"] for r in rows]
+
+    def insert_corpus_tree_event(self, node_id, event_type, detail=None):
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO corpus_tree_events (node_id, event_type, detail) VALUES (?, ?, ?)",
+                (node_id, event_type, detail),
+            )
+
+    def get_corpus_tree_events(self, event_type=None):
+        conn = self._connect()
+        if event_type:
+            rows = conn.execute(
+                "SELECT * FROM corpus_tree_events WHERE event_type = ? ORDER BY id",
+                (event_type,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM corpus_tree_events ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Entity and relationship methods

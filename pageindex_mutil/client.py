@@ -12,6 +12,7 @@ from .retrieve import get_document, get_document_structure, get_page_content
 from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, create_node_mapping, configure_llm
 from .closet_index import ClosetIndex
 from .super_tree import SuperTreeIndex
+from .corpus_tree import CorpusTreeBuilder
 from .page_index_liteparse import is_liteparse_format, liteparse_to_tree
 
 # Import search backends
@@ -105,6 +106,7 @@ class PageIndexClient:
         self.db = None
         self.closet_index = None
         self.super_tree_index = None
+        self.corpus_tree = None
         self.router = None
         self._id_mapper = DocIdMapper()
 
@@ -115,6 +117,7 @@ class PageIndexClient:
             self.db = PageIndexDB(db_path)
             self.closet_index = ClosetIndex(self.db, self.model, self.retrieve_model)
             self.super_tree_index = SuperTreeIndex(self.db, self.model, self, self.retrieve_model)
+            self.corpus_tree = CorpusTreeBuilder(self.db, self.model, self.retrieve_model)
             if AgenticRouter:
                 self.router = AgenticRouter(self, self.model, self.retrieve_model)
 
@@ -298,7 +301,14 @@ class PageIndexClient:
                 # Index Super-Tree keywords
                 if hasattr(self, 'super_tree_index') and self.super_tree_index:
                     self.super_tree_index.on_document_added(db_doc_id)
-                
+
+                # Corpus tree (P1): incremental attach after closet tags exist.
+                if self.corpus_tree:
+                    try:
+                        self.corpus_tree.update_for_document(db_doc_id)
+                    except Exception as e:
+                        logging.warning("Corpus tree incremental update failed: %s", e)
+
                 # Index in vector search backend
                 if self.search_backend and doc.get('structure'):
                     try:
@@ -367,6 +377,16 @@ class PageIndexClient:
         if self.workspace:
             self._save_doc(doc_id)
         return doc_id
+
+    def rebuild_corpus_tree(self) -> dict:
+        """Full (re)build of the corpus tree (P1). Returns the inspectable tree.
+
+        Use for initial construction or periodic structural adjustment; the
+        per-document incremental path is wired into index().
+        """
+        if not self.corpus_tree:
+            return {}
+        return self.corpus_tree.rebuild()
 
     @staticmethod
     def _make_meta_entry(doc: dict) -> dict:
