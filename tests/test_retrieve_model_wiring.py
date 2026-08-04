@@ -74,7 +74,7 @@ class TestRetrieveModelWiringPageIndexClient:
         st.kb_identity = MagicMock()
         st.kb_identity.get_identity.return_value = "kb"
         with patch.object(super_tree_mod, "llm_acompletion", return_value='{"doc_ids":[]}') as mock_llm:
-            asyncio.run(st.select_documents("q", {1: 1.0}))
+            asyncio.run(st.select_documents("q", {1: 1.0, 2: 1.0}))
             assert mock_llm.call_args[0][0] == "r-model"
 
     def test_super_tree_select_documents_falls_back_to_model(self):
@@ -85,7 +85,7 @@ class TestRetrieveModelWiringPageIndexClient:
         st.kb_identity = MagicMock()
         st.kb_identity.get_identity.return_value = "kb"
         with patch.object(super_tree_mod, "llm_acompletion", return_value='{"doc_ids":[]}') as mock_llm:
-            asyncio.run(st.select_documents("q", {1: 1.0}))
+            asyncio.run(st.select_documents("q", {1: 1.0, 2: 1.0}))
             assert mock_llm.call_args[0][0] == "m"
 
     def test_planner_uses_retrieve_model(self):

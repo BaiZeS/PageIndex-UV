@@ -144,6 +144,9 @@ class SuperTreeIndex:
     _RANK_K = 12
     _SELECT_TOP_K = 5
     _SCORE_RATIO = 0.5
+    # 三层重构-选择层：map-reduce 推理选择参数
+    _REASON_GROUP_SIZE = 10   # 候选 <= 该值走单次整体挑选；否则分组 map-reduce
+    _REASON_KEEP_PER_GROUP = 3  # map 阶段每组保留的篇数
 
     def __init__(self, db, model: str, client, retrieve_model: str = None):
         self.db = db
@@ -167,6 +170,8 @@ class SuperTreeIndex:
             self._RANK_K = getattr(cfg, "rank_k", self._RANK_K)
             self._SELECT_TOP_K = getattr(cfg, "select_top_k", self._SELECT_TOP_K)
             self._SCORE_RATIO = getattr(cfg, "score_ratio", self._SCORE_RATIO)
+            self._REASON_GROUP_SIZE = getattr(cfg, "reason_group_size", self._REASON_GROUP_SIZE)
+            self._REASON_KEEP_PER_GROUP = getattr(cfg, "reason_keep_per_group", self._REASON_KEEP_PER_GROUP)
         except Exception:
             pass
 
@@ -421,12 +426,116 @@ class SuperTreeIndex:
         # top_k 固定为配置值，不被 LLM 返回值控制，保证契约"取前 _SELECT_TOP_K"
         return result[: self._SELECT_TOP_K]
 
+    async def _holistic_select(self, query: str, db_ids: list[int], keep: int = None) -> list[int]:
+        """推理式整体挑选：LLM 从 db_ids 中挑选最相关的文档（可变数量，宁缺毋滥）。
+
+        与独立打分不同，这里让 LLM 横向比较后"挑选"，只返回真正可能相关的文档，
+        从机制上避免硬负样本稀释精确率。返回 db_id 列表。
+        """
+        if not db_ids:
+            return []
+        if len(db_ids) == 1:
+            return list(db_ids)
+
+        keep = keep or self._SELECT_TOP_K
+        super_tree = self._build_super_tree(db_ids)
+        kb_identity = self.kb_identity.get_identity()
+
+        # 预算保护：超限时缩减候选，避免挑选 prompt 过长。
+        tree_json = json.dumps(super_tree, ensure_ascii=False)
+        total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
+        while total_tokens > self._MAX_SUPER_TREE_TOKENS and len(super_tree["documents"]) > 2:
+            super_tree["documents"].pop()
+            tree_json = json.dumps(super_tree, ensure_ascii=False)
+            total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
+
+        prompt = f"""你是一个文档检索专家。给定用户问题、知识库概览和候选文档结构，请挑选出最可能包含答案的文档（最多 {keep} 篇）。
+
+[知识库概览]
+{kb_identity}
+
+[用户问题]
+{query}
+
+[候选文档结构]
+{tree_json}
+
+要求：
+1. 只挑真正可能包含答案的文档；若没有足够相关的，可以少选甚至不选。
+2. 宁缺毋滥：不要为凑数而挑选不相关的文档。
+3. 基于文档的章节标题和摘要判断相关性。
+
+返回JSON格式：
+{{"doc_ids": ["uuid-1", "uuid-2"]}}
+直接返回JSON，不要其他内容。"""
+
+        response = await llm_acompletion(self.retrieve_model or self.model, prompt)
+        if not response:
+            return []
+        data = extract_json(response)
+        if not isinstance(data, dict):
+            return []
+        picked = data.get("doc_ids", [])
+        if not isinstance(picked, list):
+            return []
+
+        uuid_to_db = {v: k for k, v in self._get_db_to_uuid().items()}
+        db_id_set = set(db_ids)
+        selected = []
+        for did in picked:
+            db_id = None
+            if isinstance(did, int):
+                db_id = did
+            elif isinstance(did, str):
+                db_id = uuid_to_db.get(did)
+            if db_id is not None and db_id in db_id_set and db_id not in selected:
+                selected.append(db_id)
+        return selected[:keep]
+
+    async def _select_documents_reasoning(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
+        """三层重构-选择层：map-reduce 推理式选档。
+
+        小候选集(<= _REASON_GROUP_SIZE)走单次整体挑选；大候选集先分组 map
+        (每组挑选 top-_REASON_KEEP_PER_GROUP)，再 reduce 精选出最终 top-k。
+        全程"推理挑选"而非"独立打分"，返回 uuid 列表。
+        """
+        truncated = self._truncate_candidates(candidate_db_ids)
+        if not truncated:
+            return []
+
+        if len(truncated) <= self._REASON_GROUP_SIZE:
+            selected_dbids = await self._holistic_select(query, truncated)
+        else:
+            groups = [
+                truncated[i:i + self._REASON_GROUP_SIZE]
+                for i in range(0, len(truncated), self._REASON_GROUP_SIZE)
+            ]
+            map_tasks = [
+                self._holistic_select(query, g, keep=self._REASON_KEEP_PER_GROUP)
+                for g in groups
+            ]
+            map_results = await asyncio.gather(*map_tasks, return_exceptions=True)
+            winners = []
+            for r in map_results:
+                if isinstance(r, list):
+                    for db_id in r:
+                        if db_id not in winners:
+                            winners.append(db_id)
+            if not winners:
+                return []
+            if len(winners) <= self._SELECT_TOP_K:
+                selected_dbids = winners
+            else:
+                selected_dbids = await self._holistic_select(query, winners)
+
+        db_to_uuid = self._get_db_to_uuid()
+        return [db_to_uuid[d] for d in selected_dbids if d in db_to_uuid]
+
     async def select_documents(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
         if not candidate_db_ids:
             return []
-        # 阶段3 形态1：先按领域标签选集合，缩小候选再精排
-        narrowed = await self._select_tag_sets(query, candidate_db_ids)
-        return await self._score_candidates(query, narrowed)
+        # 三层重构-选择层：推理式 map-reduce 选档（替代打分排序与查询期标签硬过滤）
+        return await self._select_documents_reasoning(query, candidate_db_ids)
 
     # ------------------------------------------------------------------
     # Super-Tree builder

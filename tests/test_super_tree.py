@@ -176,6 +176,7 @@ def super_tree_index():
     client._uuid_to_db = {}
     client.documents = {}
     client.closet_index = None
+    client._id_mapper = None  # 让 _get_db_to_uuid 回退到 _uuid_to_db
     st = SuperTreeIndex(db, model="qwen-plus", client=client)
     yield st, db, client
     db.close()
@@ -217,37 +218,57 @@ class TestSuperTreeIndex:
         assert len(results) == 0
 
     @pytest.mark.asyncio
-    async def test_select_documents(self, super_tree_index):
+    async def test_select_documents_reasoning_picks_subset(self, super_tree_index):
+        """三层重构-选择层：推理式挑选只返回 LLM 选中的文档子集（uuid）。"""
         with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
-            mock_llm.return_value = '{"ranked": [{"doc_id": "uuid-1", "score": 0.9, "reason": "x"}], "top_k": 1}'
-            st, db, client = super_tree_index
-            client.documents = {"uuid-1": {"id": "uuid-1", "doc_name": "test.pdf"}}
-            client._uuid_to_db = {"uuid-1": 1}
-            db.insert_document("test.pdf", "/tmp/test.pdf")
-
-            result = await st.select_documents("test", {1: 1.0})
-            assert "uuid-1" in result
-
-    @pytest.mark.asyncio
-    async def test_select_documents_returns_topk_scored(self, super_tree_index):
-        """Q1 -- 打分式精排按相关性分数取前 _SELECT_TOP_K，仍返回 uuid 列表。"""
-        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
-            mock_llm.return_value = json.dumps({
-                "ranked": [
-                    {"doc_id": "uuid-a", "score": 0.9, "reason": "直接相关"},
-                    {"doc_id": "uuid-b", "score": 0.6, "reason": "部分相关"},
-                    {"doc_id": "uuid-c", "score": 0.2, "reason": "弱相关"},
-                ],
-                "top_k": 2,
-            })
+            mock_llm.return_value = json.dumps({"doc_ids": ["uuid-a"]})
             st, db, client = super_tree_index
             client.documents = {"uuid-a": {"id": "uuid-a"}, "uuid-b": {"id": "uuid-b"}, "uuid-c": {"id": "uuid-c"}}
             client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2, "uuid-c": 3}
             for i in (1, 2, 3):
                 db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
             result = await st.select_documents("test", {1: 1.0, 2: 1.0, 3: 1.0})
-            assert set(result) == {"uuid-a", "uuid-b"}
-            assert "uuid-c" not in result
+            assert result == ["uuid-a"]
+
+    @pytest.mark.asyncio
+    async def test_select_documents_reasoning_variable_count(self, super_tree_index):
+        """三层重构-选择层：宁缺毋滥——LLM 只挑 1 篇时不强行凑满 top_k（精确率修复核心）。"""
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = json.dumps({"doc_ids": ["uuid-b"]})
+            st, db, client = super_tree_index
+            client.documents = {"uuid-a": {"id": "uuid-a"}, "uuid-b": {"id": "uuid-b"}, "uuid-c": {"id": "uuid-c"}}
+            client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2, "uuid-c": 3}
+            for i in (1, 2, 3):
+                db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
+            result = await st.select_documents("test", {1: 1.0, 2: 1.0, 3: 1.0})
+            assert result == ["uuid-b"]
+            assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_select_documents_reasoning_empty_candidates(self, super_tree_index):
+        """三层重构-选择层：空候选返回空列表。"""
+        st, db, client = super_tree_index
+        result = await st.select_documents("test", {})
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_select_documents_reasoning_map_reduce(self, super_tree_index):
+        """三层重构-选择层：候选 > group_size 时走 map-reduce，各组胜者并集。"""
+        st, db, client = super_tree_index
+        st._REASON_GROUP_SIZE = 4  # 9 候选 → 分组 [4,4,1]
+        docs = {f"uuid-{i}": i for i in range(1, 10)}
+        client.documents = {u: {"id": u} for u in docs}
+        client._uuid_to_db = dict(docs)
+        for i in range(1, 10):
+            db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
+        # map：组1 挑 uuid-1，组2 挑 uuid-5；组3 单候选短路不调 LLM
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.side_effect = [
+                json.dumps({"doc_ids": ["uuid-1"]}),
+                json.dumps({"doc_ids": ["uuid-5"]}),
+            ]
+            result = await st.select_documents("test", {i: 1.0 for i in range(1, 10)})
+        assert set(result) == {"uuid-1", "uuid-5", "uuid-9"}
 
     @pytest.mark.asyncio
     async def test_score_candidates_empty(self, super_tree_index):
