@@ -86,8 +86,10 @@ class ChromaSearchBackend(SearchBackend):
                         "sentence-transformers is required for local embeddings. "
                         "Install with: pip install sentence-transformers"
                     )
-                # Use a lightweight multilingual model
-                self._embedder = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+                # Use a lightweight multilingual model (configurable for offline use via EMBEDDING_MODEL)
+                import os
+                _emb_model = os.getenv("EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
+                self._embedder = SentenceTransformer(_emb_model)
             elif self.embedding_model == "ollama":
                 # TODO: Implement Ollama embedding support
                 raise NotImplementedError("Ollama embedding not yet implemented")

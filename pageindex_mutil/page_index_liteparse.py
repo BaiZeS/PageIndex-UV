@@ -20,7 +20,7 @@ LITEPARSE_EXTENSIONS = frozenset({
     '.odt', '.ods', '.odp',
     '.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif', '.webp',
     '.html', '.htm',
-    '.txt', '.csv', '.rtf',
+    '.csv', '.rtf',
 })
 
 

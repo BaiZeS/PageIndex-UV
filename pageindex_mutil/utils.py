@@ -67,8 +67,10 @@ def configure_llm(api_key=None, base_url=None):
     global _client, _async_client
     key, url = _resolve_llm_config(api_key=api_key, base_url=base_url)
     if key:
-        _client = OpenAI(api_key=key, base_url=url)
-        _async_client = AsyncOpenAI(api_key=key, base_url=url)
+        # Per-call timeout (env LLM_TIMEOUT, default 180s) so a hung request cannot stall the pipeline forever.
+        _timeout = float(os.getenv("LLM_TIMEOUT", "180"))
+        _client = OpenAI(api_key=key, base_url=url, timeout=_timeout)
+        _async_client = AsyncOpenAI(api_key=key, base_url=url, timeout=_timeout)
     else:
         _client = None
         _async_client = None
@@ -150,7 +152,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 return cached, "cached"
             return cached
 
-    max_retries = 10
+    max_retries = 3
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
     for i in range(max_retries):
         try:
@@ -184,7 +186,7 @@ async def llm_acompletion(model, prompt):
     if not _async_client:
         logging.error("AsyncOpenAI client not initialized.")
         return ""
-    max_retries = 10
+    max_retries = 3
     messages = [{"role": "user", "content": prompt}]
     for i in range(max_retries):
         try:
