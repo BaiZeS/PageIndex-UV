@@ -48,6 +48,10 @@ tau_low: 0.4
 rank_k: 12
 select_top_k: 5
 score_ratio: 0.5
+# 三层重构参数
+reason_group_size: 10
+reason_keep_per_group: 3
+l0_channel_topk: 30
 
 # LiteParse multi-format parsing
 liteparse_ocr_enabled: true

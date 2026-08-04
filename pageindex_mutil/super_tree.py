@@ -147,6 +147,8 @@ class SuperTreeIndex:
     # 三层重构-选择层：map-reduce 推理选择参数
     _REASON_GROUP_SIZE = 10   # 候选 <= 该值走单次整体挑选；否则分组 map-reduce
     _REASON_KEEP_PER_GROUP = 3  # map 阶段每组保留的篇数
+    # 三层重构-L0：各通道召回 top-k（并集召回，宁多勿漏，精排交给选择层）
+    _L0_CHANNEL_TOPK = 30
 
     def __init__(self, db, model: str, client, retrieve_model: str = None):
         self.db = db
@@ -172,6 +174,7 @@ class SuperTreeIndex:
             self._SCORE_RATIO = getattr(cfg, "score_ratio", self._SCORE_RATIO)
             self._REASON_GROUP_SIZE = getattr(cfg, "reason_group_size", self._REASON_GROUP_SIZE)
             self._REASON_KEEP_PER_GROUP = getattr(cfg, "reason_keep_per_group", self._REASON_KEEP_PER_GROUP)
+            self._L0_CHANNEL_TOPK = getattr(cfg, "l0_channel_topk", self._L0_CHANNEL_TOPK)
         except Exception:
             pass
 
@@ -223,11 +226,12 @@ class SuperTreeIndex:
           C: Vector search via ChromaDB (if available)
         """
         scores: Dict[int, float] = {}
+        topk = self._L0_CHANNEL_TOPK
 
         # Channel A: tag matching (ClosetIndex)
         if hasattr(self.client, "closet_index") and self.client.closet_index:
             try:
-                tag_results = self.client.closet_index.search(query, top_k=20)
+                tag_results = self.client.closet_index.search(query, top_k=topk)
                 for doc_id, score in tag_results:
                     scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(score)
             except Exception as e:
@@ -235,7 +239,7 @@ class SuperTreeIndex:
 
         # Channel B: keyword inverted index
         try:
-            keyword_results = self.keyword_index.search(query, top_k=20)
+            keyword_results = self.keyword_index.search(query, top_k=topk)
             for doc_id, score in keyword_results:
                 scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(score)
         except Exception as e:
@@ -244,7 +248,7 @@ class SuperTreeIndex:
         # Channel C: vector search (ChromaDB)
         if hasattr(self.client, "search_backend") and self.client.search_backend:
             try:
-                vector_results = self.client.search_backend.search(query, top_k=20)
+                vector_results = self.client.search_backend.search(query, top_k=topk)
                 for doc_id, score in vector_results:
                     # Weight vector results higher for semantic understanding
                     scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(score) * 1.5
@@ -254,7 +258,7 @@ class SuperTreeIndex:
         # Channel D: entity graph matching
         if hasattr(self.client, "db") and self.client.db:
             try:
-                entities = self.client.db.search_entities(query, limit=10)
+                entities = self.client.db.search_entities(query, limit=topk)
                 for entity in entities:
                     entity_id = entity.get("id")
                     if entity_id:
