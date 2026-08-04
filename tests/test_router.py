@@ -295,11 +295,20 @@ class TestActTreeSearchBudget:
     """P0: 多文档上下文 token 预算——按相关度降序，预算满即停。"""
 
     @pytest.mark.asyncio
-    async def test_context_budget_caps_docs(self, router):
+    async def test_context_budget_caps_docs(self, router, monkeypatch):
         import sys
         import types
 
-        # count_tokens 已被 mock 为 len//4 → 每篇上下文 400 字符 = 100 token
+        # 其他测试文件（test_retrieve_model_wiring）运行时会把
+        # sys.modules["pageindex_mutil.utils"] 换成真实模块（tiktoken count_tokens，
+        # "x"*400 只算 50 token），导致预算截停失效。在当前模块对象上钉住 len//4
+        # stub，使本测试与执行顺序无关。
+        monkeypatch.setattr(
+            sys.modules["pageindex_mutil.utils"], "count_tokens",
+            lambda text, model=None: len(text or "") // 4,
+        )
+
+        # count_tokens mock 为 len//4 → 每篇上下文 400 字符 = 100 token
         # 预算设 150 → 只容得下 1 篇，第 2 篇会超 → 被预算截停
         reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
         reasoning_stub._get_max_context_tokens = lambda: 150
