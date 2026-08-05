@@ -222,7 +222,8 @@ class CorpusTreeBuilder:
         data = self._llm_json(prompt)
         if isinstance(data, dict):
             canonical = str(data.get("canonical", "")).strip()
-            if canonical:
+            # 只接受已有规范标签（并入）；其他名字视为幻觉，退回原标签新开
+            if canonical and canonical in canonical_tags:
                 return canonical
         return raw_tag
 
@@ -378,11 +379,11 @@ class CorpusTreeBuilder:
                 json.dumps({"cluster": node["title"], "reason": "no_candidates"},
                            ensure_ascii=False))
             return False
-        decided, target = self._llm_merge_target(node, docs, candidates)
+        decided, target, reason = self._llm_merge_target(node, docs, candidates)
         if not decided:
             self.db.insert_corpus_tree_event(
                 node["id"], "merge_skipped",
-                json.dumps({"cluster": node["title"], "reason": "llm_unavailable"},
+                json.dumps({"cluster": node["title"], "reason": reason},
                            ensure_ascii=False))
             return False
         if target is None:
@@ -396,6 +397,7 @@ class CorpusTreeBuilder:
             self.db.add_corpus_membership(did, target["id"], max(w, target_weights.get(did, 0.0)))
         self.db.delete_corpus_memberships_for_node(node["id"])
         self.db.delete_corpus_tree_node(node["id"])
+        self._remap_victim_tag(node, target)
         self.db.insert_corpus_tree_event(
             target["id"], "merge",
             json.dumps({"from": node["title"], "into": target["title"], "docs": len(docs)},
@@ -403,7 +405,8 @@ class CorpusTreeBuilder:
         return True
 
     def _llm_merge_target(self, node: dict, docs: List[tuple], candidates: List[dict]):
-        """返回 (decided, target)。decided=False 表示 LLM 不可用。"""
+        """返回 (decided, target, reason)。decided=False 时 reason 为处置原因：
+        llm_unavailable（无响应/调用失败）或 invalid_response（响应格式非法）。"""
         counts = self._node_doc_counts()
         cand_info = [
             {"title": c["title"], "summary": c["summary"] or "",
@@ -419,16 +422,18 @@ class CorpusTreeBuilder:
 返回JSON格式：{{"target": "目标簇标题 或 null"}}
 直接返回最终JSON结构，不要输出其他内容。"""
         data = self._llm_json(prompt)
+        if data is None:
+            return False, None, "llm_unavailable"
         if not isinstance(data, dict) or "target" not in data:
-            return False, None
+            return False, None, "invalid_response"
         title = data.get("target")
         if title is None:
-            return True, None
+            return True, None, None
         title = str(title).strip()
         for c in candidates:
             if c["title"] == title:
-                return True, c
-        return True, None
+                return True, c, None
+        return True, None, None
 
     # ------------------------------------------------------------------
     # [S3.1] 合并保护：过相似的兄弟簇合并（宁缺毋滥，全程无向量）
@@ -477,10 +482,18 @@ class CorpusTreeBuilder:
                 did, target["id"], max(w, target_weights.get(did, 0.0)))
         self.db.delete_corpus_memberships_for_node(victim["id"])
         self.db.delete_corpus_tree_node(victim["id"])
+        self._remap_victim_tag(victim, target)
         self.db.insert_corpus_tree_event(
             target["id"], "merge_similar",
             json.dumps({"from": victim["title"], "into": target["title"],
                         "docs": len(docs)}, ensure_ascii=False))
+        # 合并发生在卡界 pass 之后：合并结果可能超限，必须复检（超则拆分）
+        self._split_if_oversized(target["id"])
+
+    def _remap_victim_tag(self, victim: dict, target: dict) -> None:
+        """victim 规范标签改道至幸存簇——否则增量文档会复活被合并的簇。"""
+        if victim.get("tag") and target.get("tag"):
+            self.db.remap_corpus_tag_norm(victim["tag"], target["tag"])
 
     def _llm_similar_pairs(self, siblings: List[dict]) -> Optional[List[tuple]]:
         """一次有界 LLM 调用找出过相似簇对；失败/非法返回空（不合并）。

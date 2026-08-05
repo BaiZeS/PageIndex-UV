@@ -161,6 +161,18 @@ class TestCorpusTreeStorage:
         tmp_db.set_corpus_tag_norm_map({"风控": "风险管理", "风险管理": "风险管理", "合规": "合规"})
         assert sorted(tmp_db.get_corpus_canonical_tags()) == ["合规", "风险管理"]
 
+    def test_remap_corpus_tag_norm(self, tmp_db):
+        """簇合并后规范标签改道：原指向 victim 规范的原始标签全部改指幸存规范。"""
+        tmp_db.set_corpus_tag_norm_map({
+            "风控": "风控管理", "风控管理": "风控管理", "风险管理": "风险管理",
+        })
+        tmp_db.remap_corpus_tag_norm("风控管理", "风险管理")
+        m = tmp_db.get_corpus_tag_norm_map()
+        assert m["风控"] == "风险管理"
+        assert m["风控管理"] == "风险管理"
+        assert m["风险管理"] == "风险管理"
+        assert sorted(tmp_db.get_corpus_canonical_tags()) == ["风险管理"]
+
     def test_membership_upsert_and_queries(self, tmp_db):
         doc_id = tmp_db.insert_document("a.pdf", "/tmp/a.pdf")
         node_id = tmp_db.insert_corpus_tree_node(None, "风险管理", "s", 1, kind="cluster", tag="风险管理")
@@ -264,7 +276,7 @@ class TestDeterministicGrouping:
         assert by_title["风险管理"] == {d1, d2}
         assert by_title["前端开发"] == {d3}
 
-    def test_grouping_issues_no_llm_calls(self, tmp_db):
+    def test_grouping_incurs_no_llm_calls(self, tmp_db):
         """分组是纯倒排 group-by：除标签归一与合并保护外不产生 LLM 调用。"""
         for i in range(4):
             _add_doc(tmp_db, f"a{i}.pdf", [("风险管理", 0.9)])
@@ -412,6 +424,37 @@ class TestClusterSizeBounds:
         events = tmp_db.get_corpus_tree_events()
         assert any(e["event_type"] == "merge_skipped" for e in events)
 
+    def _small_cluster_setup(self, tmp_db):
+        """一大簇（风险管理 3 篇）+ 一小簇（合规 1 篇），cluster_min=2 触发过小合并裁定。"""
+        d_big = [_add_doc(tmp_db, f"big{i}.pdf", [("风险管理", 0.9)]) for i in range(3)]
+        d_small = _add_doc(tmp_db, "small.pdf", [("合规", 0.9)])
+        norm = json.dumps({"groups": [
+            {"canonical": "风险管理", "synonyms": ["风险管理"]},
+            {"canonical": "合规", "synonyms": ["合规"]}]})
+        return d_big, d_small, norm
+
+    def test_merge_skipped_llm_unavailable_reason(self, tmp_db):
+        """LLM 无响应（空回复）→ merge_skipped 记录 reason=llm_unavailable。"""
+        d_big, d_small, norm = self._small_cluster_setup(tmp_db)
+        fake = _route_llm({M_NORM: norm, M_MERGE: ""})
+        with patch.object(corpus_tree_mod, "llm_completion", side_effect=fake):
+            tree = CorpusTreeBuilder(tmp_db, model="m", cluster_min=2, cluster_max=50).rebuild()
+        assert _all_doc_ids(tree) == set(d_big) | {d_small}
+        skipped = tmp_db.get_corpus_tree_events(event_type="merge_skipped")
+        assert len(skipped) == 1
+        assert json.loads(skipped[0]["detail"])["reason"] == "llm_unavailable"
+
+    def test_merge_skipped_invalid_response_reason(self, tmp_db):
+        """LLM 有响应但格式非法（缺 target 字段）→ reason=invalid_response（区别于不可用）。"""
+        d_big, d_small, norm = self._small_cluster_setup(tmp_db)
+        fake = _route_llm({M_NORM: norm, M_MERGE: json.dumps({"bogus": 1})})
+        with patch.object(corpus_tree_mod, "llm_completion", side_effect=fake):
+            tree = CorpusTreeBuilder(tmp_db, model="m", cluster_min=2, cluster_max=50).rebuild()
+        assert _all_doc_ids(tree) == set(d_big) | {d_small}
+        skipped = tmp_db.get_corpus_tree_events(event_type="merge_skipped")
+        assert len(skipped) == 1
+        assert json.loads(skipped[0]["detail"])["reason"] == "invalid_response"
+
 
 # ---------------------------------------------------------------------------
 # 合并保护：过相似的兄弟簇合并（[S3.1] 细而不碎·主动闸门）
@@ -466,6 +509,57 @@ class TestSimilarMergeProtection:
         assert len(leaves) == 2
         assert _all_doc_ids(tree) == set(d1) | set(d2)
         assert tmp_db.get_corpus_tree_events(event_type="merge_similar") == []
+
+    def test_similar_merge_result_revalidated_within_bounds(self, tmp_db):
+        """回归（Important #1）：两个近上限簇合并后必须复检卡界——
+        合并产生超限簇时立即拆分，结果全部 ≤ cluster_max 且留 split 记录。"""
+        d1 = [_add_doc(tmp_db, f"a{i}.pdf", [("风险管理", 0.9)]) for i in range(6)]
+        d2 = [_add_doc(tmp_db, f"b{i}.pdf", [("风控管理", 0.9)]) for i in range(6)]
+        fake = _route_llm({
+            M_NORM: json.dumps({"groups": [
+                {"canonical": "风险管理", "synonyms": ["风险管理"]},
+                {"canonical": "风控管理", "synonyms": ["风控管理"]}]}),
+            M_SIMILAR: json.dumps({"pairs": [["风险管理", "风控管理"]]}),
+            M_SPLIT: "",  # 逼确定性均分兜底
+        })
+        with patch.object(corpus_tree_mod, "llm_completion", side_effect=fake):
+            tree = CorpusTreeBuilder(tmp_db, model="m", cluster_min=2, cluster_max=8).rebuild()
+        leaves = _leaf_clusters(tree)
+        # 合并后 12 篇 > max=8：不得以单一 12 篇簇收尾（验收 3）
+        assert all(len(c["docs"]) <= 8 for c in leaves)
+        assert _all_doc_ids(tree) == set(d1) | set(d2)
+        assert len(tmp_db.get_corpus_tree_events(event_type="split")) >= 1
+
+    def test_merged_victim_tag_not_resurrected_incrementally(self, tmp_db):
+        """回归（Important #2）：被合并簇的规范标签必须改道到幸存簇——
+        增量文档携带 victim 标签（LLM 不可用）时挂入幸存簇，不得复活 victim 簇。"""
+        # 风险管理 3 篇（规模较大 → 合并时幸存），风控管理 2 篇（victim）
+        [_add_doc(tmp_db, f"a{i}.pdf", [("风险管理", 0.9)]) for i in range(3)]
+        [_add_doc(tmp_db, f"b{i}.pdf", [("风控管理", 0.9)]) for i in range(2)]
+        fake = _route_llm({
+            M_NORM: json.dumps({"groups": [
+                {"canonical": "风险管理", "synonyms": ["风险管理"]},
+                {"canonical": "风控管理", "synonyms": ["风控管理"]}]}),
+            M_SIMILAR: json.dumps({"pairs": [["风险管理", "风控管理"]]}),
+        })
+        with patch.object(corpus_tree_mod, "llm_completion", side_effect=fake):
+            b = CorpusTreeBuilder(tmp_db, model="m", cluster_min=2, cluster_max=50)
+            tree = b.rebuild()
+        leaves = _leaf_clusters(tree)
+        assert len(leaves) == 1 and leaves[0]["title"] == "风险管理"
+        # norm map：victim 规范标签改道至幸存规范
+        assert tmp_db.get_corpus_tag_norm_map()["风控管理"] == "风险管理"
+        # 增量文档携带 victim 原始标签，LLM 完全不可用
+        d_new = _add_doc(tmp_db, "new.pdf", [("风控管理", 0.8)])
+        with patch.object(corpus_tree_mod, "llm_completion", return_value=""):
+            b.update_for_document(d_new)
+        mem = tmp_db.get_corpus_doc_memberships(d_new)
+        assert len(mem) == 1
+        node = next(n for n in tmp_db.get_corpus_tree_nodes() if n["id"] == mem[0][0])
+        assert node["title"] == "风险管理"  # 挂入幸存簇
+        # victim 簇未被复活、未新开簇
+        assert all(n["title"] != "风控管理" for n in tmp_db.get_corpus_tree_nodes())
+        assert tmp_db.get_corpus_tree_events(event_type="new_cluster") == []
 
     def test_similar_llm_failure_no_merge_no_crash(self, tmp_db):
         """(c) LLM 失败（抛异常）→ 不合并、不崩溃（自动造的树错了比没有树更糟）。"""
@@ -589,6 +683,39 @@ class TestIncrementalUpdate:
         assert node["title"] == "前端开发"
         assert any(e["event_type"] == "new_cluster" for e in tmp_db.get_corpus_tree_events())
 
+    def test_adjudicate_attach_branch_attaches_existing_cluster(self, tmp_db):
+        """Minor #6：挂簇裁定 attach 分支——LLM 裁定并入现有簇，不新开簇。"""
+        b = self._build_base(tmp_db)  # 已有 风险管理 簇
+        d_new = _add_doc(tmp_db, "new.pdf", [("风控", 0.8)])
+        fake = _route_llm({
+            M_NORM: json.dumps({"canonical": "风控"}),  # 新开规范标签（原标签名）
+            M_ATTACH: json.dumps({"action": "attach", "target": "风险管理"}),
+        })
+        with patch.object(corpus_tree_mod, "llm_completion", side_effect=fake):
+            b.update_for_document(d_new)
+        mem = tmp_db.get_corpus_doc_memberships(d_new)
+        assert len(mem) == 1
+        node = next(n for n in tmp_db.get_corpus_tree_nodes() if n["id"] == mem[0][0])
+        assert node["title"] == "风险管理"  # attach 到现有簇
+        assert tmp_db.get_corpus_tree_events(event_type="new_cluster") == []
+
+    def test_resolve_new_tag_hallucinated_canonical_falls_back_to_raw(self, tmp_db):
+        """Minor #3：LLM 裁定返回不在已有规范集中的标签名（幻觉）→ 退回原标签。"""
+        b = self._build_base(tmp_db)  # 已有规范集 = {风险管理}
+        d_new = _add_doc(tmp_db, "new.pdf", [("前端开发", 0.8)])
+        fake = _route_llm({
+            M_NORM: json.dumps({"canonical": "不存在的幻觉标签"}),
+            M_ATTACH: json.dumps({"action": "create", "title": "前端开发", "summary": "前端"}),
+        })
+        with patch.object(corpus_tree_mod, "llm_completion", side_effect=fake):
+            b.update_for_document(d_new)
+        # 幻觉规范名不被采纳：norm map 以原标签为规范
+        assert tmp_db.get_corpus_tag_norm_map()["前端开发"] == "前端开发"
+        mem = tmp_db.get_corpus_doc_memberships(d_new)
+        assert len(mem) == 1
+        node = next(n for n in tmp_db.get_corpus_tree_nodes() if n["id"] == mem[0][0])
+        assert node["tag"] == "前端开发"
+
     def test_insert_evaluates_bounds_split_on_overflow(self, tmp_db):
         """增量②：每次插入评估卡界 —— 挂簇后超上限立即拆分。"""
         b = self._build_base(tmp_db, cluster_min=1, cluster_max=2)
@@ -680,6 +807,33 @@ class TestClientWiring:
         client = PageIndexClient()
         try:
             assert client.corpus_tree is None
+        finally:
+            client.close()
+
+    def test_rebuild_corpus_tree_returns_empty_without_db(self):
+        PageIndexClient = _import_real_client()
+        client = PageIndexClient()
+        try:
+            assert client.rebuild_corpus_tree() == {}
+        finally:
+            client.close()
+
+    def test_rebuild_corpus_tree_builds_tree_with_db(self, tmp_path):
+        """Minor #6：rebuild_corpus_tree() 委托 CorpusTreeBuilder.rebuild 并返回可检视树。"""
+        PageIndexClient = _import_real_client()
+        ct_mod = sys.modules["pageindex_mutil.corpus_tree"]
+        client = PageIndexClient(db_path=str(tmp_path / "t.db"), search_backend="keyword")
+        try:
+            doc_id = client.db.insert_document("a.pdf", "/tmp/a.pdf")
+            client.db.insert_closet_tags(
+                doc_id, [(doc_id, "风险管理", "风险管理", 0.9, "llm")])
+            fake = _route_llm({M_NORM: json.dumps({"groups": [
+                {"canonical": "风险管理", "synonyms": ["风险管理"]}]})})
+            with patch.object(ct_mod, "llm_completion", side_effect=fake):
+                tree = client.rebuild_corpus_tree()
+            assert tree["title"] == "知识库"
+            assert tree["kind"] == "root"
+            assert _all_doc_ids(tree) == {doc_id}
         finally:
             client.close()
 

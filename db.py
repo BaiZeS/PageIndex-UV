@@ -666,6 +666,18 @@ class PageIndexDB:
         ).fetchall()
         return [r["canonical_tag"] for r in rows]
 
+    def remap_corpus_tag_norm(self, from_canonical, to_canonical):
+        """Route every raw tag mapping to from_canonical at to_canonical.
+
+        Used after a cluster merge so incremental docs carrying the victim's
+        tag attach to the survivor instead of resurrecting the victim cluster.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE corpus_tag_norm SET canonical_tag = ? WHERE canonical_tag = ?",
+                (to_canonical, from_canonical),
+            )
+
     def insert_corpus_tree_event(self, node_id, event_type, detail=None):
         with self._connect() as conn:
             conn.execute(
