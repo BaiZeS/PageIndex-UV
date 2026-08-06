@@ -166,8 +166,8 @@ class TestInsertEntityMentionsBatch:
         doc1 = tmp_db.insert_document("a.pdf", "/tmp/a.pdf")
         doc2 = tmp_db.insert_document("b.pdf", "/tmp/b.pdf")
         records = [
-            (eid, doc1, "Alice in doc1", 0.9),
-            (eid, doc2, "Alice in doc2", 0.8),
+            (eid, doc1, None, "Alice in doc1", 0.9),
+            (eid, doc2, None, "Alice in doc2", 0.8),
         ]
         tmp_db.insert_entity_mentions_batch(records)
         docs = tmp_db.get_entity_documents(eid)

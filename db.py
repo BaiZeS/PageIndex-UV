@@ -804,7 +804,7 @@ class PageIndexDB:
     def insert_entity_mentions_batch(self, records: list[tuple]) -> None:
         """Batch insert entity mentions.
 
-        Each record = (entity_id, doc_id, context_snippet, confidence).
+        Each record = (entity_id, doc_id, node_id, context_snippet, confidence).
         Uses executemany for efficiency; updates doc_count per unique entity.
         """
         if not records:
@@ -812,8 +812,8 @@ class PageIndexDB:
         with self._connect() as conn:
             conn.executemany(
                 """
-                INSERT INTO entity_mentions (entity_id, doc_id, context_snippet, confidence)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO entity_mentions (entity_id, doc_id, node_id, context_snippet, confidence)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 records,
             )
@@ -878,8 +878,9 @@ class PageIndexDB:
         if len(_TOKENIZE_CACHE) >= _TOKENIZE_CACHE_MAX:
             oldest_key = min(_TOKENIZE_CACHE, key=lambda k: _TOKENIZE_CACHE[k][1])
             del _TOKENIZE_CACHE[oldest_key]
-        _TOKENIZE_CACHE[query] = (result, now)
-        return result
+        frozen = tuple(result)
+        _TOKENIZE_CACHE[query] = (frozen, now)
+        return frozen
 
     def search_entities(self, query: str, limit: int = 20) -> list:
         """Search entities by name/aliases using jieba tokenization.
