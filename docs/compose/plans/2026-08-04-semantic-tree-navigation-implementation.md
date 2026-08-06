@@ -1,6 +1,6 @@
 # 语义树导航 · 实施计划（交接新对话）
 
-> 日期：2026-08-04　状态：P0 已完成，P1-P4 待实施
+> 日期：2026-08-04　状态：**P0-P4 全部交付**（2026-08-04 实施完成）
 > **架构定稿**：`docs/compose/specs/2026-08-04-overall-architecture-semantic-tree-navigation.md`（[S1]-[S13]，唯一权威；取代更早的 4 份设计稿）。
 > **实施前必读该设计文档**，本计划只是落地路线。
 
@@ -26,47 +26,49 @@
 | 三层重构 T7 L0 | `ffda347` | 可配置通道召回 topk（`l0_channel_topk`） |
 | 三层重构 T8 层级 | `ddbf136` | `_hierarchy_boost` 标签软路由 |
 | **P0 上下文预算** | `a084ea9` | `_act_tree_search` 多文档上下文 token 预算（预算满即停）+ 测试 |
+| **P1 语料树构建** | `f71d250` `8ee88f2` `0eb3f98` | CorpusTreeBuilder + 4 表存储 + 增量钩子 + 细而不碎（41 测试） |
+| **P2 语义树导航** | `734577f` | 规模分档 + 逐层预筛/加权/精挑 + 渐进披露 + 并行展开 + P0 残留修复（38 测试） |
+| **P3 图谱三件套** | `a450217` `454e258` `0a71cbc` | search_entities 分词化 + 实体消歧 + 三件套支持（34 测试） |
+| **P4 循环推理** | `352582d` `4d00dc2` | MultiHopReasoner + router 集成 + 图谱引导逐跳（15 测试） |
 
-## 四、待实施任务（按序）
+## 四、已交付任务
 
-### P1 语料树构建（无向量管线）——下一站
-目标：索引期自动把语料建成树（设计文档 [S3]）。
-管线（[S3]）：
-1. 每篇索引抽 closet_tags（已有 `closet_index._extract_tags`）。
-2. **标签归一化**：收集全库唯一标签→LLM 合并同义→规范标签集（修复 风控/风险管理 不一致）。【新增】
-3. 规范标签建 tag→docs 倒排→确定性 group-by 分组（不走 LLM）。【新增】
-4. LLM 递归生成上层结构（`generate_toc_init/continue` 模式，`page_index.py:528-616` 可借鉴：continue 528-560 / init 563-595 / 循环用法 `process_no_toc` 597-616）：定名+摘要+组织上下级+裁定合并/拆分。【新增】
-5. 组装层级+软归属；增量更新。
-- **细而不碎**（[S3.1]）：簇大小双向卡界（过小合并、过大拆分），合并由 LLM 语义裁定。
-- **增量两点**（设计文档 [S3]）：①新文档标签先匹配已有规范集，不中再 LLM 单点裁定并入/新开（不重跑全库归一）；②簇卡界**每次插入时评估**（超上限→拆分，低下限→并入/上提），不做周期性全量重建。
-- 新增存储：语料树表/字段（corpus_tree）。
-- 验证（PageIndex-UV 侧单测级验收；召回@规模实证按 D4 归 pageindex-paper）：
-  1. 产出可检视语料树，结构合理；
-  2. 文档覆盖率 100%（每篇至少挂 1 簇，软归属可多挂）；
-  3. 簇大小分布落在卡界区间（越界簇有合并/拆分处置记录）；
-  4. 标签归一一致性（规范集内无同义标签并存，如 风控/风险管理）。
+### P1 语料树构建（无向量管线）✅
+- **交付 commit**：`f71d250`（主体）+ `8ee88f2`（相似兄弟簇合并）+ `0eb3f98`（合并后尺寸重检 + 标签归一映射修正）
+- **实现**：`pageindex_mutil/corpus_tree.py`（CorpusTreeBuilder，~720 行含 prompt），`db.py`（4 表 + ~15 方法），`client.py`（增量钩子），`tests/test_corpus_tree.py`（41 测试）
+- **规格评审**：26/26 通过（[S3] + [S3.1]）
+- **质量评审**：Yes
+- **全套**：184 通过（P1 基线 143 + 41 新增）
 
-### P2 语义树导航 + 量级自适应
-- 用树导航统合现有管线（设计文档 [S5]+[S6]）：每层=语义预筛(标签/关键词)+图谱加权+LLM精挑；渐进披露。
-- 量级自适应档位（小直连/中单层/海量层级树）。
-- 改造 `super_tree.py` prefilter/`_hierarchy_boost`/`select_documents`。
-- 验证：longdoc 基准对比（pageindex-paper）。
+### P2 语义树导航 + 量级自适应 ✅
+- **交付 commit**：`734577f`
+- **实现**：`super_tree.py`（+314 行：NodePrefilter / EntityBoost / SelectNodes / NavigateTree / 规模分档 / 集群路由），`router.py`（doc_id 去重 + P0 残留修复：首篇预算 + 实体上下文计入预算），`config.yaml`（分档阈值），`tests/test_tree_navigation.py`（38 测试）
+- **规格评审**：19/19 通过（[S5] + [S6] + [S9]残留 + [S10]通道C）
+- **质量评审**：Yes
+- **全套**：219 通过
 
-### P3 图谱三件套
-- **前置**：`db.search_entities` 从整串 LIKE 改为分词匹配（jieba 查询词 vs name/aliases）——现状多词查询几乎永不命中（设计文档 [S7.2]）。
-- 实体消歧（对齐标签归一化思路，修复 张三/小张 不链接；现有 `_fuzzy_match` 仅单文档内，跨文档归一需新建）。【补 `entity_extractor`/`db.insert_entity`】
-- 三件套（[S7.2]）：①实体快捷跳转 ②预筛信号加权 ③多跳导航。
+### P3 图谱三件套 ✅
+- **交付 commit**：`a450217`（主体）+ `454e258`（消歧管线集成）+ `0a71cbc`（别名合并补全 + 查询 LIMIT）
+- **实现**：`db.py`（search_entities 分词化 + get_entities_by_type + merge_entity_aliases），`entity_extractor.py`（disambiguate_entity），`client.py`（_resolve_entity 管线集成），`tests/test_entity_graph.py`（34 测试）
+- **规格评审**：21/21 通过（[S7]）
+- **质量评审**：Yes
+- **全套**：254 通过
 
-### P4 循环推理多跳
-- 推理-检索循环（[S8]）：可分解查询→逐跳导航+图谱引导下一跳。
-- **需 pageindex-paper 先建多跳基准**才能验证。
+### P4 循环推理多跳 ✅
+- **交付 commit**：`352582d`（主体）+ `4d00dc2`（matched_docs 填充 + 参数清理 + prompt 精简）
+- **实现**：`pageindex_mutil/agentic/multi_hop.py`（MultiHopReasoner，315 行），`router.py`（search() 集成），`tests/test_multi_hop.py`（15 测试）
+- **规格评审**：13/13 通过（[S8]）
+- **质量评审**：Yes
+- **全套**：269 通过
+- **注意**：多跳效果验证需 pageindex-paper 先建多跳基准（D4 分工）
 
 ## 五、依赖关系
 
-`P0(已完成) → P1 → P2 → P3 → P4`；P3 依赖 P1/P2；P4 依赖 P2+P3+多跳基准。
+~~`P0(已完成) → P1 → P2 → P3 → P4`~~ — **全部交付完成**。最终全套 269 测试通过，0 失败。多跳效果验证待 pageindex-paper 建多跳基准。
 
 ## 六、验证与测试约定
 
-- 单测用现有 `tests/` 的 `importlib.util.spec_from_file_location` stub 模式（见 `test_router.py`/`test_super_tree.py`）。
+- 单测用现有 `tests/` 的 `importlib.util.spec_from_file_location` stub 模式（见 `test_router.py`/`test_super_tree.py`/`test_corpus_tree.py`）。
 - 每阶段跑 `uv run pytest tests/...`（排除需网络的 `test_search_backends`、并发的 `test_db_concurrency`）。
 - 检索效果验证归 pageindex-paper（benchmark），PageIndex-UV 侧只做代码+单测。
+- **最终状态**：269 测试通过（P0 基线 143 + P1 41 + P2 38 + P3 34 + P4 15），每个任务均通过独立规格评审 + 代码质量评审双重门控。

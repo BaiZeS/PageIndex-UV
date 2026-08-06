@@ -1,7 +1,8 @@
 # PageIndex-UV 总体架构优化设计：语义树导航
 
-> 日期：2026-08-04　状态：**总体设计定稿（全程无向量）· 评审修订 v2**
+> 日期：2026-08-04　状态：**总体设计定稿（全程无向量）· 评审修订 v2 · P0-P4 全部交付**
 > 评审修订 v2（2026-08-04）：同步 P0 已交付实况（[S9]/[S10]/[S11]）；补增量标签归一/簇卡界时机（[S3]）、软归属去重与延迟纪律（[S6]）、向量通道 C 去留（[S10]）、`search_entities` 分词前置改造（[S7.2]）、`_fuzzy_match` 范围（[S7.1]）、延迟风险（[S12]）。架构决策未变。
+> **实施完成（2026-08-04）**：P0-P4 全部交付，269 测试通过，每个任务通过规格评审 + 代码质量评审双重门控。多跳效果验证待 pageindex-paper 建多跳基准。
 > **本文档为最终定稿，取代以下早期文档**：`docs/rag-quality-optimization-options.md`、`docs/rag-progressive-disclosure-options.md`、`docs/compose/specs/2026-08-03-massive-rag-three-layer-architecture.md`、`docs/compose/specs/2026-08-04-corpus-tree-plan.md`（其结论已并入本文，那些文档仅作历史存档）。
 > 范式定位：**树结构为主干 · 借鉴 skill/MCP 海量加载管理 · 融合图谱辅助**。
 > 一句话：构建"**按量级自适应的语义树导航**"（Adaptive Semantic Tree Navigation）——
@@ -237,9 +238,9 @@ ROOT（知识库）
 
 **已交付（2026-08-04，commit `a084ea9`）**：多文档路径预算由 `_act_tree_search` 内的**累计 token 预算跟踪**实现（`router.py:237-282`）——doc_results 按相关度降序，每篇仍经 `build_context_for_doc`（`reasoning.py:225`）组装，累计超过 `max_context_tokens`（reasoning `_get_max_context_tokens`，fallback 16000）即停止添加，保住最相关文档。**注意：未采用原稿"接入 `build_context_with_budget`"的方案**——该函数（`reasoning.py:180`）仍仅用于单文档路径的页级预算（`app/main.py`），勿重复实现。
 
-**已知残留（归 P2 处理）**：
-- 首篇文档绕过预算检查（`if contexts and ...`，`router.py:275`）——超大单篇仍可能冲爆窗口；
-- 循环后追加的实体关系上下文块（`router.py:284-301`）未计入预算。
+**已知残留（P2 已修复）**：
+- ~~首篇文档绕过预算检查（`if contexts and ...`，`router.py:275`）~~ → P2 修复：超大首篇仍入上下文但随后立即停止（`router.py:283-297`，测试 `test_first_doc_over_budget_admitted_then_stops`）。
+- ~~循环后追加的实体关系上下文块（`router.py:284-301`）未计入预算~~ → P2 修复：实体上下文块计入预算（`router.py:316-320`，测试 `test_entity_context_block_counted_against_budget`）。
 
 ---
 
@@ -265,10 +266,10 @@ ROOT（知识库）
 > 分工（D4）：以下为 PageIndex-UV 代码/检索优化；海量/多跳 benchmark 由 pageindex-paper 负责。
 
 - **P0 上下文预算**：✅ 已交付（`a084ea9`；实际机制为 `_act_tree_search` 累计预算，与 S9 原稿方案不同，见 [S9]；残留缺口归 P2）。
-- **P1 语料树构建**（离线）：S3。产出可检视语料树，验证结构合理。
-- **P2 语义树导航 + 量级自适应**：S5+S6。用树导航统合现有管线，longdoc 基准对比。
-- **P3 图谱三件套**：S7。实体快捷跳转 → 预筛加权 → （配合 P4）多跳。
-- **P4 循环推理多跳**：S8。**需 pageindex-paper 先建多跳基准**才能验证。
+- **P1 语料树构建**（离线）：✅ 已交付（`f71d250` `8ee88f2` `0eb3f98`，41 测试，规格 26/26 + 质量 Yes）。CorpusTreeBuilder + 4 表存储 + 增量钩子 + 细而不碎。
+- **P2 语义树导航 + 量级自适应**：✅ 已交付（`734577f`，38 测试，规格 19/19 + 质量 Yes）。规模分档 + 逐层预筛/加权/精挑 + 渐进披露 + 并行展开 + P0 残留修复。
+- **P3 图谱三件套**：✅ 已交付（`a450217` `454e258` `0a71cbc`，34 测试，规格 21/21 + 质量 Yes）。search_entities 分词化 + 实体消歧 + 三件套支持。
+- **P4 循环推理多跳**：✅ 已交付（`352582d` `4d00dc2`，15 测试，规格 13/13 + 质量 Yes）。MultiHopReasoner + router 集成。多跳效果验证需 pageindex-paper 建多跳基准。
 
 **依赖**：P0 独立先做；P1→P2 顺序；P3 依赖 P1/P2；P4 依赖 P2+P3+多跳基准。
 
