@@ -2,6 +2,7 @@ import os
 import sqlite3
 import json
 import threading
+import time
 
 
 SQLITE_MAX_VARIABLE_NUMBER = 999
@@ -19,6 +20,12 @@ _STOPWORDS = frozenset({
     "什么", "怎么", "哪些", "哪个", "如何", "为什么", "可以", "能",
     "请", "帮", "找", "查", "看看", "一下", "参与", "关于", "相关",
 })
+
+
+# Tokenization cache — jieba tokenization is deterministic for the same query.
+_TOKENIZE_CACHE: dict = {}  # query -> (tokens, timestamp)
+_TOKENIZE_CACHE_TTL = 300   # seconds (5 minutes)
+_TOKENIZE_CACHE_MAX = 512   # max entries
 
 
 class PageIndexDB:
@@ -319,6 +326,12 @@ class PageIndexDB:
         rows = conn.execute("SELECT * FROM documents ORDER BY id").fetchall()
         return [dict(r) for r in rows]
 
+    def get_document_count(self) -> int:
+        """Return total document count without materializing rows."""
+        conn = self._connect()
+        row = conn.execute("SELECT COUNT(*) FROM documents").fetchone()
+        return row[0] if row else 0
+
     def get_node(self, doc_id, node_id):
         conn = self._connect()
         row = conn.execute(
@@ -399,6 +412,29 @@ class PageIndexDB:
             return
         with self._connect() as conn:
             conn.execute("DELETE FROM closet_tags WHERE doc_id = ?", (doc_id,))
+            for i in range(0, len(records), 100):
+                chunk = records[i:i + 100]
+                conn.executemany(
+                    """
+                    INSERT INTO closet_tags (doc_id, tag_text, tag_token, confidence, source)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    chunk,
+                )
+
+    def insert_closet_tags_batch(self, records: list[tuple]) -> None:
+        """Batch insert closet tags across multiple documents.
+
+        Each record = (doc_id, tag_text, tag_token, confidence, source).
+        Deletes existing tags for each affected doc_id first, then bulk inserts.
+        """
+        if not records:
+            return
+        with self._connect() as conn:
+            # Delete existing tags for all affected doc_ids
+            doc_ids = {r[0] for r in records}
+            for did in doc_ids:
+                conn.execute("DELETE FROM closet_tags WHERE doc_id = ?", (did,))
             for i in range(0, len(records), 100):
                 chunk = records[i:i + 100]
                 conn.executemany(
@@ -765,6 +801,34 @@ class PageIndexDB:
                 (entity_id, entity_id)
             )
 
+    def insert_entity_mentions_batch(self, records: list[tuple]) -> None:
+        """Batch insert entity mentions.
+
+        Each record = (entity_id, doc_id, context_snippet, confidence).
+        Uses executemany for efficiency; updates doc_count per unique entity.
+        """
+        if not records:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO entity_mentions (entity_id, doc_id, context_snippet, confidence)
+                VALUES (?, ?, ?, ?)
+                """,
+                records,
+            )
+            # Update doc_count for each unique entity_id
+            entity_ids = {r[0] for r in records}
+            for eid in entity_ids:
+                conn.execute(
+                    """
+                    UPDATE entities SET doc_count = (
+                        SELECT COUNT(DISTINCT doc_id) FROM entity_mentions WHERE entity_id = ?
+                    ) WHERE id = ?
+                    """,
+                    (eid, eid),
+                )
+
     def insert_entity_relation(
         self, subject_id: int, predicate: str, object_id: int,
         doc_id: int = None, confidence: float = 0.5
@@ -789,10 +853,19 @@ class PageIndexDB:
 
     @staticmethod
     def _tokenize_query(query: str) -> list[str]:
-        """Tokenize query with jieba, filter stopwords and single-char tokens."""
+        """Tokenize query with jieba, filter stopwords and single-char tokens.
+
+        Results are cached (same query → same tokens, TTL=5min).
+        """
+        now = time.monotonic()
+        entry = _TOKENIZE_CACHE.get(query)
+        if entry and (now - entry[1]) < _TOKENIZE_CACHE_TTL:
+            return entry[0]
+        if entry:
+            del _TOKENIZE_CACHE[query]
+
         import jieba
         tokens = jieba.lcut(query)
-        # Filter: strip whitespace, filter stopwords, filter single-char tokens
         result = []
         for t in tokens:
             t = t.strip()
@@ -801,6 +874,11 @@ class PageIndexDB:
             if t in _STOPWORDS:
                 continue
             result.append(t)
+
+        if len(_TOKENIZE_CACHE) >= _TOKENIZE_CACHE_MAX:
+            oldest_key = min(_TOKENIZE_CACHE, key=lambda k: _TOKENIZE_CACHE[k][1])
+            del _TOKENIZE_CACHE[oldest_key]
+        _TOKENIZE_CACHE[query] = (result, now)
         return result
 
     def search_entities(self, query: str, limit: int = 20) -> list:

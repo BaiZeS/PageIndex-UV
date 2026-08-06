@@ -1,12 +1,13 @@
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
-from db import PageIndexDB
+from db import PageIndexDB, _TOKENIZE_CACHE
 
 
 @pytest.fixture
@@ -143,3 +144,103 @@ class TestInsertEntityAliasMerge:
         # Sanity: documents table still empty.
         conn = tmp_db._connect()
         assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+
+
+class TestGetDocumentCount:
+    def test_empty_db_returns_zero(self, tmp_db):
+        assert tmp_db.get_document_count() == 0
+
+    def test_returns_correct_count(self, tmp_db):
+        tmp_db.insert_document("a.pdf", "/tmp/a.pdf")
+        tmp_db.insert_document("b.pdf", "/tmp/b.pdf")
+        assert tmp_db.get_document_count() == 2
+
+    def test_count_matches_get_all(self, tmp_db):
+        tmp_db.insert_document("x.pdf", "/tmp/x.pdf")
+        assert tmp_db.get_document_count() == len(tmp_db.get_all_documents())
+
+
+class TestInsertEntityMentionsBatch:
+    def test_batch_insert(self, tmp_db):
+        eid = tmp_db.insert_entity("PERSON", "Alice")
+        doc1 = tmp_db.insert_document("a.pdf", "/tmp/a.pdf")
+        doc2 = tmp_db.insert_document("b.pdf", "/tmp/b.pdf")
+        records = [
+            (eid, doc1, "Alice in doc1", 0.9),
+            (eid, doc2, "Alice in doc2", 0.8),
+        ]
+        tmp_db.insert_entity_mentions_batch(records)
+        docs = tmp_db.get_entity_documents(eid)
+        assert len(docs) == 2
+        # Verify doc_count was updated
+        entity = tmp_db.get_entity_by_name("Alice")
+        assert entity["doc_count"] == 2
+
+    def test_batch_empty_noop(self, tmp_db):
+        tmp_db.insert_entity_mentions_batch([])  # should not raise
+
+
+class TestInsertClosetTagsBatch:
+    def test_batch_insert_single_doc(self, tmp_db):
+        doc_id = tmp_db.insert_document("test.pdf", "/tmp/test.pdf")
+        records = [
+            (doc_id, "容器编排", "容器 编排", 0.9, "llm"),
+            (doc_id, "微服务", "微服务", 0.8, "llm"),
+        ]
+        tmp_db.insert_closet_tags_batch(records)
+        tags = tmp_db.get_doc_tags(doc_id)
+        assert len(tags) == 2
+        assert tags[0]["tag_text"] == "容器编排"
+
+    def test_batch_insert_multi_doc(self, tmp_db):
+        d1 = tmp_db.insert_document("a.pdf", "/tmp/a.pdf")
+        d2 = tmp_db.insert_document("b.pdf", "/tmp/b.pdf")
+        records = [
+            (d1, "tag1", "token1", 0.9, "llm"),
+            (d2, "tag2", "token2", 0.8, "llm"),
+        ]
+        tmp_db.insert_closet_tags_batch(records)
+        assert len(tmp_db.get_doc_tags(d1)) == 1
+        assert len(tmp_db.get_doc_tags(d2)) == 1
+
+    def test_batch_replaces_existing(self, tmp_db):
+        doc_id = tmp_db.insert_document("test.pdf", "/tmp/test.pdf")
+        tmp_db.insert_closet_tags(doc_id, [(doc_id, "old", "old", 0.5, "llm")])
+        tmp_db.insert_closet_tags_batch([(doc_id, "new", "new", 0.9, "llm")])
+        tags = tmp_db.get_doc_tags(doc_id)
+        assert len(tags) == 1
+        assert tags[0]["tag_text"] == "new"
+
+    def test_batch_empty_noop(self, tmp_db):
+        tmp_db.insert_closet_tags_batch([])  # should not raise
+
+
+class TestTokenizationCache:
+    def setup_method(self):
+        _TOKENIZE_CACHE.clear()
+
+    def test_cache_hit(self, tmp_db):
+        result1 = PageIndexDB._tokenize_query("人工智能技术")
+        result2 = PageIndexDB._tokenize_query("人工智能技术")
+        assert result1 == result2
+        assert "人工智能技术" in _TOKENIZE_CACHE
+
+    def test_cache_different_queries(self, tmp_db):
+        result1 = PageIndexDB._tokenize_query("机器学习")
+        result2 = PageIndexDB._tokenize_query("深度学习")
+        assert "机器学习" in _TOKENIZE_CACHE
+        assert "深度学习" in _TOKENIZE_CACHE
+
+    def test_cache_ttl_expiry(self, tmp_db):
+        _TOKENIZE_CACHE["test_query"] = (["old_tokens"], time.monotonic() - 600)
+        result = PageIndexDB._tokenize_query("test_query")
+        assert result != ["old_tokens"]  # should have been recomputed
+        assert "test_query" in _TOKENIZE_CACHE
+
+    def test_cache_max_eviction(self, tmp_db):
+        # Fill cache to max
+        for i in range(512):
+            _TOKENIZE_CACHE[f"q{i}"] = (["tok"], time.monotonic())
+        # One more should evict oldest
+        PageIndexDB._tokenize_query("new_query")
+        assert "new_query" in _TOKENIZE_CACHE

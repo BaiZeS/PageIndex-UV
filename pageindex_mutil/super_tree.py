@@ -666,7 +666,7 @@ class SuperTreeIndex:
     def detect_scale_tier(self) -> str:
         """探测语料规模（文档数）→ 导航档位。阈值可配置，实测标定。"""
         try:
-            n_docs = len(self.db.get_all_documents())
+            n_docs = int(self.db.get_document_count())
         except Exception:
             n_docs = 0
         if n_docs < self._SMALL_MAX_DOCS:
