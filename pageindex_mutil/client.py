@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import uuid
 import json
 import asyncio
@@ -109,6 +110,7 @@ class PageIndexClient:
         self.corpus_tree = None
         self.router = None
         self._id_mapper = DocIdMapper()
+        self._pending_enrichment: set[int] = set()
 
         if self.workspace:
             self._load_workspace()
@@ -212,7 +214,7 @@ class PageIndexClient:
         # --- No match: create new ---
         return self.db.insert_entity(entity_type, name, aliases)
 
-    def index(self, file_path: str, mode: str = "auto") -> str:
+    def index(self, file_path: str, mode: str = "auto", sync: bool = False) -> str:
         """Index a document. Returns a document_id."""
         # Persist a canonical absolute path so workspace reloads do not
         # reinterpret caller-relative paths against the workspace directory.
@@ -342,75 +344,17 @@ class PageIndexClient:
                 if hasattr(self, 'super_tree_index') and self.super_tree_index:
                     self.super_tree_index.on_document_added(db_doc_id)
 
-                # Corpus tree (P1): incremental attach after closet tags exist.
-                if self.corpus_tree:
-                    try:
-                        self.corpus_tree.update_for_document(db_doc_id)
-                    except Exception as e:
-                        logging.warning("Corpus tree incremental update failed: %s", e)
-
-                # Index in vector search backend
-                if self.search_backend and doc.get('structure'):
-                    try:
-                        self.search_backend.index_document(
-                            db_doc_id,
-                            doc['structure'],
-                            doc.get('pages')
-                        )
-                    except Exception as e:
-                        logging.warning("Failed to index in search backend: %s", e)
-                
-                # Extract entities and relationships
-                if self.entity_extractor and doc.get('structure'):
-                    try:
-                        result = self.entity_extractor.extract_from_document(
-                            doc.get('doc_name', ''),
-                            doc.get('doc_description', ''),
-                            doc['structure']
-                        )
-                        entities, relations, node_contexts = result
-
-                        # Build context snippet map for entities
-                        # (find the most relevant context snippet for each entity)
-                        def _find_context(entity_name, contexts):
-                            name_lower = entity_name.lower()
-                            for ctx in contexts:
-                                if name_lower in ctx.lower():
-                                    return ctx[:200]
-                            return None
-
-                        # Store entities (with disambiguation against existing set)
-                        entity_ids = {}
-                        for entity in entities:
-                            eid = self._resolve_entity(
-                                entity.entity_type,
-                                entity.name,
-                                entity.aliases,
-                                self.entity_extractor,
-                            )
-                            if eid:
-                                entity_ids[entity.name] = eid
-                                context_snippet = _find_context(entity.name, node_contexts)
-                                self.db.insert_entity_mention(
-                                    eid, db_doc_id,
-                                    context_snippet=context_snippet,
-                                    confidence=entity.confidence
-                                )
-
-                        # Store relations
-                        for rel in relations:
-                            subject_id = entity_ids.get(rel.subject)
-                            object_id = entity_ids.get(rel.object)
-                            if subject_id and object_id:
-                                self.db.insert_entity_relation(
-                                    subject_id, rel.predicate, object_id,
-                                    doc_id=db_doc_id, confidence=rel.confidence
-                                )
-
-                        logging.info("Extracted %d entities and %d relations for %s",
-                                   len(entities), len(relations), doc.get('doc_name'))
-                    except Exception as e:
-                        logging.warning("Entity extraction failed: %s", e)
+                # Phase 2: corpus tree, search backend, entity extraction.
+                # By default (sync=False) this runs in a background thread.
+                if sync:
+                    self._enrich_document(db_doc_id, doc)
+                else:
+                    self._pending_enrichment.add(db_doc_id)
+                    threading.Thread(
+                        target=self._enrich_document,
+                        args=(db_doc_id, doc),
+                        daemon=True,
+                    ).start()
             except Exception as e:
                 logging.warning("Failed to persist to db: %s", e)
 
@@ -418,6 +362,89 @@ class PageIndexClient:
         if self.workspace:
             self._save_doc(doc_id)
         return doc_id
+
+    def _enrich_document(self, db_doc_id: int, doc: dict) -> None:
+        """Phase 2: corpus tree + search backend + entity extraction.
+
+        Runs in a background thread (or inline when sync=True).
+        Exceptions are caught and logged — never propagate.
+        """
+        try:
+            # Corpus tree (P1): incremental attach after closet tags exist.
+            if self.corpus_tree:
+                try:
+                    self.corpus_tree.update_for_document(db_doc_id)
+                except Exception as e:
+                    logging.warning("Corpus tree incremental update failed: %s", e)
+
+            # Index in vector search backend
+            if self.search_backend and doc.get('structure'):
+                try:
+                    self.search_backend.index_document(
+                        db_doc_id,
+                        doc['structure'],
+                        doc.get('pages')
+                    )
+                except Exception as e:
+                    logging.warning("Failed to index in search backend: %s", e)
+
+            # Extract entities and relationships
+            if self.entity_extractor and doc.get('structure'):
+                try:
+                    result = self.entity_extractor.extract_from_document(
+                        doc.get('doc_name', ''),
+                        doc.get('doc_description', ''),
+                        doc['structure']
+                    )
+                    entities, relations, node_contexts = result
+
+                    # Build context snippet map for entities
+                    # (find the most relevant context snippet for each entity)
+                    def _find_context(entity_name, contexts):
+                        name_lower = entity_name.lower()
+                        for ctx in contexts:
+                            if name_lower in ctx.lower():
+                                return ctx[:200]
+                        return None
+
+                    # Store entities (with disambiguation against existing set)
+                    entity_ids = {}
+                    for entity in entities:
+                        eid = self._resolve_entity(
+                            entity.entity_type,
+                            entity.name,
+                            entity.aliases,
+                            self.entity_extractor,
+                        )
+                        if eid:
+                            entity_ids[entity.name] = eid
+                            context_snippet = _find_context(entity.name, node_contexts)
+                            self.db.insert_entity_mention(
+                                eid, db_doc_id,
+                                context_snippet=context_snippet,
+                                confidence=entity.confidence
+                            )
+
+                    # Store relations
+                    for rel in relations:
+                        subject_id = entity_ids.get(rel.subject)
+                        object_id = entity_ids.get(rel.object)
+                        if subject_id and object_id:
+                            self.db.insert_entity_relation(
+                                subject_id, rel.predicate, object_id,
+                                doc_id=db_doc_id, confidence=rel.confidence
+                            )
+
+                    logging.info("Extracted %d entities and %d relations for %s",
+                               len(entities), len(relations), doc.get('doc_name'))
+                except Exception as e:
+                    logging.warning("Entity extraction failed: %s", e)
+
+            logging.info("Background enrichment complete for doc %d", db_doc_id)
+        except Exception as e:
+            logging.warning("Background enrichment failed for doc %d: %s", db_doc_id, e)
+        finally:
+            self._pending_enrichment.discard(db_doc_id)
 
     def rebuild_corpus_tree(self) -> dict:
         """Full (re)build of the corpus tree (P1). Returns the inspectable tree.
