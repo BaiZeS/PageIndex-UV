@@ -110,6 +110,32 @@ class TestDeleteDocumentCascade:
         assert _count_rows(tmp_db, "closet_tags", doc_id) == 0
         assert _count_rows(tmp_db, "doc_keywords", doc_id) == 0
 
+class TestInsertEntityAliasMerge:
+    """C1: insert_entity UPSERT must MERGE aliases, not overwrite them."""
+
+    def test_two_inserts_same_entity_different_aliases_merged(self, tmp_db):
+        """Two docs extracting the same entity with different aliases → both aliases kept."""
+        eid1 = tmp_db.insert_entity("PERSON", "Alice", ["Ali", "A"])
+        eid2 = tmp_db.insert_entity("PERSON", "Alice", ["Ally", "A"])
+        assert eid1 == eid2  # same entity
+        row = tmp_db._connect().execute(
+            "SELECT aliases FROM entities WHERE id = ?", (eid1,)
+        ).fetchone()
+        aliases = set(__import__("json").loads(row["aliases"]))
+        # All four unique aliases must be present (A deduplicated)
+        assert aliases == {"Ali", "A", "Ally"}
+
+    def test_insert_with_empty_aliases_preserves_existing(self, tmp_db):
+        """Inserting with aliases=[] must not discard existing aliases."""
+        tmp_db.insert_entity("ORG", "Acme", ["Acme Corp"])
+        tmp_db.insert_entity("ORG", "Acme", [])
+        row = tmp_db._connect().execute(
+            "SELECT aliases FROM entities WHERE name = 'Acme'"
+        ).fetchone()
+        aliases = __import__("json").loads(row["aliases"])
+        assert "Acme Corp" in aliases
+
+
     def test_delete_document_idempotent_nonexistent(self, tmp_db):
         """NFR2/AC1.2 — deleting a non-existent id deletes 0 rows, no error."""
         # 999999 does not exist; DELETE matches 0 rows and returns normally.

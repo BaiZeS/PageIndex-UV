@@ -719,9 +719,14 @@ class PageIndexDB:
                 INSERT INTO entities (entity_type, name, aliases)
                 VALUES (?, ?, ?)
                 ON CONFLICT(name, entity_type) DO UPDATE SET
-                    aliases = CASE 
-                        WHEN excluded.aliases != '[]' THEN excluded.aliases 
-                        ELSE entities.aliases 
+                    aliases = CASE
+                        WHEN excluded.aliases != '[]' THEN
+                            (SELECT json_group_array(DISTINCT value) FROM (
+                                SELECT value FROM json_each(entities.aliases)
+                                UNION
+                                SELECT value FROM json_each(excluded.aliases)
+                            ))
+                        ELSE entities.aliases
                     END
                 RETURNING id
                 """,
@@ -943,7 +948,7 @@ class PageIndexDB:
         """Get all entities of a given type."""
         conn = self._connect()
         rows = conn.execute(
-            "SELECT * FROM entities WHERE entity_type = ? LIMIT 100",
+            "SELECT * FROM entities WHERE entity_type = ?",
             (entity_type,)
         ).fetchall()
         return [dict(r) for r in rows]
@@ -981,6 +986,11 @@ class PageIndexDB:
             conn.execute(
                 "UPDATE OR IGNORE entity_relations SET object_id = ? WHERE object_id = ?",
                 (canonical_id, duplicate_id),
+            )
+            # Remove self-referencing relations created by the redirect
+            conn.execute(
+                "DELETE FROM entity_relations WHERE subject_id = ? AND object_id = ?",
+                (canonical_id, canonical_id),
             )
             # Merge aliases from duplicate into canonical
             row = conn.execute(
