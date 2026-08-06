@@ -172,6 +172,43 @@ class PageIndexClient:
             self.chroma_backend = None
             self.entity_extractor = None
 
+    def _resolve_entity(
+        self, entity_type: str, name: str, aliases: list,
+        extractor: "EntityExtractor",
+    ) -> int:
+        """Resolve a new entity against the existing set, merging or creating.
+
+        Incremental pattern (mirrors P1 tag normalization):
+        1. Quick check: name/alias overlap → merge immediately.
+        2. LLM adjudication via disambiguate_entity → merge if flagged.
+        3. No match / LLM failure → create new entity (conservative).
+        Returns the entity ID (existing or newly created).
+        """
+        existing = self.db.get_entities_by_type(entity_type)
+        if not existing:
+            return self.db.insert_entity(entity_type, name, aliases)
+
+        # --- Quick merge: name or alias overlap ---
+        for ent in existing:
+            ent_aliases = json.loads(ent.get("aliases", "[]") or "[]")
+            if name == ent["name"] or name in ent_aliases:
+                if aliases:
+                    self.db.merge_entity_aliases(ent["id"], aliases)
+                return ent["id"]
+            if aliases and ent["name"] in aliases:
+                self.db.merge_entity_aliases(ent["id"], aliases)
+                return ent["id"]
+
+        # --- LLM adjudication ---
+        match = extractor.disambiguate_entity(name, aliases, existing)
+        if match:
+            if aliases:
+                self.db.merge_entity_aliases(match["id"], aliases)
+            return match["id"]
+
+        # --- No match: create new ---
+        return self.db.insert_entity(entity_type, name, aliases)
+
     def index(self, file_path: str, mode: str = "auto") -> str:
         """Index a document. Returns a document_id."""
         # Persist a canonical absolute path so workspace reloads do not
@@ -339,13 +376,14 @@ class PageIndexClient:
                                     return ctx[:200]
                             return None
 
-                        # Store entities
+                        # Store entities (with disambiguation against existing set)
                         entity_ids = {}
                         for entity in entities:
-                            eid = self.db.insert_entity(
+                            eid = self._resolve_entity(
                                 entity.entity_type,
                                 entity.name,
-                                entity.aliases
+                                entity.aliases,
+                                self.entity_extractor,
                             )
                             if eid:
                                 entity_ids[entity.name] = eid

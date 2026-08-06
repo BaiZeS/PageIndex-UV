@@ -939,6 +939,30 @@ class PageIndexDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_entities_by_type(self, entity_type: str) -> list:
+        """Get all entities of a given type."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT * FROM entities WHERE entity_type = ?",
+            (entity_type,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def merge_entity_aliases(self, entity_id: int, new_aliases: list) -> None:
+        """Merge new aliases into an existing entity, deduplicating."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT aliases FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if not row:
+                return
+            existing = json.loads(row["aliases"] or "[]")
+            merged = list(dict.fromkeys(existing + new_aliases))  # dedup, preserve order
+            conn.execute(
+                "UPDATE entities SET aliases = ? WHERE id = ?",
+                (json.dumps(merged, ensure_ascii=False), entity_id)
+            )
+
     def delete_entity(self, entity_id: int) -> None:
         """Delete an entity and its mentions/relations."""
         with self._connect() as conn:

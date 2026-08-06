@@ -188,6 +188,175 @@ class TestEntityDisambiguation:
 
 
 # ===========================================================================
+# 2b. 实体消歧管线集成（S7.1）
+# ===========================================================================
+
+class TestEntityDisambiguationPipeline:
+    """管线级实体消歧：_resolve_entity 集成到 entity insertion flow。"""
+
+    def test_quick_merge_by_alias_overlap(self, db):
+        """已有 "张三" alias=["小张"]，新实体 name="小张" → 快速合并，无需 LLM。"""
+        e1 = _insert_entity(db, "person", "张三", ["小张"])
+        from pageindex_mutil.entity_extractor import EntityExtractor
+        extractor = EntityExtractor(model="test", retrieve_model="test")
+        # _resolve_entity 应在不调用 LLM 的情况下合并
+        with patch("pageindex_mutil.entity_extractor.llm_completion") as mock_llm:
+            from pageindex_mutil.client import PageIndexClient
+            # 创建一个最小 client 用于测试 _resolve_entity
+            client = PageIndexClient.__new__(PageIndexClient)
+            client.db = db
+            client.entity_extractor = extractor
+            result_id = client._resolve_entity("person", "小张", [], extractor)
+            assert result_id == e1, "应合并到已有实体 '张三'"
+            # 别名应已更新，包含 "小张"
+            entity = db.get_entity_by_name("张三")
+            aliases = json.loads(entity.get("aliases", "[]"))
+            assert "小张" in aliases, "合并后别名应包含 '小张'"
+            # LLM 不应被调用（快速合并）
+            mock_llm.assert_not_called()
+
+    def test_quick_merge_new_alias_matches_existing_name(self, db):
+        """已有 "小张"，新实体 name="张三" alias=["小张"] → 快速合并。"""
+        e1 = _insert_entity(db, "person", "小张")
+        from pageindex_mutil.entity_extractor import EntityExtractor
+        extractor = EntityExtractor(model="test", retrieve_model="test")
+        with patch("pageindex_mutil.entity_extractor.llm_completion") as mock_llm:
+            from pageindex_mutil.client import PageIndexClient
+            client = PageIndexClient.__new__(PageIndexClient)
+            client.db = db
+            client.entity_extractor = extractor
+            result_id = client._resolve_entity("person", "张三", ["小张"], extractor)
+            assert result_id == e1, "应合并到已有实体 '小张'"
+            mock_llm.assert_not_called()
+
+    def test_llm_merge_when_no_quick_match(self, db):
+        """无快速匹配时，LLM 判定应合并 → 返回已有实体 ID。"""
+        e1 = _insert_entity(db, "person", "张三")
+        from pageindex_mutil.entity_extractor import EntityExtractor
+        extractor = EntityExtractor(model="test", retrieve_model="test")
+        with patch("pageindex_mutil.entity_extractor.llm_completion") as mock_llm:
+            mock_llm.return_value = json.dumps({
+                "should_merge": True,
+                "canonical_name": "张三",
+                "reason": "同一人"
+            })
+            from pageindex_mutil.client import PageIndexClient
+            client = PageIndexClient.__new__(PageIndexClient)
+            client.db = db
+            client.entity_extractor = extractor
+            result_id = client._resolve_entity("person", "张先生", [], extractor)
+            assert result_id == e1, "LLM 判定合并 → 返回已有实体 ID"
+
+    def test_no_match_creates_new_entity(self, db):
+        """无匹配且 LLM 判定不合并 → 创建新实体。"""
+        _insert_entity(db, "person", "张三")
+        from pageindex_mutil.entity_extractor import EntityExtractor
+        extractor = EntityExtractor(model="test", retrieve_model="test")
+        with patch("pageindex_mutil.entity_extractor.llm_completion") as mock_llm:
+            mock_llm.return_value = json.dumps({
+                "should_merge": False,
+                "canonical_name": None,
+                "reason": "不同人"
+            })
+            from pageindex_mutil.client import PageIndexClient
+            client = PageIndexClient.__new__(PageIndexClient)
+            client.db = db
+            client.entity_extractor = extractor
+            result_id = client._resolve_entity("person", "李四", [], extractor)
+            # 应创建新实体
+            assert result_id is not None
+            new_entity = db.get_entity_by_name("李四")
+            assert new_entity is not None, "应创建新实体 '李四'"
+            assert new_entity["id"] == result_id
+
+    def test_llm_failure_conservative_no_merge(self, db):
+        """LLM 失败 → 保守不合并，创建新实体。"""
+        _insert_entity(db, "person", "张三")
+        from pageindex_mutil.entity_extractor import EntityExtractor
+        extractor = EntityExtractor(model="test", retrieve_model="test")
+        with patch("pageindex_mutil.entity_extractor.llm_completion") as mock_llm:
+            mock_llm.return_value = None  # LLM 失败
+            from pageindex_mutil.client import PageIndexClient
+            client = PageIndexClient.__new__(PageIndexClient)
+            client.db = db
+            client.entity_extractor = extractor
+            result_id = client._resolve_entity("person", "张先生", [], extractor)
+            # 保守策略：创建新实体
+            assert result_id is not None
+            new_entity = db.get_entity_by_name("张先生")
+            assert new_entity is not None, "LLM 失败时应创建新实体"
+
+    def test_nfr4_pipeline_uses_retrieve_model(self, db):
+        """NFR4：管线消歧 LLM 调用使用 retrieve_model。"""
+        _insert_entity(db, "person", "张三")
+        from pageindex_mutil.entity_extractor import EntityExtractor
+        extractor = EntityExtractor(model="base-model", retrieve_model="retrieve-model")
+        with patch("pageindex_mutil.entity_extractor.llm_completion") as mock_llm:
+            mock_llm.return_value = json.dumps({"should_merge": False})
+            from pageindex_mutil.client import PageIndexClient
+            client = PageIndexClient.__new__(PageIndexClient)
+            client.db = db
+            client.entity_extractor = extractor
+            client._resolve_entity("person", "张先生", [], extractor)
+            call_args = mock_llm.call_args
+            assert call_args[0][0] == "retrieve-model", \
+                "NFR4: 管线消歧应使用 retrieve_model"
+
+    def test_no_existing_entities_skips_llm(self, db):
+        """该类型无已有实体 → 跳过 LLM，直接创建新实体。"""
+        from pageindex_mutil.entity_extractor import EntityExtractor
+        extractor = EntityExtractor(model="test", retrieve_model="test")
+        with patch("pageindex_mutil.entity_extractor.llm_completion") as mock_llm:
+            from pageindex_mutil.client import PageIndexClient
+            client = PageIndexClient.__new__(PageIndexClient)
+            client.db = db
+            client.entity_extractor = extractor
+            result_id = client._resolve_entity("person", "张三", [], extractor)
+            assert result_id is not None
+            mock_llm.assert_not_called()
+
+
+# ===========================================================================
+# 2c. DB 层辅助方法
+# ===========================================================================
+
+class TestEntityDBHelpers:
+    """get_entities_by_type 和 merge_entity_aliases 测试。"""
+
+    def test_get_entities_by_type(self, db):
+        """get_entities_by_type 返回指定类型的所有实体。"""
+        _insert_entity(db, "person", "张三")
+        _insert_entity(db, "person", "李四")
+        _insert_entity(db, "concept", "风控")
+        results = db.get_entities_by_type("person")
+        names = {r["name"] for r in results}
+        assert names == {"张三", "李四"}
+
+    def test_get_entities_by_type_empty(self, db):
+        """该类型无实体 → 空列表。"""
+        _insert_entity(db, "person", "张三")
+        results = db.get_entities_by_type("concept")
+        assert results == []
+
+    def test_merge_entity_aliases(self, db):
+        """merge_entity_aliases 合并别名到已有实体。"""
+        e1 = _insert_entity(db, "person", "张三", ["小张"])
+        db.merge_entity_aliases(e1, ["老张", "Zhang"])
+        entity = db.get_entity_by_name("张三")
+        aliases = json.loads(entity.get("aliases", "[]"))
+        assert set(aliases) == {"小张", "老张", "Zhang"}
+
+    def test_merge_entity_aliases_dedup(self, db):
+        """merge_entity_aliases 去重，不重复添加已有别名。"""
+        e1 = _insert_entity(db, "person", "张三", ["小张"])
+        db.merge_entity_aliases(e1, ["小张", "老张"])
+        entity = db.get_entity_by_name("张三")
+        aliases = json.loads(entity.get("aliases", "[]"))
+        assert aliases.count("小张") == 1, "不应重复添加已有别名"
+        assert "老张" in aliases
+
+
+# ===========================================================================
 # 3. ① 实体快捷跳转
 # ===========================================================================
 
