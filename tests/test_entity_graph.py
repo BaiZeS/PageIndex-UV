@@ -229,6 +229,20 @@ class TestEntityDisambiguationPipeline:
             assert result_id == e1, "应合并到已有实体 '小张'"
             mock_llm.assert_not_called()
 
+    def test_quick_merge_new_alias_matches_existing_entity_name(self, db):
+        """已有 "张三" alias=["老张"]，新实体 name="李四" alias=["老张"] → alias 重叠，快速合并。"""
+        e1 = _insert_entity(db, "person", "张三", ["老张"])
+        from pageindex_mutil.entity_extractor import EntityExtractor
+        extractor = EntityExtractor(model="test", retrieve_model="test")
+        with patch("pageindex_mutil.entity_extractor.llm_completion") as mock_llm:
+            from pageindex_mutil.client import PageIndexClient
+            client = PageIndexClient.__new__(PageIndexClient)
+            client.db = db
+            client.entity_extractor = extractor
+            result_id = client._resolve_entity("person", "李四", ["老张"], extractor)
+            assert result_id == e1, "alias 重叠应合并到已有实体 '张三'"
+            mock_llm.assert_not_called()
+
     def test_llm_merge_when_no_quick_match(self, db):
         """无快速匹配时，LLM 判定应合并 → 返回已有实体 ID。"""
         e1 = _insert_entity(db, "person", "张三")

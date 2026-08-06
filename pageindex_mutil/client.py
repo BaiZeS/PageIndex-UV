@@ -198,6 +198,9 @@ class PageIndexClient:
             if aliases and ent["name"] in aliases:
                 self.db.merge_entity_aliases(ent["id"], aliases)
                 return ent["id"]
+            if aliases and ent_aliases and set(aliases) & set(ent_aliases):
+                self.db.merge_entity_aliases(ent["id"], aliases)
+                return ent["id"]
 
         # --- LLM adjudication ---
         match = extractor.disambiguate_entity(name, aliases, existing)

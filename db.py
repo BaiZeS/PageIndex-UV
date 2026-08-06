@@ -1,7 +1,6 @@
 import os
 import sqlite3
 import json
-import re
 import threading
 
 
@@ -10,6 +9,16 @@ SQLITE_MAX_VARIABLE_NUMBER = 999
 # WAL + synchronous=NORMAL + busy_timeout (spec §6.1).
 # busy_timeout=5000ms covers ~3 concurrent uploads queueing depth (spec §5.2).
 _BUSY_TIMEOUT_MS = 5000
+
+# Common Chinese stopwords that don't help entity matching
+_STOPWORDS = frozenset({
+    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都",
+    "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你",
+    "会", "着", "没有", "看", "好", "自己", "这", "他", "吗", "那",
+    "被", "它", "把", "又", "对", "或者", "但", "而", "与", "及",
+    "什么", "怎么", "哪些", "哪个", "如何", "为什么", "可以", "能",
+    "请", "帮", "找", "查", "看看", "一下", "参与", "关于", "相关",
+})
 
 
 class PageIndexDB:
@@ -777,15 +786,6 @@ class PageIndexDB:
     def _tokenize_query(query: str) -> list[str]:
         """Tokenize query with jieba, filter stopwords and single-char tokens."""
         import jieba
-        # Common Chinese stopwords that don't help entity matching
-        _STOPWORDS = frozenset({
-            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都",
-            "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你",
-            "会", "着", "没有", "看", "好", "自己", "这", "他", "吗", "那",
-            "被", "它", "把", "又", "对", "或者", "但", "而", "与", "及",
-            "什么", "怎么", "哪些", "哪个", "如何", "为什么", "可以", "能",
-            "请", "帮", "找", "查", "看看", "一下", "参与", "关于", "相关",
-        })
         tokens = jieba.lcut(query)
         # Filter: strip whitespace, filter stopwords, filter single-char tokens
         result = []
@@ -943,7 +943,7 @@ class PageIndexDB:
         """Get all entities of a given type."""
         conn = self._connect()
         rows = conn.execute(
-            "SELECT * FROM entities WHERE entity_type = ?",
+            "SELECT * FROM entities WHERE entity_type = ? LIMIT 100",
             (entity_type,)
         ).fetchall()
         return [dict(r) for r in rows]
