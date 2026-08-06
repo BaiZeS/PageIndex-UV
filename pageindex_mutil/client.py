@@ -214,7 +214,7 @@ class PageIndexClient:
         # --- No match: create new ---
         return self.db.insert_entity(entity_type, name, aliases)
 
-    def index(self, file_path: str, mode: str = "auto", sync: bool = False) -> str:
+    def index(self, file_path: str, mode: str = "auto", sync: bool = True) -> str:
         """Index a document. Returns a document_id."""
         # Persist a canonical absolute path so workspace reloads do not
         # reinterpret caller-relative paths against the workspace directory.
@@ -345,14 +345,23 @@ class PageIndexClient:
                     self.super_tree_index.on_document_added(db_doc_id)
 
                 # Phase 2: corpus tree, search backend, entity extraction.
-                # By default (sync=False) this runs in a background thread.
+                # By default (sync=True) this runs inline.
                 if sync:
                     self._enrich_document(db_doc_id, doc)
                 else:
+                    # Snapshot fields Phase 2 needs BEFORE launching thread.
+                    # _save_doc will pop structure/pages from the shared dict,
+                    # so without a snapshot the thread would see empty values.
+                    phase2_doc = {
+                        'doc_name': doc.get('doc_name', ''),
+                        'doc_description': doc.get('doc_description', ''),
+                        'structure': doc.get('structure'),
+                        'pages': doc.get('pages'),
+                    }
                     self._pending_enrichment.add(db_doc_id)
                     threading.Thread(
                         target=self._enrich_document,
-                        args=(db_doc_id, doc),
+                        args=(db_doc_id, phase2_doc),
                         daemon=True,
                     ).start()
             except Exception as e:

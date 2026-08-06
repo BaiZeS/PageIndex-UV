@@ -154,7 +154,7 @@ class TestPhase1FastReturn:
 
             md_path = _make_md_file(tmp_path)
             with _mock_md_to_tree():
-                doc_id = client.index(md_path, mode="md")
+                doc_id = client.index(md_path, mode="md", sync=False)
 
             # Phase 2 is running in background, doc should be in pending set
             db_doc_id = client._id_mapper.to_db(doc_id)
@@ -281,7 +281,7 @@ class TestPhase2Background:
             md_path = _make_md_file(tmp_path)
             with _mock_md_to_tree():
                 t0 = time.monotonic()
-                doc_id = client.index(md_path, mode="md")
+                doc_id = client.index(md_path, mode="md", sync=False)
                 elapsed = time.monotonic() - t0
 
             # Phase 1 should return quickly (well under 1s since all mocked)
@@ -474,8 +474,8 @@ class TestSyncMode:
         finally:
             client.close()
 
-    def test_default_is_async(self, client_factory, tmp_path):
-        """Default (no sync param) should be async (two-phase)."""
+    def test_default_is_sync(self, client_factory, tmp_path):
+        """Default (no sync param) should be synchronous (backward-compatible)."""
         call_order = []
 
         client = client_factory()
@@ -499,8 +499,8 @@ class TestSyncMode:
                 elapsed = time.monotonic() - t0
                 call_order.append("index_end")
 
-            # index() should return before corpus_tree finishes
-            assert elapsed < 0.3
-            assert "corpus_tree" not in call_order or call_order.index("corpus_tree") > call_order.index("index_end")
+            # index() should wait for corpus_tree since default is sync=True
+            assert elapsed >= 0.3
+            assert call_order.index("corpus_tree") < call_order.index("index_end")
         finally:
             client.close()
