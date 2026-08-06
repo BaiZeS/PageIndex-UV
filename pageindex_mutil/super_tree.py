@@ -128,9 +128,50 @@ class KBIdentity:
 
 
 import asyncio
-from typing import Set, Dict
+from collections import defaultdict
+from typing import Set, Dict, List, Optional
 
 from .utils import llm_acompletion, count_tokens, extract_json
+
+# [S5] 量级自适应档位
+TIER_SMALL = "small"      # 小语料直连：跳过层级，扁平语义匹配
+TIER_MEDIUM = "medium"    # 中语料：单层领域路由 → 域内匹配
+TIER_MASSIVE = "massive"  # 海量：完整层级树导航 + 宽层语义预筛 + 图谱加权
+
+
+class _CorpusTreeView:
+    """语料树内存视图：孩子/文档索引 + 子树文档集合缓存（导航期只读）。"""
+
+    def __init__(self, nodes: List[dict], memberships: List[tuple]):
+        self.nodes_by_id = {n["id"]: n for n in nodes}
+        self.root_id = next(
+            (n["id"] for n in nodes if n.get("kind") == "root"), None)
+        if self.root_id is None:
+            self.root_id = next(
+                (n["id"] for n in nodes if n.get("parent_id") is None), None)
+        self._children: Dict[int, List[dict]] = defaultdict(list)
+        for n in nodes:
+            if n.get("parent_id") is not None:
+                self._children[n["parent_id"]].append(n)
+        self._docs: Dict[int, List[tuple]] = defaultdict(list)
+        for doc_id, node_id, weight in memberships:
+            self._docs[node_id].append((doc_id, weight))
+        self._subtree_cache: Dict[int, set] = {}
+
+    def children_of(self, node_id: int) -> List[dict]:
+        return self._children.get(node_id, [])
+
+    def docs_of(self, node_id: int) -> List[tuple]:
+        return self._docs.get(node_id, [])
+
+    def subtree_doc_ids(self, node_id: int) -> set:
+        """节点子树（含自身）的全部文档 id——软归属下文档可多次出现，集合天然去重。"""
+        if node_id not in self._subtree_cache:
+            ids = {d for d, _ in self._docs.get(node_id, [])}
+            for child in self._children.get(node_id, []):
+                ids |= self.subtree_doc_ids(child["id"])
+            self._subtree_cache[node_id] = ids
+        return self._subtree_cache[node_id]
 
 
 class SuperTreeIndex:
@@ -151,6 +192,13 @@ class SuperTreeIndex:
     _L0_CHANNEL_TOPK = 30
     # 三层重构-层级：集合标签匹配的软路由加权（加性提升，绝不硬删候选）
     _HIERARCHY_BOOST_WEIGHT = 1.0
+    # P2 量级自适应（[S5]）：档位文档数阈值（标定目标，可配置覆盖）
+    _SMALL_MAX_DOCS = 50     # 文档数 < 该值 → 小语料直连（跳过层级遍历）
+    _MASSIVE_MIN_DOCS = 500  # 文档数 >= 该值 → 海量层级树导航
+    # P2 语义树导航（[S6]）
+    _NODE_PREFILTER_TOPK = 20   # 宽层语义预筛 top-k
+    _NARROW_LAYER_MAX = 16      # 兄弟数 <= 该值视为窄层：跳过预筛直接给 LLM
+    _ENTITY_BOOST_WEIGHT = 1.0  # 实体命中加权强度（图谱信号，[S6]②）
 
     def __init__(self, db, model: str, client, retrieve_model: str = None):
         self.db = db
@@ -178,6 +226,11 @@ class SuperTreeIndex:
             self._REASON_KEEP_PER_GROUP = getattr(cfg, "reason_keep_per_group", self._REASON_KEEP_PER_GROUP)
             self._L0_CHANNEL_TOPK = getattr(cfg, "l0_channel_topk", self._L0_CHANNEL_TOPK)
             self._HIERARCHY_BOOST_WEIGHT = getattr(cfg, "hierarchy_boost_weight", self._HIERARCHY_BOOST_WEIGHT)
+            self._SMALL_MAX_DOCS = getattr(cfg, "scale_small_max_docs", self._SMALL_MAX_DOCS)
+            self._MASSIVE_MIN_DOCS = getattr(cfg, "scale_massive_min_docs", self._MASSIVE_MIN_DOCS)
+            self._NODE_PREFILTER_TOPK = getattr(cfg, "node_prefilter_topk", self._NODE_PREFILTER_TOPK)
+            self._NARROW_LAYER_MAX = getattr(cfg, "narrow_layer_max", self._NARROW_LAYER_MAX)
+            self._ENTITY_BOOST_WEIGHT = getattr(cfg, "entity_boost_weight", self._ENTITY_BOOST_WEIGHT)
         except Exception:
             pass
 
@@ -226,7 +279,12 @@ class SuperTreeIndex:
         Channels:
           A: ClosetIndex semantic tag matching
           B: KeywordIndex inverted index
-          C: Vector search via ChromaDB (if available)
+          C: Vector search via ChromaDB — explicit opt-in enhancement only
+             ([S10]): NOT part of the tree-navigation main path, which is
+             strictly vectorless (jieba + closet_tags inverted). Active only
+             when a vector search_backend is configured (SEARCH_BACKEND=
+             hybrid/chroma; deployed default is keyword).
+          D: Entity graph matching
         """
         scores: Dict[int, float] = {}
         topk = self._L0_CHANNEL_TOPK
@@ -576,11 +634,261 @@ class SuperTreeIndex:
         return boosted
 
     async def select_documents(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
+        """量级自适应入口（[S5]）：小=直连 / 中=单层领域路由 / 海量=层级树导航。
+
+        语料树未建、导航落空或导航候选挑选为空时，一律降级回扁平管线
+        （标签软路由 + map-reduce 推理选档），行为与改造前一致。
+        """
         if not candidate_db_ids:
             return []
-        # 三层重构-层级：集合标签软路由加权（不删候选），再推理式 map-reduce 选档
+        tier = self.detect_scale_tier()
+        if tier == TIER_MASSIVE:
+            nav_docs = await self.navigate_tree(query)
+            if nav_docs:
+                # 树导航候选（已按 doc_id 去重、留最大权重）→ 软路由加权 → 推理选档
+                boosted = self._hierarchy_boost(query, nav_docs)
+                selected = await self._select_documents_reasoning(query, boosted)
+                if selected:
+                    logging.info("[SuperTree] massive tier: tree navigation selected %d docs", len(selected))
+                    return selected
+                logging.info("[SuperTree] tree-nav selection empty; falling back to flat candidates")
+            else:
+                logging.info("[SuperTree] tree navigation yielded nothing (or tree absent); flat fallback")
+        elif tier == TIER_MEDIUM:
+            candidate_db_ids = self._cluster_route_boost(query, candidate_db_ids)
+        # 小语料直连 / 中语料域内匹配 / 海量兜底：扁平管线
         boosted = self._hierarchy_boost(query, candidate_db_ids)
         return await self._select_documents_reasoning(query, boosted)
+
+    # ------------------------------------------------------------------
+    # P2 量级自适应引擎（[S5]）
+    # ------------------------------------------------------------------
+    def detect_scale_tier(self) -> str:
+        """探测语料规模（文档数）→ 导航档位。阈值可配置，实测标定。"""
+        try:
+            n_docs = len(self.db.get_all_documents())
+        except Exception:
+            n_docs = 0
+        if n_docs < self._SMALL_MAX_DOCS:
+            return TIER_SMALL
+        if n_docs < self._MASSIVE_MIN_DOCS:
+            return TIER_MEDIUM
+        return TIER_MASSIVE
+
+    def _load_corpus_tree(self) -> Optional[_CorpusTreeView]:
+        """加载语料树视图；未建树返回 None（调用方降级扁平管线）。"""
+        try:
+            nodes = self.db.get_corpus_tree_nodes()
+            memberships = self.db.get_all_corpus_memberships()
+        except Exception:
+            return None
+        if not nodes:
+            return None
+        return _CorpusTreeView(nodes, memberships)
+
+    # ------------------------------------------------------------------
+    # P2 语义树导航（[S6]）：每层 = 预筛 → 加权 → 精挑（全程无向量）
+    # ------------------------------------------------------------------
+    def _score_nodes(self, query: str, nodes: List[dict]) -> Dict[int, float]:
+        """无向量节点打分：jieba 查询词 × 节点 tag/标题/摘要。
+
+        closet_tags（LLM 语义标签）命中 = "无向量的语义匹配"，权重高于词面重叠。
+        """
+        query_tokens = set(self.keyword_index._tokenize(query or ""))
+        if not query_tokens:
+            return {}
+        q_lower = (query or "").lower()
+        scores: Dict[int, float] = {}
+        for node in nodes:
+            s = 0.0
+            tag = (node.get("tag") or "").strip().lower()
+            if tag:
+                if tag in q_lower or q_lower in tag:
+                    s += 2.0
+                elif query_tokens & set(self.keyword_index._tokenize(tag)):
+                    s += 1.5
+            text_tokens = set(self.keyword_index._tokenize(
+                f"{node.get('title', '')} {node.get('summary', '')}"))
+            s += 0.5 * len(query_tokens & text_tokens)
+            if s > 0:
+                scores[node["id"]] = s
+        return scores
+
+    def _prefilter_nodes(self, query: str, nodes: List[dict]) -> List[dict]:
+        """[S6]① 宽层语义预筛：把兄弟节点筛到 top-k（jieba + closet_tags 倒排，无向量）。
+
+        保召回：无任何匹配信号时原样全量返回（绝不硬过滤，由 LLM 精挑裁决）。
+        """
+        if not nodes:
+            return []
+        scores = self._score_nodes(query, nodes)
+        if not scores:
+            return list(nodes)
+        ranked = sorted(nodes, key=lambda n: scores.get(n["id"], 0.0), reverse=True)
+        return ranked[: self._NODE_PREFILTER_TOPK]
+
+    def _entity_document_ids(self, query: str) -> set:
+        """[S6]② 图谱信号：查询命中实体所链接的文档 id 集合。
+
+        复用现有 db.search_entities（其分词化前置改造属 P3，此处为基础版）。
+        """
+        try:
+            entities = self.db.search_entities(query, limit=self._L0_CHANNEL_TOPK)
+        except Exception:
+            return set()
+        doc_ids = set()
+        for entity in entities:
+            entity_id = entity.get("id")
+            if not entity_id:
+                continue
+            try:
+                for mention in self.db.get_entity_documents(entity_id):
+                    if mention.get("id"):
+                        doc_ids.add(int(mention["id"]))
+            except Exception:
+                continue
+        return doc_ids
+
+    def _entity_boost_nodes(self, candidates: List[dict], siblings: List[dict],
+                            view: _CorpusTreeView, entity_doc_ids: set) -> List[dict]:
+        """[S6]② 图谱信号加权：子树含查询链接实体的节点加性提升（绝不删除候选）。
+
+        实体命中是比词面匹配更强的相关性证据：被宽层预筛切掉但含实体的兄弟
+        节点会被捞回（软归属不硬删，H03 教训）。
+        """
+        if not entity_doc_ids or not candidates:
+            return list(candidates)
+
+        def hits(node):
+            return len(view.subtree_doc_ids(node["id"]) & entity_doc_ids)
+
+        cand_ids = {n["id"] for n in candidates}
+        out = list(candidates)
+        for node in siblings:
+            if node["id"] not in cand_ids and hits(node):
+                out.append(node)
+        out.sort(key=lambda n: -hits(n))  # 稳定排序：无命中节点保持预筛顺序
+        return out
+
+    async def _select_nodes(self, query: str, nodes: List[dict]) -> List[int]:
+        """[S6]③ LLM 推理精挑：读节点摘要，可变数量挑选、宁缺毋滥。
+
+        T9 推理挑选（H02 修复）泛化到树分支；返回选中的节点 id 列表。
+        """
+        if not nodes:
+            return []
+        if len(nodes) == 1:
+            return [nodes[0]["id"]]
+        node_list = [
+            {"node_id": n["id"], "title": n.get("title", ""),
+             "summary": (n.get("summary") or "")[: self._SUMMARY_MAX_LEN]}
+            for n in nodes
+        ]
+        prompt = f"""你是一个知识库树导航精挑专家（语义树导航·逐层精挑）。给定用户问题与当前层的候选分支节点（含标题与摘要），请挑选出可能包含答案的分支（可变数量）。
+
+[用户问题]
+{query}
+
+[候选分支节点]
+{json.dumps(node_list, ensure_ascii=False)}
+
+要求：
+1. 只挑真正可能包含答案的分支；若没有足够相关的，可以少选甚至不选。
+2. 宁缺毋滥：不要为凑数而挑选不相关的分支。
+3. 基于分支标题与摘要判断相关性。
+
+返回JSON格式：{{"node_ids": [1, 2]}}
+直接返回JSON，不要其他内容。"""
+        response = await llm_acompletion(self.retrieve_model or self.model, prompt)
+        if not response:
+            return []
+        data = extract_json(response)
+        if not isinstance(data, dict):
+            return []
+        picked = data.get("node_ids", [])
+        if not isinstance(picked, list):
+            return []
+        valid = {n["id"] for n in nodes}
+        selected = []
+        for nid in picked:
+            try:
+                nid = int(nid)
+            except (TypeError, ValueError):
+                continue
+            if nid in valid and nid not in selected:
+                selected.append(nid)
+        return selected
+
+    async def navigate_tree(self, query: str) -> Optional[Dict[int, float]]:
+        """[S6] 层级树导航：逐层预筛→加权→精挑，渐进披露，分支并行展开。
+
+        返回 doc_id→weight（软归属按 doc_id 去重、保留最大权重）；
+        语料树未建返回 None（调用方降级扁平管线）；树存在但无命中返回 {}。
+        """
+        view = self._load_corpus_tree()
+        if view is None or view.root_id is None:
+            return None
+        top_nodes = view.children_of(view.root_id)
+        if not top_nodes:
+            return {}
+        entity_doc_ids = self._entity_document_ids(query)
+        return await self._navigate_level(query, top_nodes, view, entity_doc_ids)
+
+    async def _navigate_level(self, query: str, siblings: List[dict],
+                              view: _CorpusTreeView, entity_doc_ids: set) -> Dict[int, float]:
+        """单层导航：预筛（宽层才做）→ 实体加权 → LLM 精挑 → 只展开选中分支。"""
+        if not siblings:
+            return {}
+        if len(siblings) > self._NARROW_LAYER_MAX:
+            candidates = self._prefilter_nodes(query, siblings)
+        else:
+            candidates = list(siblings)
+        candidates = self._entity_boost_nodes(candidates, siblings, view, entity_doc_ids)
+        picked_ids = set(await self._select_nodes(query, candidates))
+        picked = [n for n in candidates if n["id"] in picked_ids]
+
+        docs: Dict[int, float] = {}
+        subtasks = []
+        for node in picked:
+            for doc_id, weight in view.docs_of(node["id"]):
+                docs[doc_id] = max(docs.get(doc_id, 0.0), float(weight))
+            children = view.children_of(node["id"])
+            if children:
+                subtasks.append(self._navigate_level(query, children, view, entity_doc_ids))
+        if subtasks:
+            # 延迟纪律（[S6]）：一层选中多个分支后，下一层导航并行展开
+            results = await asyncio.gather(*subtasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logging.warning("Tree navigation branch failed: %s", r)
+                    continue
+                for doc_id, weight in r.items():
+                    docs[doc_id] = max(docs.get(doc_id, 0.0), weight)
+        return docs
+
+    def _cluster_route_boost(self, query: str, candidate_db_ids: Dict[int, float]) -> Dict[int, float]:
+        """[S5] 中语料单层领域路由：对根孩子节点（领域）无向量打分，
+        命中领域子树内的候选加性提升。软路由：只加权、绝不删除候选。"""
+        if not candidate_db_ids:
+            return candidate_db_ids
+        view = self._load_corpus_tree()
+        if view is None or view.root_id is None:
+            return candidate_db_ids
+        top_nodes = view.children_of(view.root_id)
+        if not top_nodes:
+            return candidate_db_ids
+        scores = self._score_nodes(query, top_nodes)
+        if not scores:
+            return candidate_db_ids
+        boosted = dict(candidate_db_ids)
+        for node in top_nodes:
+            s = scores.get(node["id"], 0.0)
+            if s <= 0:
+                continue
+            for doc_id in view.subtree_doc_ids(node["id"]):
+                if doc_id in boosted:
+                    boosted[doc_id] = float(boosted[doc_id]) + s * self._HIERARCHY_BOOST_WEIGHT
+        return boosted
 
     # ------------------------------------------------------------------
     # Super-Tree builder

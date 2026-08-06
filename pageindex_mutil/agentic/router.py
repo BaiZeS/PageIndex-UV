@@ -212,10 +212,19 @@ class AgenticRouter:
         if not pages_from_nodes:
             raise RuntimeError("main.py helpers not available")
 
+        # [S6] 软归属去重：同一文档可经多个簇分支命中（软归属 ⇒ DAG），
+        # 召回与预算只计一次。
+        seen_docs = set()
+        unique_docs = []
+        for doc_id in candidate_docs:
+            if doc_id not in seen_docs:
+                seen_docs.add(doc_id)
+                unique_docs.append(doc_id)
+
         # Parallel node recall across documents
         recall_tasks = [
             self._recall_nodes_for_doc(query, doc_id)
-            for doc_id in candidate_docs
+            for doc_id in unique_docs
         ]
         recall_results = await asyncio.gather(*recall_tasks, return_exceptions=True)
 
@@ -271,8 +280,9 @@ class AgenticRouter:
 
             if context:
                 _ctx_tokens = _count_tokens(context)
+                _over_budget = _used_ctx_tokens + _ctx_tokens > _max_ctx_tokens
                 # 已有上下文且加本篇会超预算 → 停止（doc_results 按相关度降序）
-                if contexts and _used_ctx_tokens + _ctx_tokens > _max_ctx_tokens:
+                if _over_budget and contexts:
                     logging.info("[SuperTree] context budget reached; stop adding docs (%d kept)", len(contexts))
                     break
                 contexts.append(context)
@@ -280,6 +290,11 @@ class AgenticRouter:
                 all_nodes.extend(selected)
                 source_docs += 1
                 doc_pages_map[doc_id] = sorted(set(pages))
+                if _over_budget:
+                    # P0 残留修复（[S9]）：首篇不再绕过预算检查——超大单篇
+                    # 仍准入（否则完全没有上下文），但准入后立即停止。
+                    logging.info("[SuperTree] first doc alone exceeds context budget; admitted and stopping")
+                    break
 
         # Enrich context with entity relationships if available
         if hasattr(self.client, "db") and self.client.db and contexts:
@@ -296,7 +311,13 @@ class AgenticRouter:
                                 rel_text += f"- {rel.get('subject_name', '')} --{rel.get('predicate', '')}--> {rel.get('object_name', '')}\n"
                             entity_context_parts.append(rel_text)
                 if entity_context_parts:
-                    contexts.append("\n".join(entity_context_parts))
+                    # P0 残留修复（[S9]）：实体关系上下文块计入同一预算，
+                    # 剩余预算不足则跳过（不再无预算追加）。
+                    entity_block = "\n".join(entity_context_parts)
+                    if _used_ctx_tokens + _count_tokens(entity_block) <= _max_ctx_tokens:
+                        contexts.append(entity_block)
+                    else:
+                        logging.info("[SuperTree] entity context block exceeds remaining budget; skipped")
             except Exception:
                 pass
 

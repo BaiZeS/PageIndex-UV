@@ -336,3 +336,207 @@ class TestActTreeSearchBudget:
         )
         # 预算 150、每篇 100 token → 仅 1 篇入上下文，其余被预算截停
         assert src_docs == 1
+
+    @pytest.mark.asyncio
+    async def test_first_doc_over_budget_admitted_then_stops(self, router, monkeypatch):
+        """P0 残留修复：首篇不再绕过预算检查——超大单篇仍准入（否则无上下文），
+        但准入后立即停止（不再构建/考虑后续文档）。"""
+        import sys
+        import types
+
+        monkeypatch.setattr(
+            sys.modules["pageindex_mutil.utils"], "count_tokens",
+            lambda text, model=None: len(text or "") // 4,
+        )
+        reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
+        reasoning_stub._get_max_context_tokens = lambda: 150
+        sys.modules["pageindex_mutil.reasoning"] = reasoning_stub
+
+        # d1 = 800 字符 = 200 token（单篇即超预算 150）；d2 = 400 字符 = 100 token
+        build_ctx = MagicMock(
+            side_effect=lambda doc, selected, pages:
+                "x" * 800 if doc["doc_name"] == "d1" else "x" * 400
+        )
+        router._main_funcs = {
+            "build_context_for_doc": build_ctx,
+            "pages_from_nodes": lambda n: [1],
+        }
+
+        async def fake_recall(query, doc_id):
+            return {
+                "doc_id": doc_id,
+                "doc": {"doc_name": doc_id, "type": "md"},
+                "structure": [{"node_id": "n1"}],
+                "selected": [{"node_id": "n1", "text": "x"}],
+                "pages": [1],
+                "relevance_score": 1.0,
+            }
+
+        router._recall_nodes_for_doc = fake_recall
+
+        ctx, _nodes, src_docs, _cov, dpm, _pwt = await router._act_tree_search(
+            "q", ["d1", "d2"]
+        )
+        assert src_docs == 1            # 超大首篇被准入
+        assert "d1" in dpm and "d2" not in dpm
+        # 准入首篇后立即停止：d2 的上下文根本不再构建（旧实现会先构建再截停）
+        assert build_ctx.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_docs_within_budget_all_admitted(self, router, monkeypatch):
+        """预算内的多篇文档全部准入（新预算逻辑不过度截停）。"""
+        import sys
+        import types
+
+        monkeypatch.setattr(
+            sys.modules["pageindex_mutil.utils"], "count_tokens",
+            lambda text, model=None: len(text or "") // 4,
+        )
+        reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
+        reasoning_stub._get_max_context_tokens = lambda: 250
+        sys.modules["pageindex_mutil.reasoning"] = reasoning_stub
+
+        router._main_funcs = {
+            "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
+            "pages_from_nodes": lambda n: [1],
+        }
+
+        async def fake_recall(query, doc_id):
+            return {
+                "doc_id": doc_id,
+                "doc": {"doc_name": doc_id, "type": "md"},
+                "structure": [{"node_id": "n1"}],
+                "selected": [{"node_id": "n1", "text": "x"}],
+                "pages": [1],
+                "relevance_score": 1.0,
+            }
+
+        router._recall_nodes_for_doc = fake_recall
+
+        _ctx, _nodes, src_docs, _cov, _dpm, _pwt = await router._act_tree_search(
+            "q", ["d1", "d2"]
+        )
+        assert src_docs == 2  # 每篇 100 token，共 200 <= 250，全部准入
+
+    @pytest.mark.asyncio
+    async def test_entity_context_block_counted_against_budget(self, router, monkeypatch):
+        """P0 残留修复：循环后追加的实体关系上下文块计入同一预算（超余量则不追加）。"""
+        import sys
+        import types
+
+        monkeypatch.setattr(
+            sys.modules["pageindex_mutil.utils"], "count_tokens",
+            lambda text, model=None: len(text or "") // 4,
+        )
+        reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
+        reasoning_stub._get_max_context_tokens = lambda: 150
+        sys.modules["pageindex_mutil.reasoning"] = reasoning_stub
+
+        # 单篇 400 字符 = 100 token → 余量仅 50 token
+        router._main_funcs = {
+            "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
+            "pages_from_nodes": lambda n: [1],
+        }
+
+        async def fake_recall(query, doc_id):
+            return {
+                "doc_id": doc_id,
+                "doc": {"doc_name": doc_id, "type": "md"},
+                "structure": [{"node_id": "n1"}],
+                "selected": [{"node_id": "n1", "text": "x"}],
+                "pages": [1],
+                "relevance_score": 1.0,
+            }
+
+        router._recall_nodes_for_doc = fake_recall
+
+        # 实体块 ≈ 350+ 字符 ≈ 88 token > 余量 50 → 不得追加
+        mock_db = MagicMock()
+        mock_db.search_entities.return_value = [{"id": 1, "name": "实体甲"}]
+        mock_db.get_entity_relations.return_value = [
+            {"subject_name": "主体名" * 10, "predicate": "关联", "object_name": "对象名" * 10}
+        ] * 5
+        router.client.db = mock_db
+
+        ctx, _nodes, src_docs, _cov, _dpm, _pwt = await router._act_tree_search(
+            "q", ["d1"]
+        )
+        assert src_docs == 1
+        assert "=== Entity:" not in ctx  # 实体块计入预算，超余量被跳过
+
+    @pytest.mark.asyncio
+    async def test_entity_context_block_admitted_when_budget_allows(self, router, monkeypatch):
+        """预算充足时实体关系块照常追加（计入预算但放得下）。"""
+        import sys
+        import types
+
+        monkeypatch.setattr(
+            sys.modules["pageindex_mutil.utils"], "count_tokens",
+            lambda text, model=None: len(text or "") // 4,
+        )
+        reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
+        reasoning_stub._get_max_context_tokens = lambda: 2000
+        sys.modules["pageindex_mutil.reasoning"] = reasoning_stub
+
+        router._main_funcs = {
+            "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
+            "pages_from_nodes": lambda n: [1],
+        }
+
+        async def fake_recall(query, doc_id):
+            return {
+                "doc_id": doc_id,
+                "doc": {"doc_name": doc_id, "type": "md"},
+                "structure": [{"node_id": "n1"}],
+                "selected": [{"node_id": "n1", "text": "x"}],
+                "pages": [1],
+                "relevance_score": 1.0,
+            }
+
+        router._recall_nodes_for_doc = fake_recall
+
+        mock_db = MagicMock()
+        mock_db.search_entities.return_value = [{"id": 1, "name": "实体甲"}]
+        mock_db.get_entity_relations.return_value = [
+            {"subject_name": "A", "predicate": "关联", "object_name": "B"}
+        ]
+        router.client.db = mock_db
+
+        ctx, _nodes, src_docs, _cov, _dpm, _pwt = await router._act_tree_search(
+            "q", ["d1"]
+        )
+        assert src_docs == 1
+        assert "=== Entity:" in ctx
+
+
+class TestActTreeSearchDedup:
+    """[S6] 软归属去重：同一文档经多个簇分支命中 → 召回/预算只计一次。"""
+
+    @pytest.mark.asyncio
+    async def test_candidate_docs_deduped_before_recall(self, router):
+        calls = []
+
+        async def fake_recall(query, doc_id):
+            calls.append(doc_id)
+            return {
+                "doc_id": doc_id,
+                "doc": {"doc_name": doc_id, "type": "md"},
+                "structure": [{"node_id": "n1"}],
+                "selected": [{"node_id": "n1", "text": "x"}],
+                "pages": [1],
+                "relevance_score": 1.0,
+            }
+
+        router._recall_nodes_for_doc = fake_recall
+        router._main_funcs = {
+            "build_context_for_doc": lambda doc, selected, pages: "ctx",
+            "pages_from_nodes": lambda n: [1],
+        }
+
+        _ctx, _nodes, src_docs, _cov, dpm, _pwt = await router._act_tree_search(
+            "q", ["d1", "d1", "d2", "d1"]
+        )
+        assert len(calls) == 2
+        assert set(calls) == {"d1", "d2"}
+        assert src_docs == 2
+        assert set(dpm) == {"d1", "d2"}
