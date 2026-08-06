@@ -6,6 +6,7 @@ from typing import List, Tuple, Dict
 from .planner import RetrievalPlanner
 from .strategies import MetadataStrategy, SemanticsStrategy, DescriptionStrategy
 from .verifier import CRAGVerifier
+from .multi_hop import MultiHopReasoner
 from ..super_tree import SuperTreeIndex
 
 
@@ -21,6 +22,7 @@ class AgenticRouter:
         self.semantics_strategy = None
         self.description_strategy = DescriptionStrategy(model, retrieve_model)
         self.verifier = CRAGVerifier(model, retrieve_model)
+        self.multi_hop_reasoner = MultiHopReasoner(model, retrieve_model)
         self._main_funcs = None
 
         if hasattr(client, "closet_index") and client.closet_index:
@@ -775,7 +777,20 @@ class AgenticRouter:
     # Public search
     # ------------------------------------------------------------------
     async def search(self, query: str, top_k: int = 3) -> Dict:
-        """Try Super-Tree first, fallback to v2 on any failure."""
+        """Try multi-hop reasoning first, then Super-Tree, fallback to v2."""
+        # Try multi-hop reasoning for decomposable queries
+        if self.super_tree_index and hasattr(self.client, "db") and self.client.db:
+            try:
+                result = await self.multi_hop_reasoner.execute(
+                    query, self, self.super_tree_index, self.client.db, top_k=top_k
+                )
+                logging.info("[Router] Multi-hop hop_count=%d confidence=%s",
+                            result.get("hop_count", 0), result.get("confidence"))
+                return result
+            except Exception as e:
+                logging.warning("Multi-hop reasoning failed, falling back to Super-Tree: %s", e)
+
+        # Fallback: direct Super-Tree search
         if self.super_tree_index:
             try:
                 result = await self._search_super_tree(query, top_k)
