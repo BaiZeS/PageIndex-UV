@@ -782,7 +782,7 @@ class AgenticRouter:
         if self.super_tree_index and hasattr(self.client, "db") and self.client.db:
             try:
                 result = await self.multi_hop_reasoner.execute(
-                    query, self, self.super_tree_index, self.client.db, top_k=top_k
+                    query, self, self.client.db, top_k=top_k
                 )
                 logging.info("[Router] Multi-hop hop_count=%d confidence=%s",
                             result.get("hop_count", 0), result.get("confidence"))

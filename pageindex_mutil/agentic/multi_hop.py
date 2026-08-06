@@ -32,7 +32,6 @@ class MultiHopReasoner:
         self,
         query: str,
         router: Any,
-        super_tree_index: Any,
         db: Any,
         max_hops: int = _DEFAULT_MAX_HOPS,
         token_budget: int = _DEFAULT_TOKEN_BUDGET,
@@ -43,7 +42,6 @@ class MultiHopReasoner:
         Args:
             query: The user query.
             router: AgenticRouter instance (for _search_super_tree and _act_tree_search).
-            super_tree_index: SuperTreeIndex instance (for select_documents / prefilter).
             db: PageIndexDB instance (for entity graph queries).
             max_hops: Maximum number of hops (default 3).
             token_budget: Total token budget across all hops (default 16000).
@@ -99,6 +97,12 @@ class MultiHopReasoner:
             used_tokens += ctx_tokens
             all_selected_nodes.extend(nodes or [])
             all_pages.extend(pages_with_text or [])
+            if doc_pages_map:
+                all_matched_docs.extend(
+                    {"doc_id": did, "score": 1.0}
+                    for did in doc_pages_map
+                    if did not in {d["doc_id"] for d in all_matched_docs}
+                )
 
             # Extract: LLM extracts intermediate entities/facts
             extraction = await self._extract_intermediate(query, current_query, ctx)
@@ -161,8 +165,8 @@ class MultiHopReasoner:
             "最终才能完整回答问题。\n\n"
             f"用户问题: {query}\n\n"
             "返回JSON格式:\n"
-            '{"decomposable": true/false, "sub_queries": ["子查询1", "子查询2", ...]}\n'
-            "如果不需要多跳，decomposable 为 false，sub_queries 为空数组。\n"
+            '{"decomposable": true/false}\n'
+            "如果不需要多跳，decomposable 为 false。\n"
             "直接返回JSON，不要其他内容。"
         )
 

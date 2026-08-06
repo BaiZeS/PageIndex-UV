@@ -172,7 +172,7 @@ class TestSingleHopDelegation:
         router._search_super_tree = AsyncMock(return_value=expected_result)
 
         with patch.object(multi_hop_mod, "llm_acompletion", return_value=single_hop_response):
-            result = asyncio.run(reasoner.execute("What is X?", router, client.super_tree_index, client.db))
+            result = asyncio.run(reasoner.execute("What is X?", router, client.db))
 
         router._search_super_tree.assert_awaited_once_with("What is X?", 3)
         assert result == expected_result
@@ -252,7 +252,7 @@ class TestMultiHopLoop:
         with patch.object(multi_hop_mod, "llm_acompletion", side_effect=mock_acompletion), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer text"):
             result = asyncio.run(reasoner.execute(
-                "How does A relate to B?", router, client.super_tree_index, client.db
+                "How does A relate to B?", router, client.db
             ))
 
         # Should have navigated at least twice
@@ -331,7 +331,7 @@ class TestMultiHopLoop:
         with patch.object(multi_hop_mod, "llm_acompletion", side_effect=mock_acompletion), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute(
-                "How does Alpha connect to Beta?", router, client.super_tree_index, client.db
+                "How does Alpha connect to Beta?", router, client.db
             ))
 
         # Graph was consulted
@@ -371,7 +371,7 @@ class TestMaxHopsLimit:
         with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose_response if "decomposable" in p or "可分解" in p else always_next), \
              patch.object(multi_hop_mod, "llm_completion", return_value="final"):
             result = asyncio.run(reasoner.execute(
-                "complex query", router, client.super_tree_index, client.db, max_hops=2
+                "complex query", router, client.db, max_hops=2
             ))
 
         # Should stop at max_hops=2 (not 3 or 4)
@@ -404,7 +404,7 @@ class TestEarlyTermination:
         with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose_response if "decomposable" in p or "可分解" in p else hop1_extract), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute(
-                "query", router, client.super_tree_index, client.db
+                "query", router, client.db
             ))
 
         # Only 1 hop should execute (no next hop to follow)
@@ -433,7 +433,7 @@ class TestEarlyTermination:
         with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose_response if "decomposable" in p or "可分解" in p else hop1_extract), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute(
-                "query", router, client.super_tree_index, client.db
+                "query", router, client.db
             ))
 
         # Empty context should trigger early termination
@@ -453,7 +453,7 @@ class TestRetrieveModelWiring:
         })
 
         with patch.object(multi_hop_mod, "llm_acompletion", return_value=single_hop) as mock_llm:
-            asyncio.run(reasoner.execute("q", router, client.super_tree_index, client.db))
+            asyncio.run(reasoner.execute("q", router, client.db))
             # First call is decomposability judgment — must use retrieve_model
             assert mock_llm.call_args_list[0][0][0] == "r-model"
 
@@ -476,7 +476,7 @@ class TestRetrieveModelWiring:
 
         with patch.object(multi_hop_mod, "llm_acompletion", side_effect=track_calls), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
-            asyncio.run(reasoner.execute("q", router, client.super_tree_index, client.db))
+            asyncio.run(reasoner.execute("q", router, client.db))
 
         # All llm_acompletion calls must use retrieve_model
         for m in calls:
@@ -492,7 +492,7 @@ class TestRetrieveModelWiring:
         })
 
         with patch.object(multi_hop_mod, "llm_acompletion", return_value=single_hop) as mock_llm:
-            asyncio.run(reasoner.execute("q", router, client.super_tree_index, client.db))
+            asyncio.run(reasoner.execute("q", router, client.db))
             assert mock_llm.call_args_list[0][0][0] == "m"
 
 
@@ -522,7 +522,7 @@ class TestTokenBudget:
         with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose if "decomposable" in p or "可分解" in p else extract), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute(
-                "q", router, client.super_tree_index, client.db, max_hops=3
+                "q", router, client.db, max_hops=3
             ))
 
         assert result["answer"]
@@ -552,7 +552,7 @@ class TestTokenBudget:
         with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose if "decomposable" in p or "可分解" in p else extract), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute(
-                "q", router, client.super_tree_index, client.db, max_hops=3,
+                "q", router, client.db, max_hops=3,
                 token_budget=500
             ))
 
@@ -630,7 +630,7 @@ class TestGraphGuidedNextHop:
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute(
                 "What technology does ProjectX use?",
-                router, client.super_tree_index, client.db
+                router, client.db
             ))
 
         assert result["answer"]
@@ -650,7 +650,7 @@ class TestReasonerResultStructure:
         })
 
         with patch.object(multi_hop_mod, "llm_acompletion", return_value=single_hop):
-            result = asyncio.run(reasoner.execute("q", router, client.super_tree_index, client.db))
+            result = asyncio.run(reasoner.execute("q", router, client.db))
 
         assert "query" in result
         assert "answer" in result
@@ -672,7 +672,83 @@ class TestReasonerResultStructure:
 
         with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose if "decomposable" in p or "可分解" in p else extract), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
-            result = asyncio.run(reasoner.execute("q", router, client.super_tree_index, client.db))
+            result = asyncio.run(reasoner.execute("q", router, client.db))
 
         assert "hop_count" in result
         assert result["hop_count"] >= 1
+
+
+class TestMatchedDocsPopulated:
+    """Issue #1: all_matched_docs must be populated with hop doc IDs in multi-hop result."""
+
+    def test_multi_hop_result_has_populated_matched_docs(self):
+        """After multi-hop execution, matched_docs must contain doc IDs from hops."""
+        reasoner, router, client = _make_reasoner()
+
+        decompose = json.dumps({"decomposable": True, "sub_queries": ["Q1", "Q2"]})
+        hop1_extract = json.dumps({
+            "entities": ["entity_A"],
+            "facts": ["A is related to B"],
+            "next_hop_hint": "entity_B",
+        })
+        hop2_extract = json.dumps({
+            "entities": [],
+            "facts": ["B does X"],
+            "next_hop_hint": "",
+        })
+
+        # Query-aware mocks so _guide_next_hop can find entity_B
+        def mock_search_entities(query, limit=5):
+            q = query.lower()
+            if "entity_b" in q:
+                return [{"id": 2, "name": "entity_B"}]
+            return [{"id": 1, "name": "entity_A"}]
+
+        client.db.search_entities = mock_search_entities
+
+        def mock_get_entity_relations(entity_id):
+            if entity_id == 1:
+                return [
+                    {"subject_id": 1, "subject_name": "entity_A", "predicate": "related_to",
+                     "object_id": 2, "object_name": "entity_B", "confidence": 0.9},
+                ]
+            if entity_id == 2:
+                return [
+                    {"subject_id": 2, "subject_name": "entity_B", "predicate": "uses",
+                     "object_id": 3, "object_name": "entity_C", "confidence": 0.8},
+                ]
+            return []
+
+        client.db.get_entity_relations = mock_get_entity_relations
+        client.db.get_entity_documents.return_value = [{"id": 10, "pdf_name": "doc.pdf"}]
+
+        # Hop 1 returns doc_pages_map with doc "doc-uuid-1", hop 2 with "doc-uuid-2"
+        hop_count = [0]
+        def mock_act_tree(query, docs):
+            hop_count[0] += 1
+            if hop_count[0] == 1:
+                return ("ctx1", [{"node_id": "n1"}], 1, 1, {"doc-uuid-1": [1, 2]}, [])
+            return ("ctx2", [{"node_id": "n2"}], 1, 1, {"doc-uuid-2": [3]}, [])
+
+        router._act_tree_search = AsyncMock(side_effect=mock_act_tree)
+
+        llm_calls = [0]
+        def mock_acompletion(model, prompt):
+            llm_calls[0] += 1
+            if "decomposable" in prompt or "可分解" in prompt:
+                return decompose
+            if llm_calls[0] == 2:
+                return hop1_extract
+            return hop2_extract
+
+        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=mock_acompletion), \
+             patch.object(multi_hop_mod, "llm_completion", return_value="final answer"):
+            result = asyncio.run(reasoner.execute(
+                "How does A relate to B?", router, client.db
+            ))
+
+        # matched_docs must NOT be empty — must contain doc IDs from hops
+        assert result["matched_docs"], "matched_docs is empty; hop doc IDs were never collected"
+        doc_ids = {d["doc_id"] for d in result["matched_docs"]}
+        assert "doc-uuid-1" in doc_ids, "doc-uuid-1 from hop 1 missing from matched_docs"
+        assert "doc-uuid-2" in doc_ids, "doc-uuid-2 from hop 2 missing from matched_docs"
