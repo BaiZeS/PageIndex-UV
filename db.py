@@ -963,6 +963,52 @@ class PageIndexDB:
                 (json.dumps(merged, ensure_ascii=False), entity_id)
             )
 
+    def merge_entities(self, canonical_id: int, duplicate_id: int) -> None:
+        """Merge duplicate entity into canonical: redirect mentions/relations, merge aliases, delete duplicate."""
+        if canonical_id == duplicate_id:
+            return
+        with self._connect() as conn:
+            # Redirect entity_mentions
+            conn.execute(
+                "UPDATE OR IGNORE entity_mentions SET entity_id = ? WHERE entity_id = ?",
+                (canonical_id, duplicate_id),
+            )
+            # Redirect entity_relations (subject and object)
+            conn.execute(
+                "UPDATE OR IGNORE entity_relations SET subject_id = ? WHERE subject_id = ?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute(
+                "UPDATE OR IGNORE entity_relations SET object_id = ? WHERE object_id = ?",
+                (canonical_id, duplicate_id),
+            )
+            # Merge aliases from duplicate into canonical
+            row = conn.execute(
+                "SELECT aliases FROM entities WHERE id = ?", (canonical_id,)
+            ).fetchone()
+            if row:
+                existing = json.loads(row["aliases"] or "[]")
+                dup_row = conn.execute(
+                    "SELECT name, aliases FROM entities WHERE id = ?", (duplicate_id,)
+                ).fetchone()
+                if dup_row:
+                    dup_aliases = json.loads(dup_row["aliases"] or "[]")
+                    dup_name = dup_row["name"]
+                    merged = list(dict.fromkeys(existing + [dup_name] + dup_aliases))
+                    conn.execute(
+                        "UPDATE entities SET aliases = ? WHERE id = ?",
+                        (json.dumps(merged, ensure_ascii=False), canonical_id),
+                    )
+            # Update doc_count for canonical
+            conn.execute(
+                """UPDATE entities SET doc_count = (
+                    SELECT COUNT(DISTINCT doc_id) FROM entity_mentions WHERE entity_id = ?
+                ) WHERE id = ?""",
+                (canonical_id, canonical_id),
+            )
+            # Delete duplicate
+            conn.execute("DELETE FROM entities WHERE id = ?", (duplicate_id,))
+
     def delete_entity(self, entity_id: int) -> None:
         """Delete an entity and its mentions/relations."""
         with self._connect() as conn:

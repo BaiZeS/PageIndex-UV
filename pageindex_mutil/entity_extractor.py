@@ -341,3 +341,87 @@ class EntityExtractor:
         except Exception as e:
             logger.warning("Entity disambiguation failed: %s", e)
             return None
+
+    def normalize_entities_batch(self, db) -> None:
+        """Batch entity normalization: LLM merges synonyms per type group.
+
+        Mirrors the _normalize_tags pattern in corpus_tree.py:
+        - Collect all unique entities grouped by type
+        - For each type: LLM merges synonyms → canonical entity map
+        - Apply: merge duplicate entities, update mentions
+        - Conservative on failure (identity mapping)
+        """
+        entity_types = ["person", "project", "organization", "concept"]
+        for etype in entity_types:
+            entities = db.get_entities_by_type(etype)
+            if len(entities) <= 1:
+                continue
+            names = [e["name"] for e in entities]
+            mapping = self._normalize_entities_llm(names)
+            # Apply canonical map: group by canonical → merge duplicates
+            canonical_groups: dict[str, list] = {}
+            for entity in entities:
+                canonical = mapping.get(entity["name"], entity["name"])
+                canonical_groups.setdefault(canonical, []).append(entity)
+            for canonical, group in canonical_groups.items():
+                if len(group) <= 1:
+                    continue
+                # Find or use the first entity as canonical
+                canonical_entity = None
+                for e in group:
+                    if e["name"] == canonical:
+                        canonical_entity = e
+                        break
+                if canonical_entity is None:
+                    canonical_entity = group[0]
+                for e in group:
+                    if e["id"] == canonical_entity["id"]:
+                        continue
+                    try:
+                        db.merge_entities(canonical_entity["id"], e["id"])
+                    except Exception as ex:
+                        logger.warning("Entity merge failed (%s → %s): %s",
+                                       e["name"], canonical, ex)
+
+    def _normalize_entities_llm(self, names: list[str]) -> dict[str, str]:
+        """LLM merges synonym entity names → raw→canonical mapping.
+
+        Mirrors _normalize_tags in corpus_tree.py. Conservative on failure.
+        """
+        mapping = {n: n for n in names}
+        if len(names) <= 1:
+            return mapping
+        prompt = (
+            "你是一个实体归一化专家。以下是从语料库全部文档中抽取的实体名称集合，"
+            "其中可能存在同义或近义实体（例如\"张三\"与\"张先生\"同义）。\n"
+            "请将同义/近义实体合并，输出规范实体集。\n\n"
+            f"实体全集：\n{json.dumps(names, ensure_ascii=False)}\n\n"
+            "要求：\n"
+            "1. 含义相同或高度相近的实体必须合并为同一个规范实体\n"
+            "2. 规范实体名选用其中最清晰、最通用的表述\n"
+            "3. 含义不同的实体保持各自独立，自成规范实体\n"
+            "4. 每个输入实体都必须归入一个规范实体，不得遗漏\n\n"
+            '返回JSON格式：{"groups": [{"canonical": "规范实体", "synonyms": ["原实体1", "原实体2"]}, ...]}\n'
+            "直接返回最终JSON结构，不要输出其他内容。"
+        )
+        try:
+            response = llm_completion(self.retrieve_model or self.model, prompt)
+            if not response:
+                return mapping
+            data = extract_json(response)
+            if not isinstance(data, dict):
+                return mapping
+            for group in data.get("groups", []):
+                if not isinstance(group, dict):
+                    continue
+                canonical = str(group.get("canonical", "")).strip()
+                if not canonical:
+                    continue
+                for syn in group.get("synonyms", []):
+                    syn = str(syn).strip()
+                    if syn in mapping:
+                        mapping[syn] = canonical
+            return mapping
+        except Exception as e:
+            logger.warning("Entity batch normalization failed: %s", e)
+            return mapping

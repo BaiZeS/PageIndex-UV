@@ -455,6 +455,194 @@ class PageIndexClient:
         finally:
             self._pending_enrichment.discard(db_doc_id)
 
+    def _parse_and_insert_doc(self, file_path: str, mode: str) -> tuple[str, int, dict]:
+        """Parse a document and insert into DB. Returns (uuid_doc_id, db_doc_id, doc)."""
+        file_path = os.path.abspath(os.path.expanduser(file_path))
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        doc_id = str(uuid.uuid4())
+        ext = os.path.splitext(file_path)[1].lower()
+        is_pdf = ext == '.pdf'
+        is_md = ext in ['.md', '.markdown']
+
+        if mode == "pdf" or (mode == "auto" and is_pdf):
+            logging.info("Indexing PDF: %s", file_path)
+            result = page_index(
+                doc=file_path, model=self.model,
+                if_add_node_summary='yes', if_add_node_text='yes',
+                if_add_node_id='yes', if_add_doc_description='yes')
+            import PyPDF2
+            pages = []
+            with open(file_path, 'rb') as f:
+                pdf_reader = PyPDF2.PdfReader(f)
+                for i, page in enumerate(pdf_reader.pages, 1):
+                    pages.append({'page': i, 'content': page.extract_text() or ''})
+            self.documents[doc_id] = {
+                'id': doc_id, 'type': 'pdf', 'path': file_path,
+                'doc_name': result.get('doc_name', ''),
+                'doc_description': result.get('doc_description', ''),
+                'page_count': len(pages), 'structure': result['structure'], 'pages': pages,
+            }
+        elif mode == "md" or (mode == "auto" and is_md):
+            logging.info("Indexing Markdown: %s", file_path)
+            coro = md_to_tree(
+                md_path=file_path, if_thinning=False,
+                if_add_node_summary='yes', summary_token_threshold=200,
+                model=self.model, if_add_doc_description='yes',
+                if_add_node_text='yes', if_add_node_id='yes')
+            try:
+                asyncio.get_running_loop()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    result = pool.submit(asyncio.run, coro).result()
+            except RuntimeError:
+                result = asyncio.run(coro)
+            self.documents[doc_id] = {
+                'id': doc_id, 'type': 'md', 'path': file_path,
+                'doc_name': result.get('doc_name', ''),
+                'doc_description': result.get('doc_description', ''),
+                'line_count': result.get('line_count', 0), 'structure': result['structure'],
+            }
+        elif mode == "auto" and is_liteparse_format(file_path):
+            logging.info("Indexing via LiteParse: %s", file_path)
+            coro = liteparse_to_tree(
+                file_path=file_path, model=self.model, if_thinning=False,
+                if_add_node_summary='yes', summary_token_threshold=200,
+                if_add_doc_description='yes', if_add_node_text='yes', if_add_node_id='yes')
+            try:
+                asyncio.get_running_loop()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    result = pool.submit(asyncio.run, coro).result()
+            except RuntimeError:
+                result = asyncio.run(coro)
+            doc_type = ext.lstrip('.')
+            self.documents[doc_id] = {
+                'id': doc_id, 'type': doc_type, 'path': file_path,
+                'doc_name': result.get('doc_name', ''),
+                'doc_description': result.get('doc_description', ''),
+                'line_count': result.get('line_count', 0), 'structure': result['structure'],
+            }
+        else:
+            raise ValueError(f"Unsupported file format for: {file_path}")
+
+        doc = self.documents[doc_id]
+        db_doc_id = self.db.insert_document(
+            pdf_name=doc.get('doc_name', ''),
+            pdf_path=file_path,
+            doc_description=doc.get('doc_description', ''))
+        self._id_mapper.register(doc_id, db_doc_id)
+
+        if doc.get('structure'):
+            from .utils import create_clean_structure_for_description
+            tree_for_reasoning = create_clean_structure_for_description(doc['structure'])
+            self.db.update_document_tree(db_doc_id, json.dumps(tree_for_reasoning, ensure_ascii=False))
+
+        if self.closet_index and doc.get('structure'):
+            self.closet_index.add_document(
+                db_doc_id, doc.get('doc_name', ''),
+                doc.get('doc_description', ''), doc['structure'])
+
+        return doc_id, db_doc_id, doc
+
+    def index_batch(self, file_paths: list[str], mode: str = "auto") -> list[str]:
+        """Batch index multiple documents with batch normalization.
+
+        Phase 1 — Extraction (per-doc, concurrent with semaphore)
+        Phase 2 — Batch corpus tree rebuild
+        Phase 3 — Batch entity normalization
+        Phase 4 — Search backend + super_tree indexing
+
+        Returns list of doc_ids (UUIDs).
+        """
+        if not self.db:
+            raise RuntimeError("Database required for batch mode. Pass db_path to PageIndexClient.")
+
+        import os as _os
+        concurrency = int(_os.environ.get("LLM_CONCURRENCY", "2"))
+
+        # -- Phase 1: per-doc extraction (concurrent) --
+        phase1_results: list[tuple[str, int, dict]] = []
+        llm_semaphore = threading.Semaphore(concurrency)
+
+        def _extract_one(file_path: str) -> tuple[str, int, dict]:
+            with llm_semaphore:
+                return self._parse_and_insert_doc(file_path, mode)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [pool.submit(_extract_one, fp) for fp in file_paths]
+            for fut in concurrent.futures.as_completed(futures):
+                phase1_results.append(fut.result())
+
+        # Entity + relation extraction (sequential, under semaphore)
+        for _, db_doc_id, doc in phase1_results:
+            if not (self.entity_extractor and doc.get('structure')):
+                continue
+            try:
+                result = self.entity_extractor.extract_from_document(
+                    doc.get('doc_name', ''), doc.get('doc_description', ''),
+                    doc['structure'])
+                entities, relations, node_contexts = result
+
+                def _find_context(entity_name, contexts):
+                    name_lower = entity_name.lower()
+                    for ctx in contexts:
+                        if name_lower in ctx.lower():
+                            return ctx[:200]
+                    return None
+
+                entity_ids = {}
+                for entity in entities:
+                    eid = self.db.insert_entity(
+                        entity.entity_type, entity.name, entity.aliases)
+                    if eid:
+                        entity_ids[entity.name] = eid
+                        context_snippet = _find_context(entity.name, node_contexts)
+                        self.db.insert_entity_mention(
+                            eid, db_doc_id,
+                            context_snippet=context_snippet,
+                            confidence=entity.confidence)
+
+                for rel in relations:
+                    subject_id = entity_ids.get(rel.subject)
+                    object_id = entity_ids.get(rel.object)
+                    if subject_id and object_id:
+                        self.db.insert_entity_relation(
+                            subject_id, rel.predicate, object_id,
+                            doc_id=db_doc_id, confidence=rel.confidence)
+
+                logging.info("Extracted %d entities and %d relations for %s",
+                             len(entities), len(relations), doc.get('doc_name'))
+            except Exception as e:
+                logging.warning("Entity extraction failed for doc %d: %s", db_doc_id, e)
+
+        # -- Phase 2: batch corpus tree rebuild --
+        try:
+            self.rebuild_corpus_tree()
+        except Exception as e:
+            logging.warning("Batch corpus tree rebuild failed: %s", e)
+
+        # -- Phase 3: batch entity normalization --
+        if self.entity_extractor:
+            try:
+                self.entity_extractor.normalize_entities_batch(self.db)
+            except Exception as e:
+                logging.warning("Batch entity normalization failed: %s", e)
+
+        # -- Phase 4: search backend + super_tree indexing --
+        for doc_id, db_doc_id, doc in phase1_results:
+            try:
+                if hasattr(self, 'super_tree_index') and self.super_tree_index:
+                    self.super_tree_index.on_document_added(db_doc_id)
+                if self.search_backend and doc.get('structure'):
+                    self.search_backend.index_document(
+                        db_doc_id, doc['structure'], doc.get('pages'))
+            except Exception as e:
+                logging.warning("Phase 4 indexing failed for doc %d: %s", db_doc_id, e)
+
+        doc_ids = [r[0] for r in phase1_results]
+        logging.info("Batch indexing complete: %d documents", len(doc_ids))
+        return doc_ids
+
     def rebuild_corpus_tree(self) -> dict:
         """Full (re)build of the corpus tree (P1). Returns the inspectable tree.
 
