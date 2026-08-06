@@ -1,8 +1,9 @@
-"""Tests for parallel TOC detection with early stop (T12).
+"""Tests for parallel TOC detection (T12).
 
-Verifies that find_toc_pages uses ThreadPoolExecutor for the first 10 pages,
-stops early when a TOC page is found, and falls back to sequential for
-remaining pages.
+Verifies that find_toc_pages uses ThreadPoolExecutor for the first batch
+(TOC_PARALLEL_BATCH_SIZE pages), skips the sequential tail when a TOC is
+found inside the batch, and falls back to sequential for remaining pages
+otherwise.
 """
 import sys
 from pathlib import Path
@@ -42,11 +43,11 @@ class TestTocParallelDetection:
         assert result == [2]
 
 
-class TestTocEarlyStop:
-    """Early stop: not all pages checked when TOC is in first 10."""
+class TestTocSkipsSequentialTail:
+    """When TOC is found inside the parallel batch, sequential tail is skipped."""
 
-    def test_early_stop_skips_pages_beyond_10(self):
-        """When TOC is on page 3, pages beyond first batch not checked."""
+    def test_skips_sequential_tail_when_toc_in_batch(self):
+        """When TOC is on page 3, pages beyond the parallel batch not checked."""
         call_pages = []
 
         def track_calls(content, model=None):

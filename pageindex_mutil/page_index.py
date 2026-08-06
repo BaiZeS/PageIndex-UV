@@ -359,7 +359,25 @@ def toc_transformer(toc_content, model=None):
 
 
 
+TOC_PARALLEL_BATCH_SIZE = 10
+
+
 def find_toc_pages(start_page_index, page_list, opt, logger=None, _detector=None):
+    """Detect TOC pages using a parallel-first strategy.
+
+    Phase 1 submits ``min(TOC_PARALLEL_BATCH_SIZE, remaining)`` pages to a
+    thread pool **without** gating on ``opt.toc_check_page_num``.  This is a
+    deliberate trade-off: the batch is small (10 pages) so the extra work is
+    bounded, and it lets us overlap the expensive LLM calls that dominate
+    latency.  ``toc_check_page_num`` is honoured from Phase 2 onward (the
+    sequential fallback paths).
+
+    The primary win from the parallel batch is *throughput*, not "early stop".
+    ``ThreadPoolExecutor`` cannot cancel in-flight futures — once submitted,
+    every page in the batch will be evaluated regardless of intermediate
+    results.  What we *can* do is skip the sequential tail when a TOC is found
+    inside the batch.
+    """
     print('start find_toc_pages')
     toc_page_list = []
     total_pages = len(page_list)
@@ -368,8 +386,9 @@ def find_toc_pages(start_page_index, page_list, opt, logger=None, _detector=None
     if start_page_index >= total_pages:
         return toc_page_list
 
-    # Phase 1: parallel detection of first 10 pages (or fewer)
-    parallel_end = min(start_page_index + 10, total_pages)
+    # Phase 1: parallel detection of first TOC_PARALLEL_BATCH_SIZE pages (or fewer).
+    # Note: this intentionally bypasses the toc_check_page_num gate — see docstring.
+    parallel_end = min(start_page_index + TOC_PARALLEL_BATCH_SIZE, total_pages)
     # Map of page_idx -> 'yes'/'no' for the parallel batch
     batch_results = {}
 
