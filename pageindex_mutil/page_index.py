@@ -359,31 +359,94 @@ def toc_transformer(toc_content, model=None):
 
 
 
-def find_toc_pages(start_page_index, page_list, opt, logger=None):
+def find_toc_pages(start_page_index, page_list, opt, logger=None, _detector=None):
     print('start find_toc_pages')
-    last_page_is_yes = False
     toc_page_list = []
-    i = start_page_index
-    
-    while i < len(page_list):
-        # Only check beyond max_pages if we're still finding TOC pages
-        if i >= opt.toc_check_page_num and not last_page_is_yes:
-            break
-        detected_result = toc_detector_single_page(page_list[i][0],model=opt.model)
-        if detected_result == 'yes':
+    total_pages = len(page_list)
+    detector = _detector or toc_detector_single_page
+
+    if start_page_index >= total_pages:
+        return toc_page_list
+
+    # Phase 1: parallel detection of first 10 pages (or fewer)
+    parallel_end = min(start_page_index + 10, total_pages)
+    # Map of page_idx -> 'yes'/'no' for the parallel batch
+    batch_results = {}
+
+    if parallel_end - start_page_index > 1:
+        futures = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for i in range(start_page_index, parallel_end):
+                future = executor.submit(
+                    detector, page_list[i][0], model=opt.model
+                )
+                futures[future] = i
+
+            for future in as_completed(futures):
+                page_idx = futures[future]
+                batch_results[page_idx] = future.result()
+    else:
+        # Single page — no parallelism needed
+        detected = detector(page_list[start_page_index][0], model=opt.model)
+        batch_results[start_page_index] = detected
+
+    # Phase 2: find consecutive TOC span using batch results
+    first_toc_page = None
+    for i in range(start_page_index, parallel_end):
+        if batch_results.get(i) == 'yes':
+            if first_toc_page is None:
+                first_toc_page = i
+            toc_page_list.append(i)
             if logger:
                 logger.info(f'Page {i} has toc')
-            toc_page_list.append(i)
-            last_page_is_yes = True
-        elif detected_result == 'no' and last_page_is_yes:
+        elif first_toc_page is not None:
+            # First "no" after a "yes" — TOC span ended within batch
             if logger:
                 logger.info(f'Found the last page with toc: {i-1}')
             break
-        i += 1
-    
+
+    # Phase 3: if TOC extends beyond the parallel batch, continue sequentially
+    if first_toc_page is not None and toc_page_list and toc_page_list[-1] == parallel_end - 1:
+        for i in range(parallel_end, total_pages):
+            if i >= opt.toc_check_page_num:
+                break
+            detected_result = detector(page_list[i][0], model=opt.model)
+            if detected_result == 'yes':
+                toc_page_list.append(i)
+                if logger:
+                    logger.info(f'Page {i} has toc')
+            else:
+                if logger:
+                    logger.info(f'Found the last page with toc: {i-1}')
+                break
+
+    # Phase 4: no TOC in batch — sequential fallback for remaining pages
+    if first_toc_page is None and parallel_end < total_pages:
+        for i in range(parallel_end, total_pages):
+            if i >= opt.toc_check_page_num:
+                break
+            detected_result = detector(page_list[i][0], model=opt.model)
+            if detected_result == 'yes':
+                toc_page_list.append(i)
+                if logger:
+                    logger.info(f'Page {i} has toc')
+                for j in range(i + 1, total_pages):
+                    if j >= opt.toc_check_page_num:
+                        break
+                    next_result = detector(page_list[j][0], model=opt.model)
+                    if next_result == 'yes':
+                        toc_page_list.append(j)
+                        if logger:
+                            logger.info(f'Page {j} has toc')
+                    else:
+                        if logger:
+                            logger.info(f'Found the last page with toc: {j-1}')
+                        break
+                break
+
     if not toc_page_list and logger:
         logger.info('No toc found')
-        
+
     return toc_page_list
 
 def remove_page_number(data):
