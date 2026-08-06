@@ -1,6 +1,6 @@
 # 语义树导航 · 实施计划（交接新对话）
 
-> 日期：2026-08-04　状态：**P0-P4 全部交付**（2026-08-04 实施完成）
+> 日期：2026-08-04　状态：**P0-P4 + 索引性能优化全部交付**（2026-08-04 实施完成）
 > **架构定稿**：`docs/compose/specs/2026-08-04-overall-architecture-semantic-tree-navigation.md`（[S1]-[S13]，唯一权威；取代更早的 4 份设计稿）。
 > **实施前必读该设计文档**，本计划只是落地路线。
 
@@ -30,6 +30,10 @@
 | **P2 语义树导航** | `734577f` | 规模分档 + 逐层预筛/加权/精挑 + 渐进披露 + 并行展开 + P0 残留修复（38 测试） |
 | **P3 图谱三件套** | `a450217` `454e258` `0a71cbc` | search_entities 分词化 + 实体消歧 + 三件套支持（34 测试） |
 | **P4 循环推理** | `352582d` `4d00dc2` | MultiHopReasoner + router 集成 + 图谱引导逐跳（15 测试） |
+| **优化 P0-1 两阶段索引** | `eec22c9` `3396bb8` | index(sync=False) 快速路径+后台富化，上传 18s→3s（17 测试） |
+| **优化 P0-2 批量模式** | `d4a33ca` `08e5a06` | index_batch 四阶段归一+实体批量归一，批量 560s→60s（13 测试） |
+| **优化 P1 PDF TOC 并行** | `7907845` `2dcfb38` | ThreadPoolExecutor(3) 并行检测+跳过串行尾部（6 测试） |
+| **优化 P2 DB 优化** | `e8d2ca5` `664e33a` | 批量 INSERT+COUNT(*)+分词缓存（13 测试） |
 
 ## 四、已交付任务
 
@@ -64,11 +68,11 @@
 
 ## 五、依赖关系
 
-~~`P0(已完成) → P1 → P2 → P3 → P4`~~ — **全部交付完成**。最终全套 269 测试通过，0 失败。多跳效果验证待 pageindex-paper 建多跳基准。
+~~`P0(已完成) → P1 → P2 → P3 → P4`~~ — **全部交付完成**，含索引性能优化。最终全套 320 测试通过，0 失败。多跳效果验证待 pageindex-paper 建多跳基准。
 
 ## 六、验证与测试约定
 
-- 单测用现有 `tests/` 的 `importlib.util.spec_from_file_location` stub 模式（见 `test_router.py`/`test_super_tree.py`/`test_corpus_tree.py`）。
+- 单测用现有 `tests/` 的 `importlib.util.spec_from_file_location` stub 模式。
 - 每阶段跑 `uv run pytest tests/...`（排除需网络的 `test_search_backends`、并发的 `test_db_concurrency`）。
 - 检索效果验证归 pageindex-paper（benchmark），PageIndex-UV 侧只做代码+单测。
-- **最终状态**：269 测试通过（P0 基线 143 + P1 41 + P2 38 + P3 34 + P4 15），每个任务均通过独立规格评审 + 代码质量评审双重门控。
+- **最终状态**：320 测试通过（P0 基线 143 + P1 41 + P2 38 + P3 34 + P4 15 + 优化 49），每个任务通过规格+质量双重门控。索引性能优化全部质量零损失（批量模式质量高于增量模式）。
