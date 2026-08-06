@@ -278,3 +278,66 @@ class EntityExtractor:
         )
 
         return entities, relations, node_contexts
+
+    def disambiguate_entity(
+        self,
+        new_name: str,
+        new_aliases: List[str],
+        existing_entities: List[Dict],
+    ) -> Optional[Dict]:
+        """Decide whether a new entity should merge with an existing one.
+
+        Uses LLM (retrieve_model per NFR4) to compare the new entity against
+        existing entities of the same type.  Returns the canonical entity dict
+        to merge into, or None if no merge is appropriate.
+
+        On LLM failure, conservatively returns None (no merge).
+        """
+        if not existing_entities:
+            return None
+
+        candidates_text = json.dumps(
+            [{"name": e["name"], "aliases": json.loads(e.get("aliases", "[]") or "[]")}
+             for e in existing_entities[:20]],
+            ensure_ascii=False,
+        )
+
+        prompt = (
+            "你是实体消歧专家。给定一个新实体和已有实体列表，判断新实体是否与某个已有实体是同一人/事/物。\n\n"
+            f"新实体名称: {new_name}\n"
+            f"新实体别名: {json.dumps(new_aliases, ensure_ascii=False)}\n\n"
+            f"已有实体列表:\n{candidates_text}\n\n"
+            "要求:\n"
+            "1. 如果新实体与某个已有实体是同一人/事/物，返回该已有实体的名称\n"
+            "2. 如果不确定或不是同一实体，返回 null\n"
+            "3. 考虑别名、简称、同义词等因素\n\n"
+            '返回JSON: {"should_merge": true/false, "canonical_name": "实体名或null", "reason": "理由"}\n'
+            "直接返回JSON，不要其他内容。"
+        )
+
+        try:
+            response = llm_completion(self.retrieve_model or self.model, prompt)
+            if not response:
+                return None
+
+            data = extract_json(response)
+            if not isinstance(data, dict):
+                return None
+
+            if not data.get("should_merge"):
+                return None
+
+            canonical_name = data.get("canonical_name")
+            if not canonical_name:
+                return None
+
+            # Find the matching existing entity
+            for entity in existing_entities:
+                if entity["name"] == canonical_name:
+                    return entity
+
+            return None
+
+        except Exception as e:
+            logger.warning("Entity disambiguation failed: %s", e)
+            return None

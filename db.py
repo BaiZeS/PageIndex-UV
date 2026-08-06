@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import json
+import re
 import threading
 
 
@@ -772,18 +773,62 @@ class PageIndexDB:
         ).fetchone()
         return dict(row) if row else None
 
+    @staticmethod
+    def _tokenize_query(query: str) -> list[str]:
+        """Tokenize query with jieba, filter stopwords and single-char tokens."""
+        import jieba
+        # Common Chinese stopwords that don't help entity matching
+        _STOPWORDS = frozenset({
+            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都",
+            "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你",
+            "会", "着", "没有", "看", "好", "自己", "这", "他", "吗", "那",
+            "被", "它", "把", "又", "对", "或者", "但", "而", "与", "及",
+            "什么", "怎么", "哪些", "哪个", "如何", "为什么", "可以", "能",
+            "请", "帮", "找", "查", "看看", "一下", "参与", "关于", "相关",
+        })
+        tokens = jieba.lcut(query)
+        # Filter: strip whitespace, filter stopwords, filter single-char tokens
+        result = []
+        for t in tokens:
+            t = t.strip()
+            if not t or len(t) < 2:
+                continue
+            if t in _STOPWORDS:
+                continue
+            result.append(t)
+        return result
+
     def search_entities(self, query: str, limit: int = 20) -> list:
-        """Search entities by name (partial match)."""
+        """Search entities by name/aliases using jieba tokenization.
+
+        Tokenizes the query with jieba, filters stopwords and single-char
+        tokens, then matches each token against entity name/aliases with OR.
+        Results are deduplicated and ordered by doc_count DESC.
+        """
+        if not query or not query.strip():
+            return []
+
+        tokens = self._tokenize_query(query)
+        if not tokens:
+            return []
+
         conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT * FROM entities 
-            WHERE name LIKE ? OR aliases LIKE ?
+        # Build OR conditions for each token against name and aliases
+        conditions = []
+        params = []
+        for token in tokens:
+            conditions.append("(name LIKE ? OR aliases LIKE ?)")
+            params.extend([f"%{token}%", f"%{token}%"])
+
+        where_clause = " OR ".join(conditions)
+        sql = f"""
+            SELECT DISTINCT * FROM entities
+            WHERE {where_clause}
             ORDER BY doc_count DESC
             LIMIT ?
-            """,
-            (f"%{query}%", f"%{query}%", limit)
-        ).fetchall()
+        """
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def get_entity_relations(self, entity_id: int, direction: str = "both") -> list:
