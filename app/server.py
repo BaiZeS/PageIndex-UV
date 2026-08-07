@@ -941,13 +941,17 @@ def _determine_mode(filename: str) -> str:
 async def _index_one_file(temp_path: Path, filename: str) -> dict:
     """Index a single file with concurrency limiting.
 
+    Uses two-phase indexing (sync=False): Phase 1 (parse + tags + keyword index)
+    returns fast (~3s); Phase 2 (entity extraction + disambiguation + corpus tree)
+    runs in background. Document is searchable immediately after Phase 1.
+
     Returns a result dict with filename, success, and either doc_id or error.
     """
     mode = _determine_mode(filename)
     try:
         async with _UPLOAD_SEMAPHORE:
             doc_id = await asyncio.to_thread(
-                get_client().index, str(temp_path), mode=mode
+                get_client().index, str(temp_path), mode=mode, sync=False
             )
         return {
             "filename": filename,
