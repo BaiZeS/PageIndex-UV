@@ -372,13 +372,75 @@ class PageIndexClient:
             self._save_doc(doc_id)
         return doc_id
 
+    def _extract_entities_for_doc(self, db_doc_id: int, doc: dict) -> None:
+        """Extract and store entities + relations for a document.
+
+        Runs in a background thread, parallel with tags/corpus_tree/search_backend.
+        """
+        if not (self.entity_extractor and doc.get('structure')):
+            return
+        try:
+            result = self.entity_extractor.extract_from_document(
+                doc.get('doc_name', ''),
+                doc.get('doc_description', ''),
+                doc['structure']
+            )
+            entities, relations, node_contexts = result
+
+            def _find_context(entity_name, contexts):
+                name_lower = entity_name.lower()
+                for ctx in contexts:
+                    if name_lower in ctx.lower():
+                        return ctx[:200]
+                return None
+
+            entity_ids = {}
+            for entity in entities:
+                eid = self._resolve_entity(
+                    entity.entity_type,
+                    entity.name,
+                    entity.aliases,
+                    self.entity_extractor,
+                )
+                if eid:
+                    entity_ids[entity.name] = eid
+                    context_snippet = _find_context(entity.name, node_contexts)
+                    self.db.insert_entity_mention(
+                        eid, db_doc_id,
+                        context_snippet=context_snippet,
+                        confidence=entity.confidence
+                    )
+
+            for rel in relations:
+                subject_id = entity_ids.get(rel.subject)
+                object_id = entity_ids.get(rel.object)
+                if subject_id and object_id:
+                    self.db.insert_entity_relation(
+                        subject_id, rel.predicate, object_id,
+                        doc_id=db_doc_id, confidence=rel.confidence
+                    )
+
+            logging.info("Extracted %d entities and %d relations for %s",
+                       len(entities), len(relations), doc.get('doc_name'))
+        except Exception as e:
+            logging.warning("Entity extraction failed for doc %d: %s", db_doc_id, e)
+
     def _enrich_document(self, db_doc_id: int, doc: dict) -> None:
         """Phase 2: corpus tree + search backend + entity extraction.
 
         Runs in a background thread (or inline when sync=True).
+        Entity extraction runs in parallel with tags/corpus_tree/search_backend
+        (it is independent of those steps).
         Exceptions are caught and logged — never propagate.
         """
         try:
+            # Start entity extraction in parallel (independent of tags/corpus_tree).
+            entity_future = None
+            if self.entity_extractor and doc.get('structure'):
+                entity_future = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(
+                    self._extract_entities_for_doc, db_doc_id, doc
+                )
+
             # Corpus tree (P1): incremental attach after closet tags exist.
             if self.corpus_tree:
                 try:
@@ -397,57 +459,12 @@ class PageIndexClient:
                 except Exception as e:
                     logging.warning("Failed to index in search backend: %s", e)
 
-            # Extract entities and relationships
-            if self.entity_extractor and doc.get('structure'):
+            # Wait for entity extraction to complete
+            if entity_future is not None:
                 try:
-                    result = self.entity_extractor.extract_from_document(
-                        doc.get('doc_name', ''),
-                        doc.get('doc_description', ''),
-                        doc['structure']
-                    )
-                    entities, relations, node_contexts = result
-
-                    # Build context snippet map for entities
-                    # (find the most relevant context snippet for each entity)
-                    def _find_context(entity_name, contexts):
-                        name_lower = entity_name.lower()
-                        for ctx in contexts:
-                            if name_lower in ctx.lower():
-                                return ctx[:200]
-                        return None
-
-                    # Store entities (with disambiguation against existing set)
-                    entity_ids = {}
-                    for entity in entities:
-                        eid = self._resolve_entity(
-                            entity.entity_type,
-                            entity.name,
-                            entity.aliases,
-                            self.entity_extractor,
-                        )
-                        if eid:
-                            entity_ids[entity.name] = eid
-                            context_snippet = _find_context(entity.name, node_contexts)
-                            self.db.insert_entity_mention(
-                                eid, db_doc_id,
-                                context_snippet=context_snippet,
-                                confidence=entity.confidence
-                            )
-
-                    # Store relations
-                    for rel in relations:
-                        subject_id = entity_ids.get(rel.subject)
-                        object_id = entity_ids.get(rel.object)
-                        if subject_id and object_id:
-                            self.db.insert_entity_relation(
-                                subject_id, rel.predicate, object_id,
-                                doc_id=db_doc_id, confidence=rel.confidence
-                            )
-
-                    logging.info("Extracted %d entities and %d relations for %s",
-                               len(entities), len(relations), doc.get('doc_name'))
+                    entity_future.result()
                 except Exception as e:
-                    logging.warning("Entity extraction failed: %s", e)
+                    logging.warning("Entity extraction thread failed for doc %d: %s", db_doc_id, e)
 
             logging.info("Background enrichment complete for doc %d", db_doc_id)
         except Exception as e:
