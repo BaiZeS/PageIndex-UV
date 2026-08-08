@@ -136,7 +136,7 @@ def count_tokens(text, model=None):
     return len(encoder.encode(text))
 
 
-def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
+def llm_completion(model, prompt, chat_history=None, return_finish_reason=False, thinking_disabled=True):
     if not _client:
         logging.error("OpenAI client not initialized.")
         if return_finish_reason:
@@ -152,6 +152,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 return cached, "cached"
             return cached
 
+    extra = {"thinking": {"type": "disabled"}} if thinking_disabled else {}
     max_retries = 3
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
     for i in range(max_retries):
@@ -160,6 +161,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 model=model,
                 messages=messages,
                 temperature=0,
+                **extra,
             )
             content = response.choices[0].message.content
             # Cache result for non-history calls
@@ -182,10 +184,11 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 return ""
 
 
-async def llm_acompletion(model, prompt):
+async def llm_acompletion(model, prompt, thinking_disabled=True):
     if not _async_client:
         logging.error("AsyncOpenAI client not initialized.")
         return ""
+    extra = {"thinking": {"type": "disabled"}} if thinking_disabled else {}
     max_retries = 3
     messages = [{"role": "user", "content": prompt}]
     for i in range(max_retries):
@@ -194,6 +197,7 @@ async def llm_acompletion(model, prompt):
                 model=model,
                 messages=messages,
                 temperature=0,
+                **extra,
             )
             return response.choices[0].message.content
         except Exception as e:

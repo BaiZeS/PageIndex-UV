@@ -90,7 +90,7 @@ class EntityExtractor:
         )
 
         try:
-            response = llm_completion(self.retrieve_model or self.model, prompt)
+            response = llm_completion(self.retrieve_model or self.model, prompt, thinking_disabled=True)
             if not response:
                 return []
             
@@ -175,7 +175,7 @@ class EntityExtractor:
         )
 
         try:
-            response = llm_completion(self.retrieve_model or self.model, prompt)
+            response = llm_completion(self.retrieve_model or self.model, prompt, thinking_disabled=True)
             if not response:
                 return []
             
@@ -316,7 +316,7 @@ class EntityExtractor:
         )
 
         try:
-            response = llm_completion(self.retrieve_model or self.model, prompt)
+            response = llm_completion(self.retrieve_model or self.model, prompt, thinking_disabled=True)
             if not response:
                 return None
 
@@ -405,7 +405,7 @@ class EntityExtractor:
             "直接返回最终JSON结构，不要输出其他内容。"
         )
         try:
-            response = llm_completion(self.retrieve_model or self.model, prompt)
+            response = llm_completion(self.retrieve_model or self.model, prompt, thinking_disabled=True)
             if not response:
                 return mapping
             data = extract_json(response)

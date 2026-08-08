@@ -87,7 +87,7 @@ class CRAGVerifier:
 直接返回JSON，不要其他内容。
 """
         try:
-            response = llm_completion(self.retrieve_model or self.model, prompt)
+            response = llm_completion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
             if not response:
                 return VerifyResult(confidence=s_ret, action="answer")
 

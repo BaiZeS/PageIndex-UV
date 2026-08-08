@@ -722,7 +722,7 @@ class CorpusTreeBuilder:
 
     def _llm_json(self, prompt: str):
         try:
-            response = llm_completion(self._llm_model, prompt)
+            response = llm_completion(self._llm_model, prompt, thinking_disabled=True)
             if not response:
                 return None
             return extract_json(response)

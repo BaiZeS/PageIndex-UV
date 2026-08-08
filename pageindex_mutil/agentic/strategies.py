@@ -85,7 +85,7 @@ class DescriptionStrategy:
 最多返回5个最相关的文档。直接返回JSON，不要其他内容。
 """
         try:
-            response = llm_completion(self.retrieve_model or self.model, prompt)
+            response = llm_completion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
             if not response:
                 return []
             data = extract_json(response)

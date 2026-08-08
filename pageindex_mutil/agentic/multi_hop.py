@@ -144,7 +144,7 @@ class MultiHopReasoner:
         if generate_answer:
             answer = generate_answer(query, aggregated_ctx)
         else:
-            answer = llm_completion(self._llm_model, self._build_answer_prompt(query, aggregated_ctx))
+            answer = llm_completion(self._llm_model, self._build_answer_prompt(query, aggregated_ctx), thinking_disabled=False)
 
         return {
             "query": query,
@@ -170,7 +170,7 @@ class MultiHopReasoner:
             "直接返回JSON，不要其他内容。"
         )
 
-        response = await llm_acompletion(self._llm_model, prompt)
+        response = await llm_acompletion(self._llm_model, prompt, thinking_disabled=False)
         logger.info("[MultiHop] decomposable response=%r", (response or "")[:100])
         if not response:
             return False
@@ -196,7 +196,7 @@ class MultiHopReasoner:
             "直接返回JSON，不要其他内容。"
         )
 
-        response = await llm_acompletion(self._llm_model, prompt)
+        response = await llm_acompletion(self._llm_model, prompt, thinking_disabled=False)
         if not response:
             return {"entities": [], "facts": [], "next_hop_hint": ""}
 

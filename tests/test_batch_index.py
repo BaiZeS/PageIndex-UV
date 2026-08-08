@@ -403,7 +403,7 @@ class TestEntityNormalizationMergesSynonyms:
 
         llm_calls = []
 
-        def mock_llm(model, prompt):
+        def mock_llm(model, prompt, **kw):
             llm_calls.append(prompt)
             # Return identity mapping (no merges)
             if "张三" in prompt:

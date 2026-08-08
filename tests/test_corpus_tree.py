@@ -97,7 +97,7 @@ def _route_llm(handlers):
     """Build a fake llm_completion routing canned responses by prompt marker."""
     calls = []
 
-    def fake(model, prompt, chat_history=None, return_finish_reason=False):
+    def fake(model, prompt, chat_history=None, return_finish_reason=False, thinking_disabled=True):
         calls.append((model, prompt))
         for marker, resp in handlers.items():
             if marker in prompt:

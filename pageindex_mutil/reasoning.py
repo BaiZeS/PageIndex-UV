@@ -63,7 +63,8 @@ def _call_llm_json(prompt, extract_key=None, expect_list=False):
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.0
+            temperature=0.0,
+            
         )
         content = response.choices[0].message.content
         if not content:
@@ -170,7 +171,8 @@ def generate_answer(question, context):
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5
+            temperature=0.5,
+            
         )
         return response.choices[0].message.content
     except Exception as e:

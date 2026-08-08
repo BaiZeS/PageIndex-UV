@@ -111,7 +111,7 @@ class KBIdentity:
 
 直接返回纯文本摘要，不要输出 JSON 或其他格式。"""
 
-        response = llm_completion(self.retrieve_model or self.model, prompt)
+        response = llm_completion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
         if response:
             cleaned = strip_markdown_fence(response)
             self.db.set_kb_identity(cleaned, len(docs))
@@ -383,7 +383,7 @@ class SuperTreeIndex:
 {{"tags": ["领域标签1", "领域标签2"]}}
 只返回与查询相关的领域，直接返回JSON，不要其他内容。"""
 
-        response = await llm_acompletion(self.retrieve_model or self.model, prompt)
+        response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
         if not response:
             return candidate_db_ids
 
@@ -451,7 +451,7 @@ class SuperTreeIndex:
 }}
 直接返回最终JSON结构，不要输出其他内容。"""
 
-        response = await llm_acompletion(self.retrieve_model or self.model, prompt)
+        response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
         if not response:
             return []
 
@@ -534,7 +534,7 @@ class SuperTreeIndex:
 {{"doc_ids": ["uuid-1", "uuid-2"]}}
 直接返回JSON，不要其他内容。"""
 
-        response = await llm_acompletion(self.retrieve_model or self.model, prompt)
+        response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
         if not response:
             return []
         data = extract_json(response)
@@ -799,7 +799,7 @@ class SuperTreeIndex:
 
 返回JSON格式：{{"node_ids": [1, 2]}}
 直接返回JSON，不要其他内容。"""
-        response = await llm_acompletion(self.retrieve_model or self.model, prompt)
+        response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
         if not response:
             return []
         data = extract_json(response)

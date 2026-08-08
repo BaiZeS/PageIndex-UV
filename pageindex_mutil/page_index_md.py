@@ -68,7 +68,7 @@ def semantic_sections_from_markdown(markdown_content, model=None):
         "直接返回最终JSON数组，不要输出其他内容。"
     )
     try:
-        response = llm_completion(model, prompt)
+        response = llm_completion(model, prompt, thinking_disabled=True)
         if not response:
             return []
         data = extract_json(response)

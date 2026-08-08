@@ -240,7 +240,7 @@ class TestMultiHopLoop:
 
         # Use call counter to distinguish decomposability, extraction hop1, extraction hop2
         acall_n = [0]
-        def mock_acompletion(model, prompt):
+        def mock_acompletion(model, prompt, **kw):
             acall_n[0] += 1
             if "decomposable" in prompt or "可分解" in prompt:
                 return decompose_response
@@ -320,7 +320,7 @@ class TestMultiHopLoop:
         )
 
         acall_n = [0]
-        def mock_acompletion(model, prompt):
+        def mock_acompletion(model, prompt, **kw):
             acall_n[0] += 1
             if "decomposable" in prompt or "可分解" in prompt:
                 return decompose_response
@@ -368,7 +368,7 @@ class TestMaxHopsLimit:
             return_value=("ctx", [], 1, 1, {}, [])
         )
 
-        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose_response if "decomposable" in p or "可分解" in p else always_next), \
+        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p, **kw: decompose_response if "decomposable" in p or "可分解" in p else always_next), \
              patch.object(multi_hop_mod, "llm_completion", return_value="final"):
             result = asyncio.run(reasoner.execute(
                 "complex query", router, client.db, max_hops=2
@@ -401,7 +401,7 @@ class TestEarlyTermination:
             return_value=("context", [], 1, 1, {}, [])
         )
 
-        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose_response if "decomposable" in p or "可分解" in p else hop1_extract), \
+        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p, **kw: decompose_response if "decomposable" in p or "可分解" in p else hop1_extract), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute(
                 "query", router, client.db
@@ -430,7 +430,7 @@ class TestEarlyTermination:
             return_value=("", [], 0, 0, {}, [])
         )
 
-        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose_response if "decomposable" in p or "可分解" in p else hop1_extract), \
+        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p, **kw: decompose_response if "decomposable" in p or "可分解" in p else hop1_extract), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute(
                 "query", router, client.db
@@ -468,7 +468,7 @@ class TestRetrieveModelWiring:
         )
 
         calls = []
-        def track_calls(model, prompt):
+        def track_calls(model, prompt, **kw):
             calls.append(model)
             if "decomposable" in prompt or "可分解" in prompt:
                 return decompose
@@ -519,7 +519,7 @@ class TestTokenBudget:
         client.db.get_entity_relations.return_value = []
         client.db.get_entity_documents.return_value = [{"id": 1, "pdf_name": "d.pdf"}]
 
-        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose if "decomposable" in p or "可分解" in p else extract), \
+        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute(
                 "q", router, client.db, max_hops=3
@@ -549,7 +549,7 @@ class TestTokenBudget:
         client.db.get_entity_relations.return_value = []
         client.db.get_entity_documents.return_value = [{"id": 1, "pdf_name": "d.pdf"}]
 
-        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose if "decomposable" in p or "可分解" in p else extract), \
+        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute(
                 "q", router, client.db, max_hops=3,
@@ -618,7 +618,7 @@ class TestGraphGuidedNextHop:
         router._act_tree_search = AsyncMock(side_effect=mock_act_tree)
 
         llm_calls = []
-        def mock_acompletion(model, prompt):
+        def mock_acompletion(model, prompt, **kw):
             llm_calls.append(prompt[:200])
             if "decomposable" in prompt or "可分解" in prompt:
                 return decompose
@@ -670,7 +670,7 @@ class TestReasonerResultStructure:
             return_value=("ctx", [], 1, 1, {}, [])
         )
 
-        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p: decompose if "decomposable" in p or "可分解" in p else extract), \
+        with patch.object(multi_hop_mod, "llm_acompletion", side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract), \
              patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
             result = asyncio.run(reasoner.execute("q", router, client.db))
 
@@ -733,7 +733,7 @@ class TestMatchedDocsPopulated:
         router._act_tree_search = AsyncMock(side_effect=mock_act_tree)
 
         llm_calls = [0]
-        def mock_acompletion(model, prompt):
+        def mock_acompletion(model, prompt, **kw):
             llm_calls[0] += 1
             if "decomposable" in prompt or "可分解" in prompt:
                 return decompose
