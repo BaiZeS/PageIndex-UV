@@ -65,6 +65,12 @@ verifier_mod = importlib.util.module_from_spec(verifier_spec)
 sys.modules["pageindex_mutil.agentic.verifier"] = verifier_mod
 verifier_spec.loader.exec_module(verifier_mod)
 
+# Pre-seed pageindex.agentic.multi_hop (router imports it at module level)
+multi_hop_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.multi_hop", pageindex_path / "agentic" / "multi_hop.py")
+multi_hop_mod = importlib.util.module_from_spec(multi_hop_spec)
+sys.modules["pageindex_mutil.agentic.multi_hop"] = multi_hop_mod
+multi_hop_spec.loader.exec_module(multi_hop_mod)
+
 # Now load the router
 router_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.router", pageindex_path / "agentic" / "router.py")
 router_mod = importlib.util.module_from_spec(router_spec)

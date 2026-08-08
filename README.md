@@ -149,6 +149,7 @@ API_KEY=testkey uv run python -m app.server
 │   ├── hybrid_backend.py      # 混合搜索后端（向量+关键词+标签 RRF 融合，需 [vector]）
 │   ├── chroma_backend.py      # ChromaDB 向量搜索后端（需 [vector]）
 │   ├── entity_extractor.py    # 实体/关系抽取 + 知识图谱
+│   ├── corpus_tree.py         # 语料统一结构树（Corpus Tree）
 │   ├── reasoning.py           # 推理逻辑（含共享上下文组装、LLM 缓存）
 │   ├── retrieve.py            # 单文档检索辅助
 │   ├── utils.py               # 工具函数（含 LLM 调用缓存）
@@ -158,7 +159,8 @@ API_KEY=testkey uv run python -m app.server
 │       ├── router.py          # 路由编排（并行节点召回 + HyDE）
 │       ├── planner.py         # 查询规划（HyDE + 查询变体）
 │       ├── strategies.py      # 检索策略（Metadata/Semantics/Description）
-│       └── verifier.py        # CRAG 答案验证
+│       ├── verifier.py        # CRAG 答案验证
+│       └── multi_hop.py       # 多跳推理（图谱引导的迭代检索）
 ├── app/                       # 应用入口
 │   ├── __init__.py
 │   ├── main.py                # 交互式问答入口

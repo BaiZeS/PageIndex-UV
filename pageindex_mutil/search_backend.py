@@ -1,9 +1,9 @@
 """Search backend abstraction layer.
 
 Provides a unified interface for different search backends:
-- SQLiteBackend: Current default (jieba inverted index + ClosetIndex tags)
-- ChromaBackend: ChromaDB vector search (required)
-- HybridBackend: Combined vector + keyword search (default)
+- KeywordSearchBackend: Default (jieba inverted index + ClosetIndex tags)
+- ChromaSearchBackend: ChromaDB vector search
+- HybridSearchBackend: Combined vector + keyword + tag search (RRF fusion)
 """
 
 from abc import ABC, abstractmethod

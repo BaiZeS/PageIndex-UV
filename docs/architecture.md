@@ -160,9 +160,9 @@ Configurable weights per channel (default: vector 1.5x, keyword 1.0x, tag 1.0x).
 
 | Surface | Path / Tool | Notes |
 |---|---|---|
-| CLI | `main.py` | `/add /list /doc <n> /clear /help` |
+| CLI | `main.py` | `/add /list /doc <n> /help` |
 | Web console | `web/index.html` + `web/static/{tokens,base,components}.css` + `web/static/{lib,components,app.js}` | Vue 3 + Element Plus, no build step. See [web-console-design-system.md](web-console-design-system.md) |
-| MCP (SSE) | `GET /sse`, `POST /messages/` | Tools: `search`, `list_documents`, `get_document`, `delete_document`. See [mcp-tools.md](mcp-tools.md) |
+| MCP (SSE) | `GET /sse`, `POST /messages/` | Tools: `search`, `list_documents`, `get_document`, `delete_document`, `search_entities`, `get_entity`, `get_document_entities`, `get_related_documents`, `get_relations`, `get_stats`. See [mcp-tools.md](mcp-tools.md) |
 | REST API | `GET /health`, `POST /upload`, `GET/DELETE /api/documents`, `POST /api/search`, `GET/POST /api/config`, `POST /api/config/test` | Used by the web console; same auth as MCP (`X-API-Key`) |
 | Auth | `APIKeyMiddleware` | Public: `/`, `/health`, `/static/*`. Gated: `/api/*`, `/sse`, `/messages/`, `/upload` |
 | Documents store | `WORKSPACE/` (PDF/MD/DOCX/PPTX/XLSX/images/HTML) | Path from `.env` (`WORKSPACE=…`). LiteParse handles non-PDF/MD formats. |
@@ -178,13 +178,19 @@ pages (id, doc_id, page_number, content)
 
 -- Super-Tree v3 tables
 closet_tags (id, doc_id, tag_text, tag_token, confidence, source)
-doc_keywords (id, doc_id, keyword, field)  -- field: "name"|"description"|"node_title"
+doc_keywords (id, doc_id, keyword, field)  -- field: "name"|"description"|"node_title"|"content"
 kb_identity (id, identity_text, doc_count, updated_at)
 
 -- Entity knowledge graph tables
 entities (id, entity_type, name, aliases, doc_count, created_at)
 entity_mentions (id, entity_id, doc_id, node_id, context_snippet, confidence, created_at)
 entity_relations (id, subject_id, predicate, object_id, doc_id, confidence, created_at)
+
+-- Corpus tree tables
+corpus_tree_nodes (id, parent_id, title, summary, level, kind, tag, created_at)
+corpus_tree_membership (doc_id, node_id, weight)
+corpus_tag_norm (raw_tag, canonical_tag)
+corpus_tree_events (id, node_id, event_type, detail, created_at)
 ```
 
 ## Stability promise

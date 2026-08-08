@@ -942,6 +942,8 @@ class PageIndexClient:
         context = build_context_for_doc(doc, selected, pages)
         answer = generate_answer(query, context)
 
+        page_map = {p["page"]: p["content"] for p in doc.get("pages", [])}
+
         return {
             "query": query,
             "mode": "single",
