@@ -256,7 +256,8 @@ Accept: text/event-stream
 {
   "mcpServers": {
     "pageindex-uv": {
-      "url": "http://127.0.0.1:3000/sse",
+      "type": "sse",
+      "url": "http://localhost:3000/sse",
       "headers": { "X-API-Key": "<your API_KEY>" }
     }
   }
