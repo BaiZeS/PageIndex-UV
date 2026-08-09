@@ -708,6 +708,9 @@ def add_node_text_with_labels(node, pdf_pages):
     return
 
 
+_SUMMARY_BATCH_SIZE = 3
+
+
 async def generate_node_summary(node, model=None):
     prompt = f"""You are given a part of a document, your task is to generate a description of the partial document about what are main points covered in the partial document.
 
@@ -719,12 +722,49 @@ async def generate_node_summary(node, model=None):
     return response
 
 
+async def _batch_summaries(nodes_with_text, model=None):
+    """Generate summaries for a batch of (index, title, text) tuples in one LLM call."""
+    sections = []
+    for idx, title, text in nodes_with_text:
+        sections.append(f"[{idx}] {title}\n{text}")
+    prompt = (
+        "你是一个文档摘要专家。请为以下每个章节生成一句简洁的摘要（中文），"
+        "概括该章节的核心内容。每个摘要不超过 50 字。\n\n"
+        + "\n\n".join(sections)
+        + "\n\n请以 JSON 数组格式返回，每个元素对应一个章节的摘要，顺序保持一致。\n"
+        '格式：["摘要1", "摘要2", ...]\n'
+        "直接返回 JSON 数组，不要输出其他内容。"
+    )
+    response = await llm_acompletion(model, prompt)
+    if not response:
+        return None
+    result = extract_json(response)
+    if isinstance(result, list) and len(result) == len(nodes_with_text):
+        return [str(s) for s in result]
+    return None
+
+
 async def generate_summaries_for_structure(structure, model=None):
     nodes = structure_to_list(structure)
-    tasks = [generate_node_summary(node, model=model) for node in nodes]
-    summaries = await asyncio.gather(*tasks)
-    
-    for node, summary in zip(nodes, summaries):
+    results = [None] * len(nodes)
+
+    # Batch nodes into groups of _SUMMARY_BATCH_SIZE.
+    batches = []
+    for i, node in enumerate(nodes):
+        batches.append((i, node.get('title', ''), node.get('text', '')))
+
+    for batch_start in range(0, len(batches), _SUMMARY_BATCH_SIZE):
+        batch = batches[batch_start:batch_start + _SUMMARY_BATCH_SIZE]
+        batch_summaries = await _batch_summaries(batch, model=model)
+        if batch_summaries:
+            for (orig_idx, _, _), summary in zip(batch, batch_summaries):
+                results[orig_idx] = summary
+        else:
+            # Fallback: per-node calls for this batch
+            for orig_idx, _, _ in batch:
+                results[orig_idx] = await generate_node_summary(nodes[orig_idx], model=model)
+
+    for node, summary in zip(nodes, results):
         node['summary'] = summary
     return structure
 

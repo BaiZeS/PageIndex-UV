@@ -14,30 +14,70 @@ from .utils import (
     generate_node_summary,
     generate_doc_description,
     llm_completion,
+    llm_acompletion,
     extract_json,
 )
 
-async def get_node_summary(node, summary_token_threshold=200, model=None):
-    node_text = node.get('text')
-    num_tokens = count_tokens(node_text, model=model)
-    if num_tokens < summary_token_threshold:
-        return node_text
-    else:
-        return await generate_node_summary(node, model=model)
+# Batch size for summary generation — how many nodes per LLM call.
+_BATCH_SIZE = 3
+
+
+async def _batch_generate_summaries(nodes_with_text, model=None):
+    """Generate summaries for a batch of nodes in a single LLM call.
+
+    Each entry in *nodes_with_text* is ``(index, title, text)``.
+    Returns a list of summary strings aligned with the input order.
+    Falls back to per-node calls on parse failure.
+    """
+    sections = []
+    for idx, title, text in nodes_with_text:
+        sections.append(f"[{idx}] {title}\n{text}")
+    prompt = (
+        "你是一个文档摘要专家。请为以下每个章节生成一句简洁的摘要（中文），"
+        "概括该章节的核心内容。每个摘要不超过 50 字。\n\n"
+        + "\n\n".join(sections)
+        + "\n\n请以 JSON 数组格式返回，每个元素对应一个章节的摘要，顺序保持一致。\n"
+        '格式：["摘要1", "摘要2", ...]\n'
+        "直接返回 JSON 数组，不要输出其他内容。"
+    )
+    response = await llm_acompletion(model, prompt)
+    if not response:
+        return None
+    result = extract_json(response)
+    if isinstance(result, list) and len(result) == len(nodes_with_text):
+        return [str(s) for s in result]
+    return None
 
 
 async def generate_summaries_for_structure_md(structure, summary_token_threshold, model=None):
     nodes = structure_to_list(structure)
-    # 阶段4：信号量限流，避免对海量叶子全量并发触发 LLM 限流/429。
-    sem = asyncio.Semaphore(2)
 
-    async def _limited(node):
-        async with sem:
-            return await get_node_summary(node, summary_token_threshold=summary_token_threshold, model=model)
+    # Phase 1: short nodes use text directly (no LLM call needed).
+    results = [None] * len(nodes)
+    long_nodes = []  # (original_index, title, text)
+    for i, node in enumerate(nodes):
+        node_text = node.get('text', '')
+        if count_tokens(node_text, model=model) < summary_token_threshold:
+            results[i] = node_text
+        else:
+            long_nodes.append((i, node.get('title', ''), node_text))
 
-    summaries = await asyncio.gather(*[_limited(node) for node in nodes])
-    
-    for node, summary in zip(nodes, summaries):
+    # Phase 2: batch long nodes into groups of _BATCH_SIZE.
+    if long_nodes:
+        for batch_start in range(0, len(long_nodes), _BATCH_SIZE):
+            batch = long_nodes[batch_start:batch_start + _BATCH_SIZE]
+            batch_summaries = await _batch_generate_summaries(batch, model=model)
+            if batch_summaries:
+                for (orig_idx, _, _), summary in zip(batch, batch_summaries):
+                    results[orig_idx] = summary
+            else:
+                # Fallback: per-node calls for this batch
+                for orig_idx, title, text in batch:
+                    node_obj = {'title': title, 'text': text}
+                    results[orig_idx] = await generate_node_summary(node_obj, model=model)
+
+    # Phase 3: assign summaries to nodes.
+    for node, summary in zip(nodes, results):
         if not node.get('nodes'):
             node['summary'] = summary
         else:

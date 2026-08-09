@@ -24,6 +24,9 @@ utils_mod.print_toc = lambda *a, **k: None
 utils_mod.generate_node_summary = lambda *a, **k: None
 utils_mod.generate_doc_description = lambda *a, **k: None
 utils_mod.llm_completion = lambda *a, **k: None
+async def _mock_llm_acompletion(*a, **k):
+    return None
+utils_mod.llm_acompletion = _mock_llm_acompletion
 utils_mod.extract_json = lambda text: json.loads(text) if text else None
 
 spec = importlib.util.spec_from_file_location("pageindex_mutil.page_index_md", _mutil / "page_index_md.py")
@@ -114,37 +117,85 @@ async def test_md_to_tree_falls_back_to_semantic_sections(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_summaries_concurrency_limited():
-    """阶段4 -- 摘要生成用信号量限流，避免并发风暴；结果仍正确汇总。"""
-    from unittest.mock import patch
-    import asyncio
+async def test_summaries_batch_mode():
+    """摘要生成使用批量调用，减少 LLM round-trip。"""
+    from unittest.mock import patch, AsyncMock
 
     structure = [
         {"title": chr(65 + i), "text": "x" * 2000, "nodes": []}
         for i in range(6)
     ]
-    active = 0
-    max_active = 0
+    batch_call_count = 0
 
-    async def fake_summary(node, model=None):
-        nonlocal active, max_active
-        active += 1
-        max_active = max(max_active, active)
-        await asyncio.sleep(0.01)
-        active -= 1
-        return f"summary:{node['title']}"
+    async def fake_batch(nodes_with_text, model=None):
+        nonlocal batch_call_count
+        batch_call_count += 1
+        return [f"batch:{t}" for _, t, _ in nodes_with_text]
 
-    with patch.object(mod, "generate_node_summary", new=fake_summary), \
-             patch.object(mod, "structure_to_list", side_effect=lambda s: (
-                 [s] if isinstance(s, dict) else s
-             )):
+    with patch.object(mod, "_batch_generate_summaries", side_effect=fake_batch), \
+         patch.object(mod, "structure_to_list", side_effect=lambda s: (
+             [s] if isinstance(s, dict) else s
+         )):
         await mod.generate_summaries_for_structure_md(
             structure, summary_token_threshold=200, model=None
         )
-    # 并发被限制在信号量上限内（当前实现无限制会并发到 6）
-    assert max_active <= 2
-    # 结果仍正确
-    assert all(n["summary"] == f"summary:{n['title']}" for n in structure)
+    # 6 nodes / batch_size=3 = 2 batch calls (not 6 individual calls)
+    assert batch_call_count == 2
+    assert all(n["summary"] == f"batch:{n['title']}" for n in structure)
+
+
+@pytest.mark.asyncio
+async def test_summaries_batch_fallback_on_failure():
+    """批量调用失败时回退到单节点调用。"""
+    from unittest.mock import patch
+
+    structure = [
+        {"title": "A", "text": "x" * 2000, "nodes": []},
+        {"title": "B", "text": "x" * 2000, "nodes": []},
+    ]
+    fallback_count = 0
+
+    async def fake_batch(*a, **k):
+        return None  # simulate failure
+
+    async def fake_summary(node, model=None):
+        nonlocal fallback_count
+        fallback_count += 1
+        return f"single:{node['title']}"
+
+    with patch.object(mod, "_batch_generate_summaries", side_effect=fake_batch), \
+         patch.object(mod, "generate_node_summary", side_effect=fake_summary), \
+         patch.object(mod, "structure_to_list", side_effect=lambda s: (
+             [s] if isinstance(s, dict) else s
+         )):
+        await mod.generate_summaries_for_structure_md(
+            structure, summary_token_threshold=200, model=None
+        )
+    # Fallback triggered for both nodes
+    assert fallback_count == 2
+    assert all(n["summary"] == f"single:{n['title']}" for n in structure)
+
+
+@pytest.mark.asyncio
+async def test_summaries_short_text_no_llm():
+    """短文本节点直接使用 text 作为摘要，不调 LLM。"""
+    from unittest.mock import patch
+
+    structure = [
+        {"title": "A", "text": "short", "nodes": []},  # < threshold
+    ]
+
+    async def fake_batch(*a, **k):
+        raise AssertionError("Should not be called for short text")
+
+    with patch.object(mod, "_batch_generate_summaries", side_effect=fake_batch), \
+         patch.object(mod, "structure_to_list", side_effect=lambda s: (
+             [s] if isinstance(s, dict) else s
+         )):
+        await mod.generate_summaries_for_structure_md(
+            structure, summary_token_threshold=200, model=None
+        )
+    assert structure[0]["summary"] == "short"
 
 
 # ---------------------------------------------------------------------------
