@@ -33,8 +33,8 @@ async def _batch_generate_summaries(nodes_with_text, model=None):
     for idx, title, text in nodes_with_text:
         sections.append(f"[{idx}] {title}\n{text}")
     prompt = (
-        "你是一个文档摘要专家。请为以下每个章节生成一句简洁的摘要（中文），"
-        "概括该章节的核心内容。每个摘要不超过 50 字。\n\n"
+        "你是一个文档摘要专家。请为以下每个章节生成摘要，概括该章节涵盖的主要内容。"
+        "摘要应完整反映章节的核心信息，包括重要的名称、术语和关键概念。\n\n"
         + "\n\n".join(sections)
         + "\n\n请以 JSON 数组格式返回，每个元素对应一个章节的摘要，顺序保持一致。\n"
         '格式：["摘要1", "摘要2", ...]\n'

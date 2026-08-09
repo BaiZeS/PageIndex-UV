@@ -61,7 +61,7 @@ class EntityExtractor:
         titles_text = "\n".join("- " + t for t in node_titles[:20])  # Limit to 20 titles
         summaries_text = ""
         if node_summaries:
-            summaries_text = "\n".join("- " + s[:100] for s in node_summaries[:10])  # Limit
+            summaries_text = "\n".join("- " + s for s in node_summaries[:10])  # Limit to 10 summaries
         
         # Build prompt sections
         desc_part = doc_description[:500] if doc_description else "无"
