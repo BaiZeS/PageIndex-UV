@@ -161,7 +161,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False,
                 model=model,
                 messages=messages,
                 temperature=0,
-                **extra,
+                extra_body=extra,
             )
             content = response.choices[0].message.content
             # Cache result for non-history calls
@@ -197,7 +197,7 @@ async def llm_acompletion(model, prompt, thinking_disabled=True):
                 model=model,
                 messages=messages,
                 temperature=0,
-                **extra,
+                extra_body=extra,
             )
             return response.choices[0].message.content
         except Exception as e:

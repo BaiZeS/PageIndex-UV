@@ -87,12 +87,50 @@ def semantic_sections_from_markdown(markdown_content, model=None):
         return []
 
 
+def _normalize_line_breaks(markdown_content):
+    """Split single-line or low-line content at sentence/paragraph boundaries.
+
+    When markdown_content has very few lines (e.g. a single-line string with
+    no ``\\n``), the ``line_num`` system has no granularity and downstream
+    line-based slicing produces empty text.  This function normalizes such
+    content by inserting ``\\n`` at sentence and paragraph boundaries so that
+    ``extract_nodes_from_markdown`` and ``semantic_sections_from_markdown``
+    can work with meaningful line numbers.
+
+    Only activates when the content has fewer than 3 non-empty lines to avoid
+    touching well-structured markdown.
+    """
+    non_empty = [ln for ln in markdown_content.split('\n') if ln.strip()]
+    if len(non_empty) >= 3:
+        return markdown_content
+
+    text = markdown_content
+    # Paragraph boundaries: two or more consecutive newlines (already multi-line,
+    # but may be collapsed into one long line by the caller).
+    text = re.sub(r'\n{2,}', '\n', text)
+
+    # Split at Chinese/English sentence-ending punctuation.
+    # Handles both "A。B" (no space) and "A. B" (with space).
+    # Keeps the delimiter attached to the preceding sentence.
+    text = re.sub(r'([。！？])(?=\S)', r'\1\n', text)
+    text = re.sub(r'([.!?])(\s+)', r'\1\n', text)
+
+    # Split at list markers that may be jammed together on one line.
+    text = re.sub(r'(\S)(\s*[-*]\s+)', r'\1\n\2', text)
+    text = re.sub(r'(\S)(\s*\d+[.、]\s+)', r'\1\n\2', text)
+
+    # Split at markdown horizontal rules (---, ***, ___).
+    text = re.sub(r'(\S)(\s*)([-*_]{3,})', r'\1\n\3', text)
+
+    return text
+
+
 def extract_nodes_from_markdown(markdown_content):
     header_pattern = r'^(#{1,6})\s+(.+)$'
     bold_heading_pattern = r'^\*\*(.+?)\*\*\s*$'
     code_block_pattern = r'^```'
     node_list = []
-    
+
     lines = markdown_content.split('\n')
     in_code_block = False
     
@@ -292,6 +330,7 @@ def clean_tree_for_output(tree_nodes):
 async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_add_node_summary='no', summary_token_threshold=None, model=None, if_add_doc_description='no', if_add_node_text='no', if_add_node_id='yes'):
     with open(md_path, 'r', encoding='utf-8') as f:
         markdown_content = f.read()
+    markdown_content = _normalize_line_breaks(markdown_content)
     line_count = markdown_content.count('\n') + 1
 
     print(f"Extracting nodes from markdown...")
@@ -313,15 +352,25 @@ async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_ad
     if not tree_structure:
         sections = semantic_sections_from_markdown(markdown_content, model=model)
         if sections:
-            semantic_nodes = [
-                {
+            # Sort sections by line_num to compute text intervals
+            sections_sorted = sorted(sections, key=lambda s: s.get("line_num", 1))
+            semantic_nodes = []
+            for i, s in enumerate(sections_sorted):
+                start = s.get("line_num", 1) - 1  # 0-indexed
+                if i + 1 < len(sections_sorted):
+                    end = sections_sorted[i + 1].get("line_num", 1) - 1
+                else:
+                    end = len(markdown_lines)
+                text = '\n'.join(markdown_lines[start:end]).strip()
+                # Fallback to full content if interval slicing yields nothing
+                if not text:
+                    text = markdown_content.strip()
+                semantic_nodes.append({
                     "title": s["title"],
                     "line_num": s.get("line_num", 1),
                     "level": 1,
-                    "text": "",
-                }
-                for s in sections
-            ]
+                    "text": text,
+                })
             tree_structure = build_tree_from_nodes(semantic_nodes)
 
     if if_add_node_id == 'yes':
