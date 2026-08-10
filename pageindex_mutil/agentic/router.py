@@ -168,7 +168,11 @@ class AgenticRouter:
     # Act — tree search + context assembly (parallelized)
     # ------------------------------------------------------------------
     async def _recall_nodes_for_doc(self, query: str, doc_id: str):
-        """Recall relevant nodes for a single document (runs in thread)."""
+        """Recall relevant nodes for a single document (runs in thread).
+
+        Strategy: keyword-first node selection (more reliable than LLM summary-based).
+        LLM is used only for ranking when both methods return results.
+        """
         funcs = self._load_main_funcs()
         get_relevant_nodes = funcs.get("get_relevant_nodes")
         pages_from_nodes = funcs.get("pages_from_nodes")
@@ -182,45 +186,30 @@ class AgenticRouter:
         if not structure:
             return None
 
-        tree_json = json.dumps(structure, ensure_ascii=False)
-        node_ids = await asyncio.to_thread(get_relevant_nodes, query, tree_json)
-
-        # Keyword fallback: if LLM returned nothing or selected nodes
-        # don't contain query keywords, try keyword-based selection.
         from ..client import PageIndexClient
         from ..utils import create_node_mapping
         mapping = create_node_mapping(structure)
 
-        llm_nodes_contain_keywords = False
-        if node_ids:
-            try:
-                import jieba
-                from ..closet_index import _STOPWORDS
-                tokens = {
-                    t.strip().lower() for t in jieba.lcut(query)
-                    if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
-                }
-            except Exception:
-                tokens = set()
-            if tokens:
-                for nid in node_ids:
-                    node = mapping.get(nid)
-                    if node:
-                        text = (node.get("text") or "").lower()
-                        if any(t in text for t in tokens):
-                            llm_nodes_contain_keywords = True
-                            break
+        # Step 1: Keyword-based selection (fast, reliable for content matching)
+        keyword_ids = PageIndexClient._keyword_select_nodes(query, structure)
 
-        if not node_ids or not llm_nodes_contain_keywords:
-            keyword_ids = PageIndexClient._keyword_select_nodes(query, structure)
-            # Merge: keep LLM selections + keyword matches (deduplicated)
-            seen = set(node_ids or [])
-            for kid in keyword_ids:
-                if kid not in seen:
-                    node_ids.append(kid)
-                    seen.add(kid)
+        # Step 2: LLM-based selection (slow, but may catch semantic matches)
+        tree_json = json.dumps(structure, ensure_ascii=False)
+        llm_ids = await asyncio.to_thread(get_relevant_nodes, query, tree_json)
 
-        if not node_ids:
+        # Step 3: Merge results (keyword-first, then LLM)
+        if keyword_ids:
+            # Keyword found results - use as primary, add LLM results
+            seen = set(keyword_ids)
+            node_ids = list(keyword_ids)
+            for nid in (llm_ids or []):
+                if nid not in seen:
+                    node_ids.append(nid)
+                    seen.add(nid)
+        elif llm_ids:
+            # No keyword matches - fallback to LLM only
+            node_ids = llm_ids
+        else:
             return None
 
         selected = [mapping.get(nid) for nid in node_ids if nid in mapping]
