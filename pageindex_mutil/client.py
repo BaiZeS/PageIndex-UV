@@ -575,7 +575,7 @@ class PageIndexClient:
             raise RuntimeError("Database required for batch mode. Pass db_path to PageIndexClient.")
 
         import os as _os
-        concurrency = int(_os.environ.get("LLM_CONCURRENCY", "2"))
+        concurrency = int(_os.environ.get("LLM_CONCURRENCY", "3"))
 
         # -- Phase 1: per-doc extraction (concurrent) --
         phase1_results: list[tuple[str, int, dict]] = []
@@ -590,10 +590,11 @@ class PageIndexClient:
             for fut in concurrent.futures.as_completed(futures):
                 phase1_results.append(fut.result())
 
-        # Entity + relation extraction (sequential, under semaphore)
-        for _, db_doc_id, doc in phase1_results:
+        # Entity + relation extraction (parallel with semaphore)
+        def _extract_entities_one(item):
+            _, db_doc_id, doc = item
             if not (self.entity_extractor and doc.get('structure')):
-                continue
+                return
             try:
                 result = self.entity_extractor.extract_from_document(
                     doc.get('doc_name', ''), doc.get('doc_description', ''),
@@ -631,6 +632,9 @@ class PageIndexClient:
                              len(entities), len(relations), doc.get('doc_name'))
             except Exception as e:
                 logging.warning("Entity extraction failed for doc %d: %s", db_doc_id, e)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(_extract_entities_one, phase1_results))
 
         # -- Phase 2: batch corpus tree rebuild --
         try:

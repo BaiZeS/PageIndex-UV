@@ -202,6 +202,7 @@ class PageIndexDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_entity_relations_subject ON entity_relations(subject_id);
                 CREATE INDEX IF NOT EXISTS idx_entity_relations_object ON entity_relations(object_id);
+                CREATE INDEX IF NOT EXISTS idx_entity_relations_predicate ON entity_relations(predicate);
 
                 -- Corpus tree (P1): unified corpus-level topic hierarchy.
                 -- 文档→节点 is the real trunk; cluster layers above are inferred
