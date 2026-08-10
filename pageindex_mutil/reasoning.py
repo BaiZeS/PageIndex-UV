@@ -96,11 +96,18 @@ def pages_from_nodes(nodes):
 
 
 def get_relevant_nodes(question, tree_json_str):
-    """Find relevant node IDs for a question using LLM."""
+    """Find relevant node IDs for a question using LLM.
+
+    Supports enhanced tree format with matched_keyword and matched_context fields.
+    """
     prompt = f"""
         You are given a question and a tree structure of a document.
         Each node contains a node id, node title, and a corresponding summary.
         Your task is to find all nodes that are likely to contain the answer to the question.
+
+        IMPORTANT: Some nodes may have "matched_keyword" and "matched_context" fields.
+        These indicate that the node contains content matching the query keywords.
+        Pay special attention to these nodes - they are highly likely to contain the answer.
 
         Question: {question}
 

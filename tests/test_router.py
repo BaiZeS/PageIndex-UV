@@ -325,7 +325,7 @@ class TestActTreeSearchBudget:
             "pages_from_nodes": lambda n: [1],
         }
 
-        async def fake_recall(query, doc_id):
+        async def fake_recall(query, doc_id, matched_info=None):
             return {
                 "doc_id": doc_id,
                 "doc": {"doc_name": doc_id, "type": "md"},
@@ -368,7 +368,7 @@ class TestActTreeSearchBudget:
             "pages_from_nodes": lambda n: [1],
         }
 
-        async def fake_recall(query, doc_id):
+        async def fake_recall(query, doc_id, matched_info=None):
             return {
                 "doc_id": doc_id,
                 "doc": {"doc_name": doc_id, "type": "md"},
@@ -407,7 +407,7 @@ class TestActTreeSearchBudget:
             "pages_from_nodes": lambda n: [1],
         }
 
-        async def fake_recall(query, doc_id):
+        async def fake_recall(query, doc_id, matched_info=None):
             return {
                 "doc_id": doc_id,
                 "doc": {"doc_name": doc_id, "type": "md"},
@@ -444,7 +444,7 @@ class TestActTreeSearchBudget:
             "pages_from_nodes": lambda n: [1],
         }
 
-        async def fake_recall(query, doc_id):
+        async def fake_recall(query, doc_id, matched_info=None):
             return {
                 "doc_id": doc_id,
                 "doc": {"doc_name": doc_id, "type": "md"},
@@ -489,7 +489,7 @@ class TestActTreeSearchBudget:
             "pages_from_nodes": lambda n: [1],
         }
 
-        async def fake_recall(query, doc_id):
+        async def fake_recall(query, doc_id, matched_info=None):
             return {
                 "doc_id": doc_id,
                 "doc": {"doc_name": doc_id, "type": "md"},
@@ -522,7 +522,7 @@ class TestActTreeSearchDedup:
     async def test_candidate_docs_deduped_before_recall(self, router):
         calls = []
 
-        async def fake_recall(query, doc_id):
+        async def fake_recall(query, doc_id, matched_info=None):
             calls.append(doc_id)
             return {
                 "doc_id": doc_id,

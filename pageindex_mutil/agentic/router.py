@@ -135,7 +135,13 @@ class AgenticRouter:
     # ------------------------------------------------------------------
     async def _run_strategies(
         self, query: str, docs_info: List[Dict], weights: Dict[str, float]
-    ) -> Dict[str, List[Tuple[str, int]]]:
+    ) -> Tuple[Dict[str, List[Tuple[str, int]]], Dict[str, List[Dict]]]:
+        """Run retrieval strategies and return results + node match info.
+
+        Returns:
+            results: {strategy_name: [(doc_id, rank)]}
+            node_matches: {doc_id: [{"node_id", "keyword", "context"}]}
+        """
         tasks = {}
         tasks["metadata"] = asyncio.to_thread(
             self.metadata_strategy.search, query, docs_info
@@ -154,24 +160,106 @@ class AgenticRouter:
             )
 
         results: Dict[str, List[Tuple[str, int]]] = {}
+        node_matches: Dict[str, List[Dict]] = {}
+
         if tasks:
             done = await asyncio.gather(*tasks.values(), return_exceptions=True)
             for name, res in zip(tasks.keys(), done):
                 if isinstance(res, Exception):
                     logging.warning("Strategy %s failed: %s", name, res)
                     results[name] = []
+                elif name == "content" and isinstance(res, list):
+                    # ContentStrategy returns (doc_id, score, matched_nodes)
+                    content_results = []
+                    for item in res:
+                        if len(item) == 3:
+                            doc_id, score, matches = item
+                            content_results.append((doc_id, score))
+                            node_matches[doc_id] = matches
+                        else:
+                            content_results.append(item)
+                    results[name] = content_results
                 else:
                     results[name] = res
-        return results
+
+        return results, node_matches
 
     # ------------------------------------------------------------------
     # Act — tree search + context assembly (parallelized)
     # ------------------------------------------------------------------
-    async def _recall_nodes_for_doc(self, query: str, doc_id: str):
+    def _enhance_tree_with_matches(self, structure: List[Dict], matched_info: List[Dict]) -> List[Dict]:
+        """Enhance tree nodes with keyword match context for LLM."""
+        match_map = {}
+        for m in matched_info:
+            node_id = m.get("node_id")
+            if node_id:
+                match_map[node_id] = m
+
+        enhanced = []
+        for node in structure:
+            node_data = {
+                "node_id": node.get("node_id"),
+                "title": node.get("title"),
+                "summary": node.get("summary", ""),
+            }
+            # Add match context if available
+            node_id = node.get("node_id")
+            if node_id in match_map:
+                match = match_map[node_id]
+                node_data["matched_keyword"] = match.get("keyword", "")
+                node_data["matched_context"] = match.get("context", "")
+            enhanced.append(node_data)
+
+        return enhanced
+
+    def _adaptive_node_selection(self, node_ids: List[str], structure: List[Dict],
+                                  window: int = 5) -> List[str]:
+        """Adaptive sliding window node selection.
+
+        Select nodes based on relevance score with a sliding window of size 5.
+        If top nodes are close in relevance, include more nodes.
+        """
+        if not node_ids:
+            return []
+
+        from ..utils import create_node_mapping
+        mapping = create_node_mapping(structure)
+
+        # Score nodes by keyword match count
+        scored_nodes = []
+        for nid in node_ids:
+            node = mapping.get(nid)
+            if node:
+                # Simple score: length of text (more content = more relevant)
+                text_len = len(node.get("text", "") or "")
+                scored_nodes.append((nid, text_len))
+
+        scored_nodes.sort(key=lambda x: x[1], reverse=True)
+
+        if not scored_nodes:
+            return []
+
+        # Adaptive window: include nodes within window of top score
+        selected = [scored_nodes[0][0]]
+        top_score = scored_nodes[0][1]
+
+        for nid, score in scored_nodes[1:]:
+            # Include if within window size and score is close to top
+            if len(selected) < window:
+                selected.append(nid)
+            elif score > top_score * 0.5:  # Score is at least 50% of top
+                selected.append(nid)
+            else:
+                break
+
+        return selected
+
+    async def _recall_nodes_for_doc(self, query: str, doc_id: str,
+                                      matched_info: List[Dict] = None):
         """Recall relevant nodes for a single document (runs in thread).
 
-        Strategy: keyword-first node selection (more reliable than LLM summary-based).
-        LLM is used only for ranking when both methods return results.
+        Uses enhanced tree with keyword match context for better LLM decisions.
+        Adaptive sliding window for node selection.
         """
         funcs = self._load_main_funcs()
         get_relevant_nodes = funcs.get("get_relevant_nodes")
@@ -186,31 +274,29 @@ class AgenticRouter:
         if not structure:
             return None
 
-        from ..client import PageIndexClient
         from ..utils import create_node_mapping
         mapping = create_node_mapping(structure)
 
-        # Step 1: Keyword-based selection (fast, reliable for content matching)
-        keyword_ids = PageIndexClient._keyword_select_nodes(query, structure)
-
-        # Step 2: LLM-based selection (slow, but may catch semantic matches)
-        tree_json = json.dumps(structure, ensure_ascii=False)
-        llm_ids = await asyncio.to_thread(get_relevant_nodes, query, tree_json)
-
-        # Step 3: Merge results (keyword-first, then LLM)
-        if keyword_ids:
-            # Keyword found results - use as primary, add LLM results
-            seen = set(keyword_ids)
-            node_ids = list(keyword_ids)
-            for nid in (llm_ids or []):
-                if nid not in seen:
-                    node_ids.append(nid)
-                    seen.add(nid)
-        elif llm_ids:
-            # No keyword matches - fallback to LLM only
-            node_ids = llm_ids
+        # Enhance tree with match context if available
+        if matched_info:
+            enhanced_tree = self._enhance_tree_with_matches(structure, matched_info)
+            tree_json = json.dumps(enhanced_tree, ensure_ascii=False)
         else:
+            tree_json = json.dumps(structure, ensure_ascii=False)
+
+        # LLM-based selection with enhanced context
+        node_ids = await asyncio.to_thread(get_relevant_nodes, query, tree_json)
+
+        # Keyword fallback if LLM returns nothing
+        if not node_ids:
+            from ..client import PageIndexClient
+            node_ids = PageIndexClient._keyword_select_nodes(query, structure)
+
+        if not node_ids:
             return None
+
+        # Adaptive sliding window selection
+        node_ids = self._adaptive_node_selection(node_ids, structure, window=5)
 
         selected = [mapping.get(nid) for nid in node_ids if nid in mapping]
         selected = [n for n in selected if n]
@@ -235,7 +321,8 @@ class AgenticRouter:
         }
 
     async def _act_tree_search(
-        self, query: str, candidate_docs: List[str]
+        self, query: str, candidate_docs: List[str],
+        node_matches: Dict[str, List[Dict]] = None
     ) -> Tuple[str, List[dict], int, int, Dict[str, List[int]], List[dict]]:
         funcs = self._load_main_funcs()
         pages_from_nodes = funcs.get("pages_from_nodes")
@@ -251,9 +338,12 @@ class AgenticRouter:
                 seen_docs.add(doc_id)
                 unique_docs.append(doc_id)
 
-        # Parallel node recall across documents
+        # Parallel node recall across documents (with match info if available)
         recall_tasks = [
-            self._recall_nodes_for_doc(query, doc_id)
+            self._recall_nodes_for_doc(
+                query, doc_id,
+                matched_info=node_matches.get(doc_id) if node_matches else None
+            )
             for doc_id in unique_docs
         ]
         recall_results = await asyncio.gather(*recall_tasks, return_exceptions=True)
@@ -626,7 +716,7 @@ class AgenticRouter:
             }
 
         # Route
-        results = await self._run_strategies(
+        results, node_matches = await self._run_strategies(
             plan.queries[0], docs_info, plan.weights
         )
 
@@ -670,10 +760,10 @@ class AgenticRouter:
             for doc_id, score in fused[:top_k]
         ]
 
-        # Act
+        # Act (with node matches from ContentStrategy)
         try:
             ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = await self._act_tree_search(
-                query, candidates
+                query, candidates, node_matches=node_matches
             )
         except Exception as e:
             logging.warning("Act phase failed: %s", e)

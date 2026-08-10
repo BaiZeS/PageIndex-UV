@@ -49,12 +49,33 @@ class SemanticsStrategy:
 
 
 class ContentStrategy:
-    """Search based on document content keywords (not just metadata)."""
+    """Search based on document content keywords (not just metadata).
+
+    Returns node-level matching information for downstream LLM enhancement.
+    """
 
     def __init__(self, client):
         self.client = client
 
-    def search(self, query: str, docs_info: List[Dict]) -> List[Tuple[str, int]]:
+    def _extract_keyword_context(self, text: str, keyword: str, window: int = 50) -> str:
+        """Extract keyword and its surrounding context."""
+        idx = text.lower().find(keyword.lower())
+        if idx == -1:
+            return None
+        start = max(0, idx - window)
+        end = min(len(text), idx + len(keyword) + window)
+        context = text[start:end]
+        if start > 0:
+            context = "..." + context
+        if end < len(text):
+            context = context + "..."
+        return context
+
+    def search(self, query: str, docs_info: List[Dict]) -> List[Tuple[str, int, List[Dict]]]:
+        """Return (doc_id, score, matched_nodes_info).
+
+        matched_nodes_info: [{"node_id": str, "keyword": str, "context": str}]
+        """
         try:
             tokens = jieba.lcut(query)
         except Exception:
@@ -70,28 +91,53 @@ class ContentStrategy:
         scored = []
         for doc_info in docs_info:
             doc_id = str(doc_info.get("doc_id", ""))
-            # Try to get content from docs_info first
-            content = (doc_info.get("content") or "").lower()
-            # Fallback: read from client.documents
-            if not content and self.client:
-                doc = self.client.documents.get(doc_id)
-                if doc:
-                    # Try pages (PDF)
-                    for p in doc.get("pages", []):
-                        content += (p.get("content") or "") + "\n"
-                    # Try structure text (MD)
-                    if not content.strip():
-                        for node in doc.get("structure", []):
-                            content += (node.get("text") or "") + "\n"
-            if not content.strip():
+            doc = self.client.documents.get(doc_id) if self.client else None
+            if not doc:
                 continue
-            content = content.lower()
-            hits = sum(1 for kw in keywords if kw in content)
-            if hits > 0:
-                scored.append((doc_id, hits))
+
+            matched_nodes = []
+            seen_nodes = set()
+
+            # Search in structure text (both MD and PDF)
+            for node in doc.get("structure", []):
+                text = (node.get("text") or "")
+                text_lower = text.lower()
+                node_id = node.get("node_id")
+                if not node_id or node_id in seen_nodes:
+                    continue
+
+                for kw in keywords:
+                    if kw in text_lower:
+                        context = self._extract_keyword_context(text, kw)
+                        if context:
+                            matched_nodes.append({
+                                "node_id": node_id,
+                                "keyword": kw,
+                                "context": context
+                            })
+                            seen_nodes.add(node_id)
+                            break  # One match per node is enough
+
+            # Also search in pages (PDF)
+            if not matched_nodes:
+                for page in doc.get("pages", []):
+                    page_text = (page.get("content") or "").lower()
+                    for kw in keywords:
+                        if kw in page_text:
+                            context = self._extract_keyword_context(page.get("content", ""), kw)
+                            if context:
+                                matched_nodes.append({
+                                    "node_id": f"page_{page.get('page', 0)}",
+                                    "keyword": kw,
+                                    "context": context
+                                })
+                                break
+
+            if matched_nodes:
+                scored.append((doc_id, len(matched_nodes), matched_nodes))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [(doc_id, rank + 1) for rank, (doc_id, _) in enumerate(scored)]
+        return scored
 
 
 class DescriptionStrategy:
