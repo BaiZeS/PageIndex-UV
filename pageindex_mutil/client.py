@@ -856,6 +856,36 @@ class PageIndexClient:
             "pages": [],
         }
 
+    @staticmethod
+    def _keyword_select_nodes(query: str, structure: list) -> list[str]:
+        """Select node IDs by keyword matching on text content.
+
+        Used as fallback when LLM-based selection misses the answer node.
+        """
+        try:
+            import jieba
+            from .closet_index import _STOPWORDS
+            tokens = {
+                t.strip().lower() for t in jieba.lcut(query)
+                if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
+            }
+        except Exception:
+            tokens = {w.lower() for w in query.split() if len(w) > 1}
+        if not tokens:
+            return []
+
+        mapping = create_node_mapping(structure)
+        scored = []
+        for nid, node in mapping.items():
+            text = (node.get("text") or "").lower()
+            if not text:
+                continue
+            hits = sum(1 for t in tokens if t in text)
+            if hits > 0:
+                scored.append((nid, hits))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [nid for nid, _ in scored]
+
     async def _search_single(self, query: str, doc_id: str) -> dict:
         """Direct tree search for a single document (zero router overhead)."""
         if self.workspace:
@@ -904,6 +934,39 @@ class PageIndexClient:
 
         tree_json = json.dumps(structure, ensure_ascii=False)
         node_ids = get_relevant_nodes(query, tree_json)
+
+        # Keyword fallback: if LLM returned nothing or selected nodes
+        # don't contain query keywords, try keyword-based selection.
+        mapping = create_node_mapping(structure)
+        llm_nodes_contain_keywords = False
+        if node_ids:
+            try:
+                import jieba
+                from .closet_index import _STOPWORDS
+                tokens = {
+                    t.strip().lower() for t in jieba.lcut(query)
+                    if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
+                }
+            except Exception:
+                tokens = set()
+            if tokens:
+                for nid in node_ids:
+                    node = mapping.get(nid)
+                    if node:
+                        text = (node.get("text") or "").lower()
+                        if any(t in text for t in tokens):
+                            llm_nodes_contain_keywords = True
+                            break
+
+        if not node_ids or not llm_nodes_contain_keywords:
+            keyword_ids = self._keyword_select_nodes(query, structure)
+            # Merge: keep LLM selections + keyword matches (deduplicated)
+            seen = set(node_ids or [])
+            for kid in keyword_ids:
+                if kid not in seen:
+                    node_ids.append(kid)
+                    seen.add(kid)
+
         if not node_ids:
             return {
                 "query": query,
@@ -915,7 +978,6 @@ class PageIndexClient:
                 "pages": [],
             }
 
-        mapping = create_node_mapping(structure)
         selected = [mapping.get(nid) for nid in node_ids if nid in mapping]
         selected = [n for n in selected if n]
         if not selected:

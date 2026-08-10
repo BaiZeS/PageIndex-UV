@@ -93,13 +93,24 @@ CRAG Verification (verifier.py)
 
 ## Key components
 
+### Single-Document Retrieval
+
+When only one document is indexed, the search bypasses the agentic router and uses a direct tree search path:
+
+1. **LLM Node Selection** (`get_relevant_nodes()`): LLM selects relevant nodes based on titles and summaries
+2. **Keyword Fallback** (`_keyword_select_nodes()`): If LLM-selected nodes don't contain query keywords, falls back to keyword-based node selection using jieba tokenization on full node text
+3. **Result Merging**: LLM selections and keyword matches are combined (deduplicated)
+4. **Answer Generation**: Context assembled from selected nodes, LLM generates answer
+
+This hybrid approach solves the "summary information loss" problem where LLM-generated summaries don't capture all keywords from the original text.
+
 ### Super-Tree Retrieval v3
 
 The multi-document retrieval uses a four-layer architecture:
 
 1. **L0 Four-Channel Prefilter** (`SuperTreeIndex.prefilter()`):
    - **Channel A (Semantic)**: `ClosetIndex` matches query against `closet_tags` table using jieba tokenization
-   - **Channel B (Keyword)**: `KeywordIndex` matches query against `doc_keywords` table (includes node titles, doc names, descriptions)
+   - **Channel B (Keyword)**: `KeywordIndex` matches query against `doc_keywords` table (includes node titles, doc names, descriptions, and full document content)
    - **Channel C (Vector)**: ChromaDB vector search via `SearchBackend.search()` (1.5x weight for semantic understanding)
    - **Channel D (Entity)**: Entity graph matching via `db.search_entities()` + `db.get_entity_documents()`
    - Results merged into candidate set (max 50 docs)
@@ -125,8 +136,12 @@ The multi-document retrieval uses a four-layer architecture:
 ### Agentic Router (v2 fallback)
 
 When Super-Tree fails, `AgenticRouter.search()` falls back to:
-- **Plan**: Query analysis with HyDE (query type classification + query variants)
-- **Route**: Parallel strategy execution (Metadata/Semantics/Description)
+- **Plan**: Query analysis with HyDE (query type classification + query variants + four-strategy weight allocation)
+- **Route**: Parallel strategy execution (Metadata/Content/Semantics/Description)
+  - **MetadataStrategy**: Matches query against doc_name and description
+  - **ContentStrategy**: Matches query against full document content (cheap, always runs)
+  - **SemanticsStrategy**: Matches query against ClosetIndex semantic tags
+  - **DescriptionStrategy**: LLM-based document relevance judgment
 - **Act**: Parallel node recall + context assembly
 - **Verify**: CRAG verification with confidence thresholds (answer/expand/refuse)
 
@@ -134,7 +149,7 @@ When Super-Tree fails, `AgenticRouter.search()` falls back to:
 
 Three search backends are available (configured via `SEARCH_BACKEND` env var):
 
-- **`keyword`** (default): `KeywordSearchBackend` — jieba tokenization + SQLite inverted index (`doc_keywords`) + ClosetIndex tags. Fast, zero model-loading overhead. Includes LRU search result caching (5min TTL, 128 entries max).
+- **`keyword`** (default): `KeywordSearchBackend` — jieba tokenization + SQLite inverted index (`doc_keywords`) + ClosetIndex tags. Fast, zero model-loading overhead. Includes LRU search result caching (5min TTL, 128 entries max). Indexes full document content for comprehensive keyword matching.
 - **`hybrid`**: `HybridSearchBackend` — combines vector + keyword + tag using Reciprocal Rank Fusion (RRF). Requires `pip install .[vector]`. Includes LRU search result caching.
 - **`chroma`**: `ChromaSearchBackend` — ChromaDB vector search with sentence-transformers embeddings. Requires `pip install .[vector]`. Tracks embedding model identity to prevent dimension mismatches.
 

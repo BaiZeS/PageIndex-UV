@@ -6,6 +6,7 @@
 
 - **混合检索引擎**：四通道预过滤（语义标签 + 关键词倒排 + ChromaDB 向量 + 实体图谱），RRF 融合排序
 - **多文档联合检索**：Super-Tree Retrieval v3 四层架构（L0 四通道预过滤 → L1 LLM 选档 → L2 并行节点推理 → L3 按相关性排序上下文提取）
+- **单文档智能检索**：LLM 节点选择 + 关键词回退机制，解决摘要信息丢失问题
 - **SQLite 缓存加速**：节点元数据、页面文本、树结构持久化，避免重复解析 PDF
 - **实体知识图谱**：自动抽取文档实体与关系，支持跨文档实体驱动检索
 - **多格式支持**：PDF、Markdown、DOCX、PPTX、XLSX 等
@@ -156,9 +157,9 @@ API_KEY=testkey uv run python -m app.server
 │   ├── config.yaml            # 索引/检索参数配置
 │   ├── migrations/            # 数据库迁移脚本
 │   └── agentic/               # Agentic 多策略路由
-│       ├── router.py          # 路由编排（并行节点召回 + HyDE）
-│       ├── planner.py         # 查询规划（HyDE + 查询变体）
-│       ├── strategies.py      # 检索策略（Metadata/Semantics/Description）
+│       ├── router.py          # 路由编排（并行节点召回 + HyDE + 内容搜索）
+│       ├── planner.py         # 查询规划（HyDE + 查询变体 + 四策略权重）
+│       ├── strategies.py      # 检索策略（Metadata/Content/Semantics/Description）
 │       ├── verifier.py        # CRAG 答案验证
 │       └── multi_hop.py       # 多跳推理（图谱引导的迭代检索）
 ├── app/                       # 应用入口

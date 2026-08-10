@@ -26,14 +26,14 @@ class RetrievalPlanner:
 1. 判断问题类型: factual(事实查询) / analytical(分析推理) / comparative(对比查询) / vague(模糊查询)
 2. 生成假设答案(HyDE): 基于问题生成一个简短假设答案（1-2句话）
 3. 基于假设答案提取2个不同角度的查询变体（更具体或更宽泛的表述）
-4. 分配三策略权重(0-1之间): metadata(文档名/描述关键词匹配), semantics(语义标签索引), description(LLM描述相关性判断)
+4. 分配四策略权重(0-1之间): metadata(文档名/描述关键词匹配), content(全文内容关键词匹配), semantics(语义标签索引), description(LLM描述相关性判断)
 
 返回JSON格式:
 {{
     "query_type": "factual",
     "hyde_answer": "假设答案...",
     "query_variants": ["变体1", "变体2"],
-    "weights": {{"metadata": 0.2, "semantics": 0.5, "description": 0.3}}
+    "weights": {{"metadata": 0.2, "content": 0.3, "semantics": 0.3, "description": 0.2}}
 }}
 
 直接返回JSON，不要其他内容。
@@ -58,7 +58,7 @@ class RetrievalPlanner:
                 if v and v != query and v not in queries:
                     queries.append(v)
 
-            default_weights = {"metadata": 0.2, "semantics": 0.5, "description": 0.3}
+            default_weights = {"metadata": 0.15, "content": 0.35, "semantics": 0.3, "description": 0.2}
             for k, v in default_weights.items():
                 weights.setdefault(k, v)
 
@@ -75,6 +75,6 @@ class RetrievalPlanner:
     def _default_plan(self, query: str) -> PlanResult:
         return PlanResult(
             queries=[query],
-            weights={"metadata": 0.2, "semantics": 0.5, "description": 0.3},
+            weights={"metadata": 0.15, "content": 0.35, "semantics": 0.3, "description": 0.2},
             query_type="factual",
         )

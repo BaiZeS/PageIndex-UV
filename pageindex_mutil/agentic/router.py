@@ -4,7 +4,7 @@ import logging
 from typing import List, Tuple, Dict
 
 from .planner import RetrievalPlanner
-from .strategies import MetadataStrategy, SemanticsStrategy, DescriptionStrategy
+from .strategies import MetadataStrategy, SemanticsStrategy, ContentStrategy, DescriptionStrategy
 from .verifier import CRAGVerifier
 from .multi_hop import MultiHopReasoner
 from ..super_tree import SuperTreeIndex
@@ -19,6 +19,7 @@ class AgenticRouter:
         self.retrieve_model = retrieve_model
         self.planner = RetrievalPlanner(model, retrieve_model)
         self.metadata_strategy = MetadataStrategy()
+        self.content_strategy = ContentStrategy(client)
         self.semantics_strategy = None
         self.description_strategy = DescriptionStrategy(model, retrieve_model)
         self.verifier = CRAGVerifier(model, retrieve_model)
@@ -138,6 +139,10 @@ class AgenticRouter:
         tasks = {}
         tasks["metadata"] = asyncio.to_thread(
             self.metadata_strategy.search, query, docs_info
+        )
+        # Content-based search: always run (cheap, keyword-only)
+        tasks["content"] = asyncio.to_thread(
+            self.content_strategy.search, query, docs_info
         )
         if self.semantics_strategy and weights.get("semantics", 0) > 0:
             tasks["semantics"] = asyncio.to_thread(

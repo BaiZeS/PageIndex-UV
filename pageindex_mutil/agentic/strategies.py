@@ -48,6 +48,52 @@ class SemanticsStrategy:
         return [(str(doc_id), rank + 1) for rank, (doc_id, _) in enumerate(results)]
 
 
+class ContentStrategy:
+    """Search based on document content keywords (not just metadata)."""
+
+    def __init__(self, client):
+        self.client = client
+
+    def search(self, query: str, docs_info: List[Dict]) -> List[Tuple[str, int]]:
+        try:
+            tokens = jieba.lcut(query)
+        except Exception:
+            return []
+        keywords = [
+            t.strip().lower()
+            for t in tokens
+            if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
+        ]
+        if not keywords:
+            return []
+
+        scored = []
+        for doc_info in docs_info:
+            doc_id = str(doc_info.get("doc_id", ""))
+            # Try to get content from docs_info first
+            content = (doc_info.get("content") or "").lower()
+            # Fallback: read from client.documents
+            if not content and self.client:
+                doc = self.client.documents.get(doc_id)
+                if doc:
+                    # Try pages (PDF)
+                    for p in doc.get("pages", []):
+                        content += (p.get("content") or "") + "\n"
+                    # Try structure text (MD)
+                    if not content.strip():
+                        for node in doc.get("structure", []):
+                            content += (node.get("text") or "") + "\n"
+            if not content.strip():
+                continue
+            content = content.lower()
+            hits = sum(1 for kw in keywords if kw in content)
+            if hits > 0:
+                scored.append((doc_id, hits))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [(doc_id, rank + 1) for rank, (doc_id, _) in enumerate(scored)]
+
+
 class DescriptionStrategy:
     def __init__(self, model: str, retrieve_model: str = None):
         self.model = model
