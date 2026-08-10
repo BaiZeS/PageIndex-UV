@@ -114,6 +114,7 @@ The multi-document retrieval uses a four-layer architecture:
    - **Channel C (Vector)**: ChromaDB vector search via `SearchBackend.search()` (1.5x weight for semantic understanding)
    - **Channel D (Entity)**: Entity graph matching via `db.search_entities()` + `db.get_entity_documents()`
    - Results merged into candidate set (max 50 docs)
+   - **Entity Distance Precomputation**: One BFS at query start, level-by-level lookup (O(1))
 
 2. **L1 Super-Tree Document Selection** (`SuperTreeIndex.select_documents()`):
    - Builds enriched mini-TOC (depth=1 nodes + depth=2 child titles, max 8 top nodes per doc)
@@ -122,10 +123,14 @@ The multi-document retrieval uses a four-layer architecture:
    - Token budget: 6000 tokens (auto-truncation if exceeded)
    - HyDE integration: planner generates hypothetical answer for query expansion
 
-3. **L2 Parallel Per-Document Node Recall** (`AgenticRouter._act_tree_search()`):
-   - `asyncio.gather` parallel tree reasoning per selected document
-   - Each doc's recall runs in a thread via `_recall_nodes_for_doc()`
-   - Results ranked by relevance score (matched node count / total nodes)
+3. **L2 Semantic Tree Navigation** (`SuperTreeIndex.navigate_tree()`):
+   - **Hierarchical navigation**: Progressive disclosure, expand only selected branches
+   - **Per-level processing**: Four-channel prefilter → Entity boost (table lookup) → LLM selection
+   - **Entity boost**: Hierarchical (distance decay × relation type weight)
+     - Relation types: causal(1.0) > part_of(0.8) > related_to(0.6) > other(0.4)
+     - Distance decay: 0→1.0, 1→0.7, 2→0.4, 3→0.2
+   - **Node recovery**: Filtered-out nodes with entity matches are recovered
+   - **LLM evidence**: Sees entity_relation (distance, relation_type) for informed decisions
 
 4. **L3 Context Extraction** (ranked by relevance):
    - Entity relationship enrichment from cross-document graph

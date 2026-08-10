@@ -848,49 +848,6 @@ class SuperTreeIndex:
 
         return best_boost, best_entity
 
-    def _entity_document_ids(self, query: str) -> set:
-        """[S6]② 图谱信号：查询命中实体所链接的文档 id 集合。
-
-        复用现有 db.search_entities（其分词化前置改造属 P3，此处为基础版）。
-        """
-        try:
-            entities = self.db.search_entities(query, limit=self._L0_CHANNEL_TOPK)
-        except Exception:
-            return set()
-        doc_ids = set()
-        for entity in entities:
-            entity_id = entity.get("id")
-            if not entity_id:
-                continue
-            try:
-                for mention in self.db.get_entity_documents(entity_id):
-                    if mention.get("id"):
-                        doc_ids.add(int(mention["id"]))
-            except Exception:
-                continue
-        return doc_ids
-
-    def _entity_boost_nodes(self, candidates: List[dict], siblings: List[dict],
-                            view: _CorpusTreeView, entity_doc_ids: set) -> List[dict]:
-        """[S6]② 图谱信号加权：子树含查询链接实体的节点加性提升（绝不删除候选）。
-
-        实体命中是比词面匹配更强的相关性证据：被宽层预筛切掉但含实体的兄弟
-        节点会被捞回（软归属不硬删，H03 教训）。
-        """
-        if not entity_doc_ids or not candidates:
-            return list(candidates)
-
-        def hits(node):
-            return len(view.subtree_doc_ids(node["id"]) & entity_doc_ids)
-
-        cand_ids = {n["id"] for n in candidates}
-        out = list(candidates)
-        for node in siblings:
-            if node["id"] not in cand_ids and hits(node):
-                out.append(node)
-        out.sort(key=lambda n: -hits(n))  # 稳定排序：无命中节点保持预筛顺序
-        return out
-
     async def _select_nodes(self, query: str, nodes: List[dict],
                             node_boosts: Dict[int, Dict] = None) -> List[int]:
         """[S6]③ LLM 推理精挑：读节点摘要 + 图谱加权证据，可变数量挑选、宁缺毋滥。
