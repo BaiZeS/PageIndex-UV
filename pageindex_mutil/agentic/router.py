@@ -222,7 +222,7 @@ class AgenticRouter:
         """Recall relevant nodes for a single document (runs in thread).
 
         Uses enhanced tree with keyword match context for better LLM decisions.
-        Strict node selection: LLM + keyword validation (no sliding window).
+        LLM is the final decision maker (PageIndex core principle).
         """
         funcs = self._load_main_funcs()
         get_relevant_nodes = funcs.get("get_relevant_nodes")
@@ -247,7 +247,7 @@ class AgenticRouter:
         else:
             tree_json = json.dumps(structure, ensure_ascii=False)
 
-        # LLM-based selection with enhanced context
+        # LLM-based selection with enhanced context (LLM is the decision maker)
         node_ids = await asyncio.to_thread(get_relevant_nodes, query, tree_json)
 
         # Keyword fallback if LLM returns nothing
@@ -257,30 +257,6 @@ class AgenticRouter:
 
         if not node_ids:
             return None
-
-        # Strict validation: only keep nodes that contain query keywords
-        # This prevents precision dilution from sliding window
-        try:
-            import jieba
-            from ..closet_index import _STOPWORDS
-            tokens = {
-                t.strip().lower() for t in jieba.lcut(query)
-                if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
-            }
-        except Exception:
-            tokens = set()
-
-        if tokens:
-            # Filter nodes: only keep those containing query keywords
-            validated_ids = []
-            for nid in node_ids:
-                node = mapping.get(nid)
-                if node:
-                    text = (node.get("text") or "").lower()
-                    if any(t in text for t in tokens):
-                        validated_ids.append(nid)
-            # Use validated nodes if any, otherwise fall back to original
-            node_ids = validated_ids if validated_ids else node_ids
 
         selected = [mapping.get(nid) for nid in node_ids if nid in mapping]
         selected = [n for n in selected if n]
