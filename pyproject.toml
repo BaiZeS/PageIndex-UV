@@ -35,6 +35,9 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning:PyPDF2.*",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
