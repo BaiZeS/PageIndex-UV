@@ -188,36 +188,48 @@ class AgenticRouter:
     # Act — tree search + context assembly (parallelized)
     # ------------------------------------------------------------------
     def _enhance_tree_with_matches(self, structure: List[Dict], matched_info: List[Dict]) -> List[Dict]:
-        """Enhance tree nodes with keyword match context for LLM."""
+        """Enhance tree nodes with keyword match context for LLM.
+
+        Preserves original tree structure including nested nodes.
+        """
         match_map = {}
         for m in matched_info:
             node_id = m.get("node_id")
             if node_id:
                 match_map[node_id] = m
 
-        enhanced = []
-        for node in structure:
-            node_data = {
-                "node_id": node.get("node_id"),
-                "title": node.get("title"),
-                "summary": node.get("summary", ""),
-            }
+        def enhance_node(node):
+            """Recursively enhance a node and its children."""
+            node_data = dict(node)  # Copy all original fields
+
             # Add match context if available
             node_id = node.get("node_id")
             if node_id in match_map:
                 match = match_map[node_id]
                 node_data["matched_keyword"] = match.get("keyword", "")
                 node_data["matched_context"] = match.get("context", "")
-            enhanced.append(node_data)
 
-        return enhanced
+            # Recursively enhance child nodes
+            if "nodes" in node and isinstance(node["nodes"], list):
+                node_data["nodes"] = [enhance_node(child) for child in node["nodes"]]
+
+            return node_data
+
+        return [enhance_node(node) for node in structure]
 
     def _adaptive_node_selection(self, node_ids: List[str], structure: List[Dict],
-                                  window: int = 5) -> List[str]:
+                                  window: int = 5, threshold: float = 0.3) -> List[str]:
         """Adaptive sliding window node selection.
 
-        Select nodes based on relevance score with a sliding window of size 5.
-        If top nodes are close in relevance, include more nodes.
+        Select nodes based on relevance score with a sliding window.
+        Score is based on keyword match count (passed via matched_info),
+        falling back to text length as proxy.
+
+        Args:
+            node_ids: Candidate node IDs from LLM/keyword selection
+            structure: Document structure
+            window: Maximum nodes to select
+            threshold: Minimum score ratio relative to top node (0-1)
         """
         if not node_ids:
             return []
@@ -225,32 +237,35 @@ class AgenticRouter:
         from ..utils import create_node_mapping
         mapping = create_node_mapping(structure)
 
-        # Score nodes by keyword match count
+        # Score nodes: use text length as proxy for content richness
+        # (In future, could use TF-IDF or keyword density)
         scored_nodes = []
         for nid in node_ids:
             node = mapping.get(nid)
             if node:
-                # Simple score: length of text (more content = more relevant)
-                text_len = len(node.get("text", "") or "")
-                scored_nodes.append((nid, text_len))
+                text = node.get("text", "") or ""
+                # Score = text length (log scale to avoid huge differences)
+                import math
+                score = math.log(len(text) + 1)
+                scored_nodes.append((nid, score))
 
         scored_nodes.sort(key=lambda x: x[1], reverse=True)
 
         if not scored_nodes:
             return []
 
-        # Adaptive window: include nodes within window of top score
-        selected = [scored_nodes[0][0]]
+        # Adaptive window: include nodes within window, stop if score drops
+        selected = []
         top_score = scored_nodes[0][1]
 
-        for nid, score in scored_nodes[1:]:
-            # Include if within window size and score is close to top
-            if len(selected) < window:
-                selected.append(nid)
-            elif score > top_score * 0.5:  # Score is at least 50% of top
+        for nid, score in scored_nodes:
+            if len(selected) >= window:
+                break
+            # Include if score is above threshold of top score
+            if score >= top_score * threshold:
                 selected.append(nid)
             else:
-                break
+                break  # Stop when score drops below threshold
 
         return selected
 
