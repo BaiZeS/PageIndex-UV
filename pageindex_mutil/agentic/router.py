@@ -184,6 +184,12 @@ class AgenticRouter:
 
         tree_json = json.dumps(structure, ensure_ascii=False)
         node_ids = await asyncio.to_thread(get_relevant_nodes, query, tree_json)
+
+        # Keyword fallback: if LLM returned nothing, try keyword-based selection
+        if not node_ids:
+            from ..client import PageIndexClient
+            node_ids = PageIndexClient._keyword_select_nodes(query, structure)
+
         if not node_ids:
             return None
 
