@@ -217,64 +217,12 @@ class AgenticRouter:
 
         return [enhance_node(node) for node in structure]
 
-    def _adaptive_node_selection(self, node_ids: List[str], structure: List[Dict],
-                                  window: int = 5, threshold: float = 0.3) -> List[str]:
-        """Adaptive sliding window node selection.
-
-        Select nodes based on relevance score with a sliding window.
-        Score is based on keyword match count (passed via matched_info),
-        falling back to text length as proxy.
-
-        Args:
-            node_ids: Candidate node IDs from LLM/keyword selection
-            structure: Document structure
-            window: Maximum nodes to select
-            threshold: Minimum score ratio relative to top node (0-1)
-        """
-        if not node_ids:
-            return []
-
-        from ..utils import create_node_mapping
-        mapping = create_node_mapping(structure)
-
-        # Score nodes: use text length as proxy for content richness
-        # (In future, could use TF-IDF or keyword density)
-        scored_nodes = []
-        for nid in node_ids:
-            node = mapping.get(nid)
-            if node:
-                text = node.get("text", "") or ""
-                # Score = text length (log scale to avoid huge differences)
-                import math
-                score = math.log(len(text) + 1)
-                scored_nodes.append((nid, score))
-
-        scored_nodes.sort(key=lambda x: x[1], reverse=True)
-
-        if not scored_nodes:
-            return []
-
-        # Adaptive window: include nodes within window, stop if score drops
-        selected = []
-        top_score = scored_nodes[0][1]
-
-        for nid, score in scored_nodes:
-            if len(selected) >= window:
-                break
-            # Include if score is above threshold of top score
-            if score >= top_score * threshold:
-                selected.append(nid)
-            else:
-                break  # Stop when score drops below threshold
-
-        return selected
-
     async def _recall_nodes_for_doc(self, query: str, doc_id: str,
                                       matched_info: List[Dict] = None):
         """Recall relevant nodes for a single document (runs in thread).
 
         Uses enhanced tree with keyword match context for better LLM decisions.
-        Adaptive sliding window for node selection.
+        Strict node selection: LLM + keyword validation (no sliding window).
         """
         funcs = self._load_main_funcs()
         get_relevant_nodes = funcs.get("get_relevant_nodes")
@@ -310,8 +258,29 @@ class AgenticRouter:
         if not node_ids:
             return None
 
-        # Adaptive sliding window selection
-        node_ids = self._adaptive_node_selection(node_ids, structure, window=5)
+        # Strict validation: only keep nodes that contain query keywords
+        # This prevents precision dilution from sliding window
+        try:
+            import jieba
+            from ..closet_index import _STOPWORDS
+            tokens = {
+                t.strip().lower() for t in jieba.lcut(query)
+                if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
+            }
+        except Exception:
+            tokens = set()
+
+        if tokens:
+            # Filter nodes: only keep those containing query keywords
+            validated_ids = []
+            for nid in node_ids:
+                node = mapping.get(nid)
+                if node:
+                    text = (node.get("text") or "").lower()
+                    if any(t in text for t in tokens):
+                        validated_ids.append(nid)
+            # Use validated nodes if any, otherwise fall back to original
+            node_ids = validated_ids if validated_ids else node_ids
 
         selected = [mapping.get(nid) for nid in node_ids if nid in mapping]
         selected = [n for n in selected if n]
