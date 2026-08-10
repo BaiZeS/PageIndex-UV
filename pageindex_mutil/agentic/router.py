@@ -185,16 +185,44 @@ class AgenticRouter:
         tree_json = json.dumps(structure, ensure_ascii=False)
         node_ids = await asyncio.to_thread(get_relevant_nodes, query, tree_json)
 
-        # Keyword fallback: if LLM returned nothing, try keyword-based selection
-        if not node_ids:
-            from ..client import PageIndexClient
-            node_ids = PageIndexClient._keyword_select_nodes(query, structure)
+        # Keyword fallback: if LLM returned nothing or selected nodes
+        # don't contain query keywords, try keyword-based selection.
+        from ..client import PageIndexClient
+        from ..utils import create_node_mapping
+        mapping = create_node_mapping(structure)
+
+        llm_nodes_contain_keywords = False
+        if node_ids:
+            try:
+                import jieba
+                from ..closet_index import _STOPWORDS
+                tokens = {
+                    t.strip().lower() for t in jieba.lcut(query)
+                    if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
+                }
+            except Exception:
+                tokens = set()
+            if tokens:
+                for nid in node_ids:
+                    node = mapping.get(nid)
+                    if node:
+                        text = (node.get("text") or "").lower()
+                        if any(t in text for t in tokens):
+                            llm_nodes_contain_keywords = True
+                            break
+
+        if not node_ids or not llm_nodes_contain_keywords:
+            keyword_ids = PageIndexClient._keyword_select_nodes(query, structure)
+            # Merge: keep LLM selections + keyword matches (deduplicated)
+            seen = set(node_ids or [])
+            for kid in keyword_ids:
+                if kid not in seen:
+                    node_ids.append(kid)
+                    seen.add(kid)
 
         if not node_ids:
             return None
 
-        from ..utils import create_node_mapping
-        mapping = create_node_mapping(structure)
         selected = [mapping.get(nid) for nid in node_ids if nid in mapping]
         selected = [n for n in selected if n]
         if not selected:
