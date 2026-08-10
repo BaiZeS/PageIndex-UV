@@ -82,7 +82,7 @@ API_KEY=testkey uv run python -m app.server
 | `DB_PATH` | 否 | SQLite 数据库路径（默认 `./data/index.db`） |
 | `SEARCH_BACKEND` | 否 | 搜索模式：`keyword`（关键词+标签，默认，无需加载模型）、`hybrid`（向量+关键词+标签，需安装 `.[vector]`）、`chroma`（纯向量） |
 | `VECTOR_DB_PATH` | 否 | ChromaDB 存储目录（默认 `./data/vectors`） |
-| `LLM_CONCURRENCY` | 否 | 批量索引时的最大并发 LLM 调用数（默认 `3`） |
+| `LLM_CONCURRENCY` | 否 | 批量索引时的最大并发 LLM 调用数（默认 `2`，多数据集并行时建议设为 `1`） |
 
 > *至少配置一个 LLM API Key。优先级：显式参数 > `OPENAI_API_KEY` > `DASHSCOPE_API_KEY`。
 

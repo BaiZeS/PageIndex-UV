@@ -575,7 +575,7 @@ class PageIndexClient:
             raise RuntimeError("Database required for batch mode. Pass db_path to PageIndexClient.")
 
         import os as _os
-        concurrency = int(_os.environ.get("LLM_CONCURRENCY", "3"))
+        concurrency = int(_os.environ.get("LLM_CONCURRENCY", "2"))
 
         # -- Phase 1: per-doc extraction (concurrent) --
         phase1_results: list[tuple[str, int, dict]] = []
