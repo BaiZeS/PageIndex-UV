@@ -852,6 +852,29 @@ class PageIndexDB:
         ).fetchone()
         return dict(row) if row else None
 
+    def get_entity_by_id(self, entity_id: int) -> dict:
+        """Get an entity by ID."""
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_entity_mentions_by_doc(self, doc_id: int) -> list:
+        """Get all entity mentions in a document."""
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT em.*, e.name as entity_name, e.entity_type
+            FROM entity_mentions em
+            JOIN entities e ON em.entity_id = e.id
+            WHERE em.doc_id = ?
+            ORDER BY em.confidence DESC
+            """,
+            (doc_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     @staticmethod
     def _tokenize_query(query: str) -> list[str]:
         """Tokenize query with jieba, filter stopwords and single-char tokens.

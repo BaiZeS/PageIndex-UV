@@ -727,6 +727,127 @@ class SuperTreeIndex:
         ranked = sorted(nodes, key=lambda n: scores.get(n["id"], 0.0), reverse=True)
         return ranked[: self._NODE_PREFILTER_TOPK]
 
+    # ------------------------------------------------------------------
+    # Entity distance precomputation (L0, one BFS, level-by-level lookup)
+    # ------------------------------------------------------------------
+    # Relation type weights (causal > part_of > related_to > other)
+    _RELATION_TYPE_WEIGHTS = {
+        "causal": 1.0, "causes": 1.0, "effect": 1.0,
+        "part_of": 0.8, "contains": 0.8, "has_part": 0.8, "belongs_to": 0.8,
+        "related_to": 0.6, "associated": 0.6, "similar": 0.6,
+        "_default": 0.4,
+    }
+    # Distance decay
+    _DISTANCE_DECAY = {0: 1.0, 1: 0.7, 2: 0.4, 3: 0.2}
+    _MAX_ENTITY_HOP = 3
+
+    def _precompute_entity_distances(self, query: str) -> Dict[int, Dict]:
+        """L0 预计算实体距离（一次 BFS，逐层查表）。
+
+        Returns:
+            entity_table: {entity_id: {distance, relation_type, weight, name}}
+        """
+        try:
+            query_entities = self.db.search_entities(query, limit=self._L0_CHANNEL_TOPK)
+        except Exception:
+            return {}
+
+        entity_table = {}
+        queue = []
+
+        # Query entities: distance 0, weight 1.0
+        for entity in query_entities:
+            eid = entity.get("id")
+            if not eid:
+                continue
+            entity_table[eid] = {
+                "distance": 0,
+                "relation_type": "direct",
+                "weight": 1.0,
+                "name": entity.get("name", "")
+            }
+            queue.append((eid, 0))
+
+        visited = set(entity_table.keys())
+
+        # BFS to compute distances
+        while queue:
+            current_id, current_dist = queue.pop(0)
+            if current_dist >= self._MAX_ENTITY_HOP:
+                continue
+
+            try:
+                relations = self.db.get_entity_relations(current_id)
+            except Exception:
+                continue
+
+            for rel in relations:
+                neighbor_id = (rel["object_id"] if rel["subject_id"] == current_id
+                              else rel["subject_id"])
+
+                if neighbor_id in visited:
+                    continue
+
+                # Compute weight: distance decay × relation type weight
+                distance_weight = self._DISTANCE_DECAY.get(current_dist + 1, 0.1)
+                relation_type = rel.get("predicate", "_default")
+                relation_weight = self._RELATION_TYPE_WEIGHTS.get(
+                    relation_type, self._RELATION_TYPE_WEIGHTS["_default"]
+                )
+                total_weight = distance_weight * relation_weight
+
+                try:
+                    neighbor_entity = self.db.get_entity_by_id(neighbor_id)
+                    name = neighbor_entity.get("name", "") if neighbor_entity else ""
+                except Exception:
+                    name = ""
+
+                entity_table[neighbor_id] = {
+                    "distance": current_dist + 1,
+                    "relation_type": relation_type,
+                    "weight": total_weight,
+                    "name": name
+                }
+
+                visited.add(neighbor_id)
+                queue.append((neighbor_id, current_dist + 1))
+
+        return entity_table
+
+    def _get_node_entity_boost(self, node_id: int, view: _CorpusTreeView,
+                                entity_table: Dict[int, Dict]) -> Tuple[float, Optional[Dict]]:
+        """逐层图谱加权：查表，不重新 BFS。
+
+        Returns:
+            (boost_weight, entity_info) or (0, None)
+        """
+        if not entity_table:
+            return 0, None
+
+        # Get entities in this node's subtree
+        doc_ids = view.subtree_doc_ids(node_id)
+        if not doc_ids:
+            return 0, None
+
+        best_boost = 0
+        best_entity = None
+
+        # Check each document's entities against the entity table
+        for doc_id in doc_ids:
+            try:
+                mentions = self.db.get_entity_mentions_by_doc(doc_id)
+            except Exception:
+                continue
+            for mention in mentions:
+                entity_id = mention.get("entity_id")
+                if entity_id and entity_id in entity_table:
+                    info = entity_table[entity_id]
+                    if info["weight"] > best_boost:
+                        best_boost = info["weight"]
+                        best_entity = info
+
+        return best_boost, best_entity
+
     def _entity_document_ids(self, query: str) -> set:
         """[S6]② 图谱信号：查询命中实体所链接的文档 id 集合。
 
@@ -770,8 +891,9 @@ class SuperTreeIndex:
         out.sort(key=lambda n: -hits(n))  # 稳定排序：无命中节点保持预筛顺序
         return out
 
-    async def _select_nodes(self, query: str, nodes: List[dict]) -> List[int]:
-        """[S6]③ LLM 推理精挑：读节点摘要，可变数量挑选、宁缺毋滥。
+    async def _select_nodes(self, query: str, nodes: List[dict],
+                            node_boosts: Dict[int, Dict] = None) -> List[int]:
+        """[S6]③ LLM 推理精挑：读节点摘要 + 图谱加权证据，可变数量挑选、宁缺毋滥。
 
         T9 推理挑选（H02 修复）泛化到树分支；返回选中的节点 id 列表。
         """
@@ -779,12 +901,31 @@ class SuperTreeIndex:
             return []
         if len(nodes) == 1:
             return [nodes[0]["id"]]
-        node_list = [
-            {"node_id": n["id"], "title": n.get("title", ""),
-             "summary": (n.get("summary") or "")[: self._SUMMARY_MAX_LEN]}
-            for n in nodes
-        ]
-        prompt = f"""你是一个知识库树导航精挑专家（语义树导航·逐层精挑）。给定用户问题与当前层的候选分支节点（含标题与摘要），请挑选出可能包含答案的分支（可变数量）。
+
+        # Build node info with evidence
+        node_list = []
+        for n in nodes:
+            info = {
+                "node_id": n["id"],
+                "title": n.get("title", ""),
+                "summary": (n.get("summary") or "")[: self._SUMMARY_MAX_LEN]
+            }
+
+            # Add entity boost evidence if available
+            if node_boosts and n["id"] in node_boosts:
+                boost_info = node_boosts[n["id"]]
+                info["entity_boost"] = round(boost_info["boost"], 2)
+                if boost_info.get("entity_info"):
+                    entity = boost_info["entity_info"]
+                    info["entity_relation"] = {
+                        "name": entity.get("name", ""),
+                        "type": entity.get("relation_type", ""),
+                        "distance": entity.get("distance", -1)
+                    }
+
+            node_list.append(info)
+
+        prompt = f"""你是一个知识库树导航精挑专家（语义树导航·逐层精挑）。给定用户问题与当前层的候选分支节点（含标题、摘要和图谱加权证据），请挑选出可能包含答案的分支（可变数量）。
 
 [用户问题]
 {query}
@@ -796,6 +937,10 @@ class SuperTreeIndex:
 1. 只挑真正可能包含答案的分支；若没有足够相关的，可以少选甚至不选。
 2. 宁缺毋滥：不要为凑数而挑选不相关的分支。
 3. 基于分支标题与摘要判断相关性。
+4. 有 entity_relation 的节点包含查询相关实体，优先考虑：
+   - distance=0：直接包含查询实体
+   - distance=1：包含与查询实体有直接关系的实体
+   - relation_type: causal(因果) > part_of(组成) > related_to(相关)
 
 返回JSON格式：{{"node_ids": [1, 2]}}
 直接返回JSON，不要其他内容。"""
@@ -831,20 +976,53 @@ class SuperTreeIndex:
         top_nodes = view.children_of(view.root_id)
         if not top_nodes:
             return {}
-        entity_doc_ids = self._entity_document_ids(query)
-        return await self._navigate_level(query, top_nodes, view, entity_doc_ids)
+
+        # L0: Precompute entity distances (one BFS, level-by-level lookup)
+        entity_table = self._precompute_entity_distances(query)
+
+        return await self._navigate_level(query, top_nodes, view, entity_table)
 
     async def _navigate_level(self, query: str, siblings: List[dict],
-                              view: _CorpusTreeView, entity_doc_ids: set) -> Dict[int, float]:
-        """单层导航：预筛（宽层才做）→ 实体加权 → LLM 精挑 → 只展开选中分支。"""
+                              view: _CorpusTreeView, entity_table: Dict[int, Dict]) -> Dict[int, float]:
+        """单层导航：四通道初筛→图谱加权(查表)→LLM精挑→只展开选中分支。"""
         if not siblings:
             return {}
+
+        # ① 四通道初筛（缩小当前层候选节点范围）
         if len(siblings) > self._NARROW_LAYER_MAX:
             candidates = self._prefilter_nodes(query, siblings)
         else:
             candidates = list(siblings)
-        candidates = self._entity_boost_nodes(candidates, siblings, view, entity_doc_ids)
-        picked_ids = set(await self._select_nodes(query, candidates))
+
+        # ② 图谱加权（查表，不重新 BFS）
+        node_boosts = {}
+        for node in candidates:
+            boost, entity_info = self._get_node_entity_boost(
+                node["id"], view, entity_table
+            )
+            if boost > 0:
+                node_boosts[node["id"]] = {
+                    "boost": boost,
+                    "entity_info": entity_info
+                }
+
+        # Also boost nodes that were filtered out but have entity matches
+        if entity_table:
+            cand_ids = {n["id"] for n in candidates}
+            for node in siblings:
+                if node["id"] not in cand_ids:
+                    boost, entity_info = self._get_node_entity_boost(
+                        node["id"], view, entity_table
+                    )
+                    if boost > 0:
+                        candidates.append(node)
+                        node_boosts[node["id"]] = {
+                            "boost": boost,
+                            "entity_info": entity_info
+                        }
+
+        # ③ LLM精挑（看到完整证据做决策）
+        picked_ids = set(await self._select_nodes(query, candidates, node_boosts))
         picked = [n for n in candidates if n["id"] in picked_ids]
 
         docs: Dict[int, float] = {}
@@ -854,7 +1032,7 @@ class SuperTreeIndex:
                 docs[doc_id] = max(docs.get(doc_id, 0.0), float(weight))
             children = view.children_of(node["id"])
             if children:
-                subtasks.append(self._navigate_level(query, children, view, entity_doc_ids))
+                subtasks.append(self._navigate_level(query, children, view, entity_table))
         if subtasks:
             # 延迟纪律（[S6]）：一层选中多个分支后，下一层导航并行展开
             results = await asyncio.gather(*subtasks, return_exceptions=True)
