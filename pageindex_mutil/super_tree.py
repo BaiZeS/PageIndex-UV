@@ -687,44 +687,91 @@ class SuperTreeIndex:
         return _CorpusTreeView(nodes, memberships)
 
     # ------------------------------------------------------------------
-    # P2 语义树导航（[S6]）：每层 = 预筛 → 加权 → 精挑（全程无向量）
+    # P2 语义树导航（[S6]）：每层 = 预筛 → 加权 → 精挑
     # ------------------------------------------------------------------
-    def _score_nodes(self, query: str, nodes: List[dict]) -> Dict[int, float]:
-        """无向量节点打分：jieba 查询词 × 节点 tag/标题/摘要。
+    def _score_nodes(self, query: str, nodes: List[dict],
+                     view: _CorpusTreeView = None,
+                     entity_table: Dict[int, Dict] = None) -> Dict[int, Dict]:
+        """四通道节点打分：标签/BM25/向量/实体图谱。
 
-        closet_tags（LLM 语义标签）命中 = "无向量的语义匹配"，权重高于词面重叠。
+        Returns:
+            {node_id: {"tag_score": float, "bm25_score": float,
+                       "vector_score": float, "entity_boost": float,
+                       "total_score": float, "entity_info": dict}}
         """
         query_tokens = set(self.keyword_index._tokenize(query or ""))
-        if not query_tokens:
-            return {}
         q_lower = (query or "").lower()
-        scores: Dict[int, float] = {}
+
+        scores: Dict[int, Dict] = {}
         for node in nodes:
-            s = 0.0
+            node_scores = {
+                "tag_score": 0.0,
+                "bm25_score": 0.0,
+                "vector_score": 0.0,
+                "entity_boost": 0.0,
+                "entity_info": None,
+            }
+
+            # Channel A: closet_tags 语义标签匹配
             tag = (node.get("tag") or "").strip().lower()
             if tag:
                 if tag in q_lower or q_lower in tag:
-                    s += 2.0
+                    node_scores["tag_score"] = 2.0
                 elif query_tokens & set(self.keyword_index._tokenize(tag)):
-                    s += 1.5
-            text_tokens = set(self.keyword_index._tokenize(
-                f"{node.get('title', '')} {node.get('summary', '')}"))
-            s += 0.5 * len(query_tokens & text_tokens)
-            if s > 0:
-                scores[node["id"]] = s
+                    node_scores["tag_score"] = 1.5
+
+            # Channel B: BM25 关键词匹配（jieba 分词）
+            if query_tokens:
+                text_tokens = set(self.keyword_index._tokenize(
+                    f"{node.get('title', '')} {node.get('summary', '')}"))
+                overlap = query_tokens & text_tokens
+                if overlap:
+                    # BM25-like scoring: overlap / query_length
+                    node_scores["bm25_score"] = len(overlap) / len(query_tokens)
+
+            # Channel C: 向量相似度（如果可用）
+            if hasattr(self, '_vector_score') and self._vector_score:
+                try:
+                    node_scores["vector_score"] = self._vector_score(query, node)
+                except Exception:
+                    pass
+
+            # Channel D: 实体图谱加权（查表）
+            if entity_table and view:
+                boost, entity_info = self._get_node_entity_boost(
+                    node["id"], view, entity_table
+                )
+                node_scores["entity_boost"] = boost
+                node_scores["entity_info"] = entity_info
+
+            # 归一化总分：各通道权重
+            node_scores["total_score"] = (
+                node_scores["tag_score"] * 0.3 +
+                node_scores["bm25_score"] * 0.3 +
+                node_scores["vector_score"] * 0.2 +
+                node_scores["entity_boost"] * 0.2
+            )
+
+            scores[node["id"]] = node_scores
+
         return scores
 
-    def _prefilter_nodes(self, query: str, nodes: List[dict]) -> List[dict]:
-        """[S6]① 宽层语义预筛：把兄弟节点筛到 top-k（jieba + closet_tags 倒排，无向量）。
+    def _prefilter_nodes(self, query: str, nodes: List[dict],
+                         view: _CorpusTreeView = None,
+                         entity_table: Dict[int, Dict] = None) -> List[dict]:
+        """[S6]① 宽层语义预筛：四通道打分，筛到 top-k。
 
         保召回：无任何匹配信号时原样全量返回（绝不硬过滤，由 LLM 精挑裁决）。
         """
         if not nodes:
             return []
-        scores = self._score_nodes(query, nodes)
+        scores = self._score_nodes(query, nodes, view, entity_table)
         if not scores:
             return list(nodes)
-        ranked = sorted(nodes, key=lambda n: scores.get(n["id"], 0.0), reverse=True)
+        # Sort by total_score descending
+        ranked = sorted(nodes,
+                       key=lambda n: scores.get(n["id"], {}).get("total_score", 0.0),
+                       reverse=True)
         return ranked[: self._NODE_PREFILTER_TOPK]
 
     # ------------------------------------------------------------------
@@ -849,8 +896,8 @@ class SuperTreeIndex:
         return best_boost, best_entity
 
     async def _select_nodes(self, query: str, nodes: List[dict],
-                            node_boosts: Dict[int, Dict] = None) -> List[int]:
-        """[S6]③ LLM 推理精挑：读节点摘要 + 图谱加权证据，可变数量挑选、宁缺毋滥。
+                            node_scores: Dict[int, Dict] = None) -> List[int]:
+        """[S6]③ LLM 推理精挑：读节点摘要 + 四通道分数 + 图谱加权证据，可变数量挑选、宁缺毋滥。
 
         T9 推理挑选（H02 修复）泛化到树分支；返回选中的节点 id 列表。
         """
@@ -868,21 +915,30 @@ class SuperTreeIndex:
                 "summary": (n.get("summary") or "")[: self._SUMMARY_MAX_LEN]
             }
 
-            # Add entity boost evidence if available
-            if node_boosts and n["id"] in node_boosts:
-                boost_info = node_boosts[n["id"]]
-                info["entity_boost"] = round(boost_info["boost"], 2)
-                if boost_info.get("entity_info"):
-                    entity = boost_info["entity_info"]
-                    info["entity_relation"] = {
-                        "name": entity.get("name", ""),
-                        "type": entity.get("relation_type", ""),
-                        "distance": entity.get("distance", -1)
-                    }
+            # Add channel scores if available
+            if node_scores and n["id"] in node_scores:
+                scores = node_scores[n["id"]]
+                if scores.get("tag_score", 0) > 0:
+                    info["tag_score"] = round(scores["tag_score"], 2)
+                if scores.get("bm25_score", 0) > 0:
+                    info["bm25_score"] = round(scores["bm25_score"], 2)
+                if scores.get("vector_score", 0) > 0:
+                    info["vector_score"] = round(scores["vector_score"], 2)
+
+                # Add entity boost evidence if available
+                if scores.get("entity_boost", 0) > 0:
+                    info["entity_boost"] = round(scores["entity_boost"], 2)
+                    if scores.get("entity_info"):
+                        entity = scores["entity_info"]
+                        info["entity_relation"] = {
+                            "name": entity.get("name", ""),
+                            "type": entity.get("relation_type", ""),
+                            "distance": entity.get("distance", -1)
+                        }
 
             node_list.append(info)
 
-        prompt = f"""你是一个知识库树导航精挑专家（语义树导航·逐层精挑）。给定用户问题与当前层的候选分支节点（含标题、摘要和图谱加权证据），请挑选出可能包含答案的分支（可变数量）。
+        prompt = f"""你是一个知识库树导航精挑专家（语义树导航·逐层精挑）。给定用户问题与当前层的候选分支节点（含标题、摘要和四通道分数），请挑选出可能包含答案的分支（可变数量）。
 
 [用户问题]
 {query}
@@ -894,10 +950,14 @@ class SuperTreeIndex:
 1. 只挑真正可能包含答案的分支；若没有足够相关的，可以少选甚至不选。
 2. 宁缺毋滥：不要为凑数而挑选不相关的分支。
 3. 基于分支标题与摘要判断相关性。
-4. 有 entity_relation 的节点包含查询相关实体，优先考虑：
-   - distance=0：直接包含查询实体
-   - distance=1：包含与查询实体有直接关系的实体
-   - relation_type: causal(因果) > part_of(组成) > related_to(相关)
+4. 综合考虑四通道分数：
+   - tag_score: 标签匹配（语义相关性）
+   - bm25_score: 关键词匹配（词面匹配）
+   - vector_score: 向量相似度（语义相似）
+   - entity_relation: 实体关系（图谱加权）
+     - distance=0: 直接包含查询实体
+     - distance=1: 包含与查询实体有直接关系的实体
+     - relation_type: causal(因果) > part_of(组成) > related_to(相关)
 
 返回JSON格式：{{"node_ids": [1, 2]}}
 直接返回JSON，不要其他内容。"""
@@ -947,39 +1007,16 @@ class SuperTreeIndex:
 
         # ① 四通道初筛（缩小当前层候选节点范围）
         if len(siblings) > self._NARROW_LAYER_MAX:
-            candidates = self._prefilter_nodes(query, siblings)
+            candidates = self._prefilter_nodes(query, siblings, view, entity_table)
         else:
             candidates = list(siblings)
 
-        # ② 图谱加权（查表，不重新 BFS）
-        node_boosts = {}
-        for node in candidates:
-            boost, entity_info = self._get_node_entity_boost(
-                node["id"], view, entity_table
-            )
-            if boost > 0:
-                node_boosts[node["id"]] = {
-                    "boost": boost,
-                    "entity_info": entity_info
-                }
-
-        # Also boost nodes that were filtered out but have entity matches
-        if entity_table:
-            cand_ids = {n["id"] for n in candidates}
-            for node in siblings:
-                if node["id"] not in cand_ids:
-                    boost, entity_info = self._get_node_entity_boost(
-                        node["id"], view, entity_table
-                    )
-                    if boost > 0:
-                        candidates.append(node)
-                        node_boosts[node["id"]] = {
-                            "boost": boost,
-                            "entity_info": entity_info
-                        }
+        # ② 图谱加权（查表，不重新 BFS）- 已集成到 _score_nodes
+        # 获取节点分数信息用于 LLM
+        node_scores = self._score_nodes(query, candidates, view, entity_table)
 
         # ③ LLM精挑（看到完整证据做决策）
-        picked_ids = set(await self._select_nodes(query, candidates, node_boosts))
+        picked_ids = set(await self._select_nodes(query, candidates, node_scores))
         picked = [n for n in candidates if n["id"] in picked_ids]
 
         docs: Dict[int, float] = {}
