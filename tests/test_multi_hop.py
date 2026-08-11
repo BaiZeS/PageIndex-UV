@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock, call
 
@@ -97,6 +98,16 @@ AgenticRouter = router_mod.AgenticRouter
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+class _FakeIdMapper:
+    """Mimics pageindex_mutil.client.DocIdMapper: db_id -> UUID lookup."""
+
+    def __init__(self, db_to_uuid):
+        self._db_to_uuid = dict(db_to_uuid)
+
+    def to_uuid(self, db_id):
+        return self._db_to_uuid.get(db_id)
+
 
 def _make_mock_db():
     """Create a mock db with entity graph methods."""
@@ -752,3 +763,215 @@ class TestMatchedDocsPopulated:
         doc_ids = {d["doc_id"] for d in result["matched_docs"]}
         assert "doc-uuid-1" in doc_ids, "doc-uuid-1 from hop 1 missing from matched_docs"
         assert "doc-uuid-2" in doc_ids, "doc-uuid-2 from hop 2 missing from matched_docs"
+
+
+class TestCandidateDocIdMapping:
+    """Bug3: entity_mentions/entity_relations hold DB integer ids, but downstream
+    tree navigation (_recall_nodes_for_doc) is keyed by UUID. _get_candidate_docs
+    must map DB ids to UUIDs at its outlet so the entity→document chain works."""
+
+    def test_candidate_docs_are_uuids_not_db_ids(self):
+        """DB int doc ids from get_entity_documents must come out as UUIDs."""
+        reasoner, router, client = _make_reasoner()
+
+        db = _make_mock_db()
+        db.search_entities.return_value = [{"id": 1, "name": "X"}]
+        db.get_entity_documents.return_value = [{"id": 10, "pdf_name": "x.pdf"}]
+
+        mapper = _FakeIdMapper({10: "uuid-doc-10"})
+        result = reasoner._get_candidate_docs(db, "X", set(), to_uuid=mapper.to_uuid)
+
+        assert result == ["uuid-doc-10"]
+        assert "10" not in result
+
+    def test_unmapped_db_id_is_skipped(self):
+        """Docs whose DB id has no UUID mapping are dropped, not stringified."""
+        reasoner, router, client = _make_reasoner()
+
+        db = _make_mock_db()
+        db.search_entities.return_value = [{"id": 1, "name": "X"}]
+        db.get_entity_documents.return_value = [
+            {"id": 10, "pdf_name": "mapped.pdf"},
+            {"id": 99, "pdf_name": "unmapped.pdf"},
+        ]
+
+        mapper = _FakeIdMapper({10: "uuid-doc-10"})
+        result = reasoner._get_candidate_docs(db, "X", set(), to_uuid=mapper.to_uuid)
+
+        assert result == ["uuid-doc-10"]
+
+    def test_no_mapper_falls_back_to_str_db_id(self):
+        """Without a mapper (old-style callers) keep the legacy str(db_id) behavior."""
+        reasoner, router, client = _make_reasoner()
+
+        db = _make_mock_db()
+        db.search_entities.return_value = [{"id": 1, "name": "X"}]
+        db.get_entity_documents.return_value = [{"id": 10, "pdf_name": "x.pdf"}]
+
+        result = reasoner._get_candidate_docs(db, "X", set())
+
+        assert result == ["10"]
+
+
+class TestMultiHopCRAGVerification:
+    """Bug3: the multi-hop branch must run the CRAG verifier after answer
+    generation (same verify→refuse/answer/expand pattern as router paths)."""
+
+    def _run_multi_hop(self, reasoner, router, client):
+        decompose = json.dumps({"decomposable": True, "sub_queries": ["Q1"]})
+        extract = json.dumps({"entities": [], "facts": [], "next_hop_hint": ""})
+        router._act_tree_search = AsyncMock(
+            return_value=("hop ctx", [{"node_id": "n1"}, {"node_id": "n2"}],
+                          1, 2, {"docX": [1]}, [])
+        )
+        with patch.object(
+            multi_hop_mod, "llm_acompletion",
+            side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract,
+        ), patch.object(multi_hop_mod, "llm_completion", return_value="answer"):
+            return asyncio.run(reasoner.execute("q", router, client.db))
+
+    def test_verifier_invoked_after_answer_generation(self):
+        reasoner, router, client = _make_reasoner()
+        router.verifier.verify.return_value = MagicMock(action="answer")
+
+        result = self._run_multi_hop(reasoner, router, client)
+
+        router.verifier.verify.assert_called_once()
+        # (answer, aggregated_ctx, query, source_docs, covered_nodes)
+        args = router.verifier.verify.call_args[0]
+        assert args[0] == "final answer"
+        assert args[1] == "hop ctx"
+        assert args[2] == "q"
+        assert args[3] == 1  # len(all_matched_docs)
+        assert args[4] == 2  # len(all_selected_nodes)
+        answer_mock = router._load_main_funcs.return_value["generate_answer"]
+        assert router.verifier.verify.call_count == 1
+        assert result["answer"] == "final answer"
+
+    def test_refuse_verdict_returns_idk_low(self):
+        reasoner, router, client = _make_reasoner()
+        router.verifier.verify.return_value = MagicMock(action="refuse")
+
+        result = self._run_multi_hop(reasoner, router, client)
+
+        assert result["answer"] == "I don't know."
+        assert result["confidence"] == "low"
+
+    def test_answer_action_high_confidence_single_hop(self):
+        """Verdict-driven confidence replaces the hop-count heuristic: a single
+        hop with action='answer' must be 'high' (old heuristic gave 'low')."""
+        reasoner, router, client = _make_reasoner()
+        router.verifier.verify.return_value = MagicMock(action="answer")
+
+        result = self._run_multi_hop(reasoner, router, client)
+
+        assert result["confidence"] == "high"
+
+    def test_expand_action_medium_confidence(self):
+        reasoner, router, client = _make_reasoner()
+        router.verifier.verify.return_value = MagicMock(action="expand")
+
+        result = self._run_multi_hop(reasoner, router, client)
+
+        assert result["confidence"] == "medium"
+
+    def test_no_verifier_keeps_heuristic(self):
+        reasoner, router, client = _make_reasoner()
+        router.verifier = None
+
+        result = self._run_multi_hop(reasoner, router, client)
+
+        # single hop => low under the legacy heuristic
+        assert result["confidence"] == "low"
+
+
+class TestMultiHopEntityToDocE2E:
+    """Bug3 end-to-end acceptance (v3.3): entity → _get_candidate_docs (UUID) →
+    _act_tree_search/_recall_nodes_for_doc resolves the doc by UUID → context
+    contains the entity content → final answer. Guards against 'fix one spot,
+    break still downstream'."""
+
+    def test_entity_to_document_chain_end_to_end(self):
+        # test_router.py may re-seed sys.modules["pageindex_mutil.utils"] with a
+        # stub lacking create_node_mapping (collection order); restore the real
+        # helper so the real router chain also works in combined runs.
+        utils_entry = sys.modules.get("pageindex_mutil.utils")
+        if utils_entry is not None and not hasattr(utils_entry, "create_node_mapping"):
+            utils_entry.create_node_mapping = utils_mod.create_node_mapping
+
+        client = _make_mock_client()
+
+        # Entity→document ids are DB integers; the mapper knows only 10→uuid.
+        db = client.db
+        db.search_entities.return_value = [{"id": 1, "name": "Alpha"}]
+        db.get_entity_relations.return_value = []
+        db.get_entity_documents.return_value = [{"id": 10, "pdf_name": "doc_A.pdf"}]
+
+        # In-memory documents are keyed by UUID (as in PageIndexClient).
+        client._id_mapper = _FakeIdMapper({10: "uuid-doc-10"})
+        client.documents = {
+            "uuid-doc-10": {
+                "doc_name": "doc_A.pdf",
+                "type": "md",
+                "structure": [{
+                    "node_id": "n1",
+                    "title": "Alpha",
+                    "text": "Alpha 实体内容 ENTITY_CONTENT_MARKER",
+                    "start_index": 0,
+                    "end_index": 0,
+                }],
+            }
+        }
+
+        # Router: mock everything except the REAL _act_tree_search and
+        # _recall_nodes_for_doc, which form the chain under test.
+        router = MagicMock(spec=AgenticRouter)
+        router.client = client
+        router.verifier = MagicMock()
+        router.verifier.verify.return_value = MagicMock(action="answer")
+        router._load_main_funcs.return_value = {
+            "get_relevant_nodes": MagicMock(return_value=["n1"]),
+            "pages_from_nodes": MagicMock(return_value=[1]),
+            "build_context_for_doc": MagicMock(
+                side_effect=lambda doc, selected, pages: "\n".join(
+                    n.get("text", "") for n in selected
+                )
+            ),
+            "generate_answer": MagicMock(return_value="e2e final answer"),
+        }
+        router._act_tree_search = types.MethodType(AgenticRouter._act_tree_search, router)
+        router._recall_nodes_for_doc = types.MethodType(AgenticRouter._recall_nodes_for_doc, router)
+
+        reasoner = MultiHopReasoner(model="m", retrieve_model="m")
+
+        decompose = json.dumps({"decomposable": True, "sub_queries": ["Q1"]})
+        # Hop 1 extracts nothing new → loop ends after hop 1.
+        extract = json.dumps({"entities": [], "facts": [], "next_hop_hint": ""})
+
+        with patch.object(
+            multi_hop_mod, "llm_acompletion",
+            side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract,
+        ):
+            result = asyncio.run(reasoner.execute("Alpha 是什么?", router, db))
+
+        # 1) Candidate docs reached tree search as UUIDs, not stringified DB ids:
+        #    matched_docs is keyed by whatever _act_tree_search resolved.
+        matched_ids = [d["doc_id"] for d in result["matched_docs"]]
+        assert "uuid-doc-10" in matched_ids
+        assert "10" not in matched_ids
+
+        # 2) The UUID-resolved doc's entity content made it into hop context.
+        assert any("ENTITY_CONTENT_MARKER" in c for c in result["hop_contexts"])
+
+        # 3) Final answer generated and CRAG-verified.
+        assert result["answer"] == "e2e final answer"
+        assert result["confidence"] == "high"
+        assert result["hop_count"] == 1
+
+        # 4) Chain proof: real recall succeeds for the UUID and returns None for
+        #    the old stringified DB id (which is what broke the link).
+        ok = asyncio.run(router._recall_nodes_for_doc("q", "uuid-doc-10"))
+        assert ok is not None
+        assert ok["doc_id"] == "uuid-doc-10"
+        broken = asyncio.run(router._recall_nodes_for_doc("q", "10"))
+        assert broken is None

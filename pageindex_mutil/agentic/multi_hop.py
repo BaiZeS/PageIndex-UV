@@ -4,9 +4,10 @@ Implements the reasoning-retrieval loop: query decomposability judgment →
 per-hop navigation → entity extraction → graph-guided next hop →
 multi-hop context aggregation → answer generation.
 """
+import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..utils import llm_acompletion, llm_completion, extract_json, count_tokens
 
@@ -68,12 +69,17 @@ class MultiHopReasoner:
         current_query = query
         visited_entities = set()
 
+        # entity→document ids from the graph are DB integers; downstream recall
+        # (_recall_nodes_for_doc) is keyed by UUID, so resolve them here.
+        id_mapper = getattr(getattr(router, "client", None), "_id_mapper", None)
+        to_uuid = getattr(id_mapper, "to_uuid", None)
+
         for hop_idx in range(max_hops):
             logger.info("[MultiHop] hop %d/%d query=%r", hop_idx + 1, max_hops, current_query)
 
             # Navigate: use tree navigation for current sub-query
             try:
-                candidate_docs = self._get_candidate_docs(db, current_query, visited_entities)
+                candidate_docs = self._get_candidate_docs(db, current_query, visited_entities, to_uuid)
                 ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = (
                     await router._act_tree_search(current_query, candidate_docs)
                 )
@@ -146,10 +152,28 @@ class MultiHopReasoner:
         else:
             answer = llm_completion(self._llm_model, self._build_answer_prompt(query, aggregated_ctx), thinking_disabled=False)
 
+        answer = answer or "No answer generated."
+
+        # Step 4: CRAG verification (same pattern as router tree-search paths)
+        verifier = getattr(router, "verifier", None)
+        verify_fn = getattr(verifier, "verify", None)
+        if callable(verify_fn):
+            v = await asyncio.to_thread(
+                verify_fn, answer, aggregated_ctx, query,
+                len(all_matched_docs), len(all_selected_nodes),
+            )
+            if v.action == "refuse":
+                answer = "I don't know."
+                confidence = "low"
+            else:
+                confidence = "high" if v.action == "answer" else "medium"
+        else:
+            confidence = "medium" if len(hop_contexts) >= 2 else "low"
+
         return {
             "query": query,
-            "answer": answer or "No answer generated.",
-            "confidence": "medium" if len(hop_contexts) >= 2 else "low",
+            "answer": answer,
+            "confidence": confidence,
             "matched_docs": all_matched_docs,
             "selected_nodes": all_selected_nodes,
             "pages": all_pages,
@@ -282,8 +306,21 @@ class MultiHopReasoner:
         visited_entities.add(best_next_entity.lower())
         return f"{query} (相关主题: {best_next_entity})"
 
-    def _get_candidate_docs(self, db: Any, query: str, visited_entities: set) -> List[str]:
-        """Get candidate document IDs from entity graph for the current sub-query."""
+    def _get_candidate_docs(
+        self,
+        db: Any,
+        query: str,
+        visited_entities: set,
+        to_uuid: Optional[Callable[[int], Optional[str]]] = None,
+    ) -> List[str]:
+        """Get candidate document UUIDs from entity graph for the current sub-query.
+
+        Entity tables reference documents by DB integer id, but downstream tree
+        navigation (_recall_nodes_for_doc) is keyed by UUID. When a `to_uuid`
+        mapper is provided, DB ids are converted at this outlet; unmapped ids
+        are dropped (they could never be retrieved anyway). Without a mapper,
+        fall back to the legacy str(db_id) behavior.
+        """
         if not db:
             return []
 
@@ -301,8 +338,16 @@ class MultiHopReasoner:
                 docs = db.get_entity_documents(entity_id)
                 for doc in docs:
                     doc_id = doc.get("id")
-                    if doc_id and str(doc_id) not in doc_ids:
-                        doc_ids.append(str(doc_id))
+                    if not doc_id:
+                        continue
+                    if callable(to_uuid):
+                        doc_id = to_uuid(doc_id)
+                        if not doc_id:
+                            continue
+                    else:
+                        doc_id = str(doc_id)
+                    if doc_id not in doc_ids:
+                        doc_ids.append(doc_id)
             except Exception:
                 continue
 
