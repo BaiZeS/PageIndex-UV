@@ -1054,7 +1054,7 @@ class SuperTreeIndex:
             return candidate_db_ids
         boosted = dict(candidate_db_ids)
         for node in top_nodes:
-            s = scores.get(node["id"], 0.0)
+            s = scores.get(node["id"], {}).get("total_score", 0.0)
             if s <= 0:
                 continue
             for doc_id in view.subtree_doc_ids(node["id"]):
