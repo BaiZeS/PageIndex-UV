@@ -306,7 +306,8 @@ class PageIndexClient:
             entry = {"name": m["entity_name"], "type": m["entity_type"]}
             if entry not in entries:
                 entries.append(entry)
-        tags = [t["tag_text"] for t in self.db.get_doc_tags(db_doc_id)]
+        # Node-profile 标签是语义属性：只取 LLM 抽象标签（fallback 原词不进语义漏斗）
+        tags = [t["tag_text"] for t in self.db.get_doc_tags(db_doc_id, source="llm")]
         profiles = [
             {"node_id": node_id, "entities": entries, "keywords": [], "tags": tags}
             for node_id, entries in profiles_by_node.items()

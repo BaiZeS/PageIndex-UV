@@ -28,6 +28,45 @@ FALLBACK_TITLE = "未分类"
 FALLBACK_WEIGHT = 0.3
 
 
+def resolve_new_tag(db, model: Optional[str], raw_tag: str) -> str:
+    """增量标签归一（共享）：单点 LLM 裁定"并入已有规范标签 or 新开"。
+
+    语料级标签集稳定的公共入口（[7.2]）：新文档抽取出的新标签先与已有
+    canonical 集比对，语义近似则复用既有 canonical 名，不新造。被
+    CorpusTreeBuilder._resolve_new_tag 与 ClosetIndex._anchor_tags 复用。
+
+    LLM 返回的 canonical 必须命中已有规范集（否则视为幻觉）；LLM 失败、
+    无响应或幻觉一律退回原标签（新开），不破坏确定性。
+    """
+    canonical_tags = db.get_corpus_canonical_tags()
+    if not canonical_tags:
+        return raw_tag
+    prompt = f"""你是一个语义标签归一化专家（标签归一化·增量单标签裁定）。已有规范标签集：
+{json.dumps(canonical_tags, ensure_ascii=False)}
+
+新文档产生了一个新标签："{raw_tag}"
+请裁定：该标签应并入哪个已有规范标签（同义/近义），还是作为新的规范标签？
+
+要求：
+1. 与已有规范标签同义或高度近义时，并入该规范标签
+2. 否则作为新的规范标签（可直接使用原标签名）
+
+返回JSON格式：{{"canonical": "规范标签名"}}
+直接返回最终JSON结构，不要输出其他内容。"""
+    try:
+        response = llm_completion(model, prompt, thinking_disabled=True)
+        data = extract_json(response) if response else None
+    except Exception as e:
+        logging.warning("resolve_new_tag LLM call failed: %s", e)
+        return raw_tag
+    if isinstance(data, dict):
+        canonical = str(data.get("canonical", "")).strip()
+        # 只接受已有规范标签（并入）；其他名字视为幻觉，退回原标签新开
+        if canonical and canonical in canonical_tags:
+            return canonical
+    return raw_tag
+
+
 class CorpusTreeBuilder:
     """索引期自动构建/增量维护语料级主题树（整库一棵树，无向量）。"""
 
@@ -57,7 +96,8 @@ class CorpusTreeBuilder:
     def rebuild(self) -> dict:
         """全量构建：从全部已索引文档重建语料树。返回可检视树结构。"""
         docs = self.db.get_all_documents()
-        doc_tags = {d["id"]: self.db.get_doc_tags(d["id"]) for d in docs}
+        # 语料树是语义漏斗：只认 LLM 抽象标签（fallback 原词不进语义通道）
+        doc_tags = {d["id"]: self.db.get_doc_tags(d["id"], source="llm") for d in docs}
 
         # ② 标签归一化（对"标签集合"的有界一次性 LLM 操作）
         all_tags = sorted({t["tag_text"] for tags in doc_tags.values() for t in tags})
@@ -107,7 +147,8 @@ class CorpusTreeBuilder:
           到下次结构调整（rebuild 合并 pass 处理）。
         """
         root_id = self._ensure_root()
-        rows = self.db.get_doc_tags(doc_id)
+        # 语义漏斗只认 LLM 抽象标签；fallback 原词文档按"无标签"挂兜底簇
+        rows = self.db.get_doc_tags(doc_id, source="llm")
         if not rows:
             fallback_id = self._ensure_fallback_cluster(root_id)
             self.db.add_corpus_membership(doc_id, fallback_id, FALLBACK_WEIGHT)
@@ -203,29 +244,8 @@ class CorpusTreeBuilder:
         return mapping
 
     def _resolve_new_tag(self, raw_tag: str) -> str:
-        """增量标签归一：单点 LLM 裁定"并入已有规范标签 or 新开"。"""
-        canonical_tags = self.db.get_corpus_canonical_tags()
-        if not canonical_tags:
-            return raw_tag
-        prompt = f"""你是一个语义标签归一化专家（标签归一化·增量单标签裁定）。已有规范标签集：
-{json.dumps(canonical_tags, ensure_ascii=False)}
-
-新文档产生了一个新标签："{raw_tag}"
-请裁定：该标签应并入哪个已有规范标签（同义/近义），还是作为新的规范标签？
-
-要求：
-1. 与已有规范标签同义或高度近义时，并入该规范标签
-2. 否则作为新的规范标签（可直接使用原标签名）
-
-返回JSON格式：{{"canonical": "规范标签名"}}
-直接返回最终JSON结构，不要输出其他内容。"""
-        data = self._llm_json(prompt)
-        if isinstance(data, dict):
-            canonical = str(data.get("canonical", "")).strip()
-            # 只接受已有规范标签（并入）；其他名字视为幻觉，退回原标签新开
-            if canonical and canonical in canonical_tags:
-                return canonical
-        return raw_tag
+        """增量标签归一：单点 LLM 裁定"并入已有规范标签 or 新开"（委托共享实现）。"""
+        return resolve_new_tag(self.db, self._llm_model, raw_tag)
 
     # ------------------------------------------------------------------
     # [S3.1] 簇大小双向卡界：过大拆分、过小合并

@@ -101,7 +101,8 @@ class HybridSearchBackend(SearchBackend):
             return []
 
         try:
-            tag_results = self.db.match_closet_tags(tokens, top_k)
+            # 语义标签通道只认 LLM 抽象标签（[7.2]：fallback 原词只进关键词层）
+            tag_results = self.db.match_closet_tags(tokens, top_k, source="llm")
             return [(doc_id, float(score)) for doc_id, score in tag_results]
         except Exception as e:
             logger.warning("Tag search failed: %s", e)

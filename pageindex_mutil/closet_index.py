@@ -51,6 +51,9 @@ class Tag:
 class ClosetIndex:
     _MIN_TAG_CONFIDENCE = 0.5
     _MIN_TOKEN_LENGTH = 1
+    # [7.2] 确定性抽取：固定 prompt + 全局 temperature=0（llm_completion），
+    # 代码侧再卡 K 上限（与 prompt "3-5 个"对齐），杜绝超量与抖动。
+    _MAX_TAGS_PER_DOC = 5
 
     def __init__(self, db, model: str, retrieve_model: str = None):
         self.db = db
@@ -94,7 +97,7 @@ class ClosetIndex:
                     conf = float(item.get("confidence", 0))
                     if text and conf >= self._MIN_TAG_CONFIDENCE:
                         tags.append(Tag(text=text.strip(), confidence=conf))
-            return tags
+            return tags[: self._MAX_TAGS_PER_DOC]
         except Exception as e:
             logging.warning(f"Tag extraction failed for {doc_name}: {e}")
             return []
@@ -131,17 +134,57 @@ class ClosetIndex:
     ) -> None:
         node_titles = [n.get("title", "") for n in nodes if n.get("title")]
         tags = self._extract_tags(doc_name, doc_description, node_titles)
+        source = "llm"
         if not tags:
+            # [7.2] fallback 分层降级：jieba 兜底原词只进关键词层（source="fallback"），
+            # 不冒充抽象概念进入语义标签漏斗。
             tags = self._fallback_tags(doc_name, doc_description)
+            source = "fallback"
         if not tags:
             return
+        if source == "llm":
+            # [7.2] 标签词表锚定（增量归一）：新标签先匹配 corpus_tag_norm 已有规范集
+            tags = self._anchor_tags(tags)
 
         records = []
         for tag in tags:
             tag_token = self._tokenize_tag(tag.text)
-            records.append((doc_id, tag.text, tag_token, tag.confidence, "llm"))
+            records.append((doc_id, tag.text, tag_token, tag.confidence, source))
 
         self.db.insert_closet_tags(doc_id, records)
+
+    def _anchor_tags(self, tags: List[Tag]) -> List[Tag]:
+        """增量归一锚定：复用 corpus_tree 的单点裁定（resolve_new_tag）。
+
+        已有 raw→canonical 映射直接复用；恰为已有规范标签的直接沿用；
+        真新标签才做一次单点 LLM 裁定，并落 corpus_tag_norm——
+        重索引同文档时全部命中映射，标签集幂等（[7.2] 稳定性）。
+        """
+        from .corpus_tree import resolve_new_tag
+
+        norm_map = self.db.get_corpus_tag_norm_map()
+        canonicals = set(norm_map.values())
+        order: List[str] = []
+        conf: dict = {}
+        for tag in tags:
+            raw = tag.text
+            if raw in norm_map:
+                canonical = norm_map[raw]
+            elif raw in canonicals:
+                canonical = raw
+                self.db.upsert_corpus_tag_norm(raw, raw)
+            else:
+                canonical = resolve_new_tag(
+                    self.db, self.retrieve_model or self.model, raw)
+                self.db.upsert_corpus_tag_norm(raw, canonical)
+                canonicals.add(canonical)
+            norm_map[raw] = canonical
+            if canonical not in conf:
+                order.append(canonical)
+                conf[canonical] = tag.confidence
+            else:
+                conf[canonical] = max(conf[canonical], tag.confidence)
+        return [Tag(text=c, confidence=conf[c]) for c in order]
 
     def remove_document(self, doc_id) -> None:
         self.db.delete_closet_tags(doc_id)
@@ -158,7 +201,8 @@ class ClosetIndex:
         ]
         if not filtered:
             return []
-        return self.db.match_closet_tags(filtered, top_k)
+        # 语义标签通道只认 LLM 抽象标签（[7.2]：fallback 原词只进关键词层）
+        return self.db.match_closet_tags(filtered, top_k, source="llm")
 
     def rebuild(self) -> None:
         with self.db._connect() as conn:

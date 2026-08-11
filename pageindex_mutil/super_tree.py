@@ -361,7 +361,8 @@ class SuperTreeIndex:
         tag_to_docs: Dict[str, list] = {}
         for db_id in candidate_db_ids:
             try:
-                tags = self.db.get_doc_tags(db_id)
+                # 领域级语义标签只认 LLM 抽象标签（fallback 原词不进语义漏斗）
+                tags = self.db.get_doc_tags(db_id, source="llm")
             except Exception:
                 tags = []
             for t in tags:
@@ -617,7 +618,8 @@ class SuperTreeIndex:
         for db_id, score in candidate_db_ids.items():
             boost = 0.0
             try:
-                tags = self.db.get_doc_tags(db_id)
+                # 集合层软路由只认 LLM 抽象标签（fallback 原词不进语义漏斗）
+                tags = self.db.get_doc_tags(db_id, source="llm")
             except Exception:
                 tags = []
             for t in tags:

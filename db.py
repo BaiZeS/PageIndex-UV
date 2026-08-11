@@ -463,14 +463,20 @@ class PageIndexDB:
         with self._connect() as conn:
             conn.execute("DELETE FROM closet_tags WHERE doc_id = ?", (doc_id,))
 
-    def get_doc_tags(self, doc_id):
-        """返回某文档的语义标签列表：[{tag_text, confidence}]（按置信度降序）。"""
+    def get_doc_tags(self, doc_id, source=None):
+        """返回某文档的语义标签列表：[{tag_text, confidence}]（按置信度降序）。
+
+        source 可选过滤（[7.2] 分层）："llm" 只取 LLM 抽象语义标签（语义通道），
+        "fallback" 只取 jieba 兜底原词（关键词层）；缺省返回全部来源。
+        """
+        sql = "SELECT tag_text, confidence FROM closet_tags WHERE doc_id = ?"
+        params = [doc_id]
+        if source is not None:
+            sql += " AND source = ?"
+            params.append(source)
+        sql += " ORDER BY confidence DESC"
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT tag_text, confidence FROM closet_tags WHERE doc_id = ? "
-                "ORDER BY confidence DESC",
-                (doc_id,),
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [{"tag_text": r[0], "confidence": r[1]} for r in rows]
 
     def upsert_node_profiles(self, doc_id, profiles):
@@ -534,33 +540,42 @@ class PageIndexDB:
         with self._connect() as conn:
             conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
 
-    def match_closet_tags(self, tokens, top_k=5):
+    def match_closet_tags(self, tokens, top_k=5, source=None):
+        """closet_tags 倒排匹配。source 可选过滤（[7.2] 分层）：
+        语义通道传 "llm"（只认 LLM 抽象标签）；关键词层缺省匹配全部来源。"""
         if not tokens:
             return []
+        src_clause = ""
+        extra = []
+        if source is not None:
+            src_clause = " AND source = ?"
+            extra = [source]
         conn = self._connect()
-        if len(tokens) <= SQLITE_MAX_VARIABLE_NUMBER:
+        # Reserve bind slots for the source filter / LIMIT inside SQLite's cap.
+        chunk_size = SQLITE_MAX_VARIABLE_NUMBER - len(extra)
+        if len(tokens) + 1 <= chunk_size:  # +1 for the LIMIT parameter
             placeholders = ",".join("?" for _ in tokens)
             sql = f"""
                 SELECT doc_id, SUM(confidence) AS score
                 FROM closet_tags
-                WHERE tag_token IN ({placeholders})
+                WHERE tag_token IN ({placeholders}){src_clause}
                 GROUP BY doc_id
                 ORDER BY score DESC
                 LIMIT ?
             """
-            rows = conn.execute(sql, (*tokens, top_k)).fetchall()
+            rows = conn.execute(sql, (*tokens, *extra, top_k)).fetchall()
             return [(r["doc_id"], r["score"]) for r in rows]
         results = []
-        for i in range(0, len(tokens), SQLITE_MAX_VARIABLE_NUMBER):
-            chunk = tokens[i:i + SQLITE_MAX_VARIABLE_NUMBER]
+        for i in range(0, len(tokens), chunk_size):
+            chunk = tokens[i:i + chunk_size]
             placeholders = ",".join("?" for _ in chunk)
             sql = f"""
                 SELECT doc_id, SUM(confidence) AS score
                 FROM closet_tags
-                WHERE tag_token IN ({placeholders})
+                WHERE tag_token IN ({placeholders}){src_clause}
                 GROUP BY doc_id
             """
-            rows = conn.execute(sql, chunk).fetchall()
+            rows = conn.execute(sql, (*chunk, *extra)).fetchall()
             results.extend(rows)
         merged = {}
         for r in results:
