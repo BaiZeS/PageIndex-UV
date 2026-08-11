@@ -766,7 +766,8 @@ class SuperTreeIndex:
         if not nodes:
             return []
         scores = self._score_nodes(query, nodes, view, entity_table)
-        if not scores:
+        # 零信号保召回：四个通道全部无命中时不截断，全量交给 LLM 精挑
+        if not any(s["total_score"] > 0 for s in scores.values()):
             return list(nodes)
         # Sort by total_score descending
         ranked = sorted(nodes,
