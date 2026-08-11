@@ -169,7 +169,7 @@ class AgenticRouter:
                     logging.warning("Strategy %s failed: %s", name, res)
                     results[name] = []
                 elif name == "content" and isinstance(res, list):
-                    # ContentStrategy returns (doc_id, score, matched_nodes)
+                    # ContentStrategy returns (doc_id, hit_count, matched_nodes)
                     content_results = []
                     for item in res:
                         if len(item) == 3:
@@ -178,7 +178,13 @@ class AgenticRouter:
                             node_matches[doc_id] = matches
                         else:
                             content_results.append(item)
-                    results[name] = content_results
+                    # 命中数不是 rank：按命中数降序（已排序，防御性再排一次）
+                    # 转换为真实 1-based rank 后再喂 RRF，否则命中越多分越低。
+                    content_results.sort(key=lambda t: t[1], reverse=True)
+                    results[name] = [
+                        (doc_id, rank + 1)
+                        for rank, (doc_id, _count) in enumerate(content_results)
+                    ]
                 else:
                     results[name] = res
 

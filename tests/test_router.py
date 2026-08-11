@@ -119,6 +119,49 @@ def router(mock_client):
     return AgenticRouter(mock_client, model="qwen-plus")
 
 
+class TestContentRankConversion:
+    """P0-Bug2: content 策略命中数必须转换为真实 rank 后再喂 RRF。"""
+
+    @pytest.mark.asyncio
+    async def test_content_results_are_ranks_not_hit_counts(self, router):
+        router.metadata_strategy.search = MagicMock(return_value=[])
+
+        match_a = [{"node_id": "nA", "keyword": "k", "context": "ctxA"}]
+        match_b = [{"node_id": "nB", "keyword": "k", "context": "ctxB"}]
+        router.content_strategy = MagicMock()
+        # ContentStrategy 保证按命中数降序返回 (doc_id, hit_count, matches)
+        router.content_strategy.search = MagicMock(
+            return_value=[("docA", 5, match_a), ("docB", 1, match_b)]
+        )
+
+        results, node_matches = await router._run_strategies(
+            "test query", [], {"content": 1.0}
+        )
+
+        # 必须是真实的 1-based rank（最优在前），而不是原始命中数
+        assert results["content"] == [("docA", 1), ("docB", 2)]
+        # node_matches 仍按 doc_id 携带匹配节点信息
+        assert node_matches == {"docA": match_a, "docB": match_b}
+
+    @pytest.mark.asyncio
+    async def test_fusion_ranks_more_hits_higher(self, router):
+        """端到端融合断言：命中更多的文档在 RRF 融合后排名更高。"""
+        router.metadata_strategy.search = MagicMock(return_value=[])
+        router.content_strategy = MagicMock()
+        router.content_strategy.search = MagicMock(
+            return_value=[
+                ("docA", 8, [{"node_id": "a"}]),
+                ("docB", 1, [{"node_id": "b"}]),
+            ]
+        )
+
+        results, _ = await router._run_strategies(
+            "test query", [], {"content": 1.0}
+        )
+        fused = AgenticRouter._weighted_rrf(results, {"content": 1.0})
+        assert [doc_id for doc_id, _ in fused] == ["docA", "docB"]
+
+
 class TestSearchSuperTree:
     @pytest.mark.asyncio
     async def test_prefilter_returns_empty(self, router):
