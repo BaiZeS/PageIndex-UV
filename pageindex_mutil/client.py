@@ -41,6 +41,19 @@ except ImportError:
 
 META_INDEX = "_meta.json"
 
+# P1.2: cap on node-level mention rows per (entity, doc) — deterministic
+# attribution can fan out on repetitive docs; keep the table bounded.
+_MAX_NODE_MENTIONS_PER_ENTITY = 20
+
+
+def _iter_structure_nodes(structure):
+    """Yield every node dict in a nested TOC structure, depth-first."""
+    for node in structure or []:
+        yield node
+        children = node.get("nodes")
+        if children:
+            yield from _iter_structure_nodes(children)
+
 
 class DocIdMapper:
     """Centralized UUID ↔ DB ID mapping with bidirectional lookup."""
@@ -213,6 +226,96 @@ class PageIndexClient:
 
         # --- No match: create new ---
         return self.db.insert_entity(entity_type, name, aliases)
+
+    @staticmethod
+    def _match_nodes_for_entity(name, aliases, structure,
+                                limit=_MAX_NODE_MENTIONS_PER_ENTITY):
+        """Deterministic entity→node attribution (no LLM).
+
+        Returns node_ids of TOC nodes whose title/text contains the entity
+        name or any alias (case-insensitive substring; sufficient for CJK).
+        Nodes without 'text' (PDF) fall back to 'summary'. First `limit`
+        matches win, in document order.
+        """
+        terms = [t.strip().casefold()
+                 for t in ([name] + list(aliases or [])) if t and t.strip()]
+        if not terms:
+            return []
+        matched = []
+        for node in _iter_structure_nodes(structure):
+            node_id = node.get("node_id")
+            if not node_id:
+                continue
+            # Check fields separately so multi-word terms can't match across
+            # the title/text boundary.
+            fields = [
+                (node.get("title") or "").casefold(),
+                (node.get("text") or node.get("summary") or "").casefold(),
+            ]
+            if any(t in f for t in terms for f in fields):
+                matched.append(node_id)
+                if len(matched) >= limit:
+                    break
+        return matched
+
+    def _insert_entity_mentions(self, eid, db_doc_id, entity,
+                                context_snippet, structure):
+        """Insert mention rows attributed to matching TOC nodes.
+
+        One row per (entity, doc, matched node); a single doc-level row
+        (node_id NULL) only when no node matches. Attribution uses the
+        entity row's accumulated name + aliases (post-resolution).
+        """
+        row = self.db.get_entity_by_id(eid)
+        name = row["name"] if row else entity.name
+        try:
+            aliases = json.loads((row or {}).get("aliases") or "[]")
+        except ValueError:
+            aliases = []
+        if not aliases:
+            aliases = list(entity.aliases or [])
+        node_ids = self._match_nodes_for_entity(name, aliases, structure)
+        if node_ids:
+            for nid in node_ids:
+                self.db.insert_entity_mention(
+                    eid, db_doc_id, node_id=nid,
+                    context_snippet=context_snippet,
+                    confidence=entity.confidence,
+                )
+        else:
+            self.db.insert_entity_mention(
+                eid, db_doc_id, context_snippet=context_snippet,
+                confidence=entity.confidence,
+            )
+
+    def _write_node_profiles(self, db_doc_id, structure=None):
+        """Build and persist node profiles for a document (P1.2).
+
+        Profiles aggregate entity_mentions (node-level rows) joined with the
+        entities table, so names are ALWAYS canonical (post merge/normalize).
+        Tags reuse the doc-level closet_tags. Optionally attaches the
+        'entities' key onto the live structure node dicts. Returns the list
+        of profile dicts written.
+        """
+        profiles_by_node = {}
+        for m in self.db.get_entity_mentions_by_doc(db_doc_id):
+            node_id = m.get("node_id")
+            if not node_id:
+                continue
+            entries = profiles_by_node.setdefault(node_id, [])
+            entry = {"name": m["entity_name"], "type": m["entity_type"]}
+            if entry not in entries:
+                entries.append(entry)
+        tags = [t["tag_text"] for t in self.db.get_doc_tags(db_doc_id)]
+        profiles = [
+            {"node_id": node_id, "entities": entries, "keywords": [], "tags": tags}
+            for node_id, entries in profiles_by_node.items()
+        ]
+        self.db.upsert_node_profiles(db_doc_id, profiles)
+        if structure:
+            for node in _iter_structure_nodes(structure):
+                node["entities"] = profiles_by_node.get(node.get("node_id"), [])
+        return profiles
 
     def index(self, file_path: str, mode: str = "auto", sync: bool = True) -> str:
         """Index a document. Returns a document_id."""
@@ -394,6 +497,9 @@ class PageIndexClient:
                         return ctx[:200]
                 return None
 
+            # Re-index: replace this doc's mentions (one row per entity/doc/node)
+            self.db.delete_entity_mentions(db_doc_id)
+
             entity_ids = {}
             for entity in entities:
                 eid = self._resolve_entity(
@@ -405,10 +511,9 @@ class PageIndexClient:
                 if eid:
                     entity_ids[entity.name] = eid
                     context_snippet = _find_context(entity.name, node_contexts)
-                    self.db.insert_entity_mention(
-                        eid, db_doc_id,
-                        context_snippet=context_snippet,
-                        confidence=entity.confidence
+                    self._insert_entity_mentions(
+                        eid, db_doc_id, entity,
+                        context_snippet, doc.get('structure')
                     )
 
             for rel in relations:
@@ -465,6 +570,15 @@ class PageIndexClient:
                     entity_future.result()
                 except Exception as e:
                     logging.warning("Entity extraction thread failed for doc %d: %s", db_doc_id, e)
+
+            # Node profiles (P1.2): canonical entity signatures per TOC node.
+            # Runs after entity extraction so mentions exist; also attaches the
+            # 'entities' key onto the structure before _save_doc persists it.
+            if self.db and doc.get('structure'):
+                try:
+                    self._write_node_profiles(db_doc_id, doc['structure'])
+                except Exception as e:
+                    logging.warning("Node profile build failed for doc %d: %s", db_doc_id, e)
 
             logging.info("Background enrichment complete for doc %d", db_doc_id)
         except Exception as e:
@@ -568,6 +682,7 @@ class PageIndexClient:
         Phase 2 — Batch corpus tree rebuild
         Phase 3 — Batch entity normalization
         Phase 4 — Search backend + super_tree indexing
+        Phase 5 — Node profiles (post-normalization → canonical entities)
 
         Returns list of doc_ids (UUIDs).
         """
@@ -608,6 +723,9 @@ class PageIndexClient:
                             return ctx[:200]
                     return None
 
+                # Re-index: replace this doc's mentions (one row per entity/doc/node)
+                self.db.delete_entity_mentions(db_doc_id)
+
                 entity_ids = {}
                 for entity in entities:
                     eid = self.db.insert_entity(
@@ -615,10 +733,9 @@ class PageIndexClient:
                     if eid:
                         entity_ids[entity.name] = eid
                         context_snippet = _find_context(entity.name, node_contexts)
-                        self.db.insert_entity_mention(
-                            eid, db_doc_id,
-                            context_snippet=context_snippet,
-                            confidence=entity.confidence)
+                        self._insert_entity_mentions(
+                            eid, db_doc_id, entity,
+                            context_snippet, doc.get('structure'))
 
                 for rel in relations:
                     subject_id = entity_ids.get(rel.subject)
@@ -659,6 +776,14 @@ class PageIndexClient:
                         db_doc_id, doc['structure'], doc.get('pages'))
             except Exception as e:
                 logging.warning("Phase 4 indexing failed for doc %d: %s", db_doc_id, e)
+
+        # -- Phase 5: node profiles (after normalization → canonical names) --
+        for _, db_doc_id, doc in phase1_results:
+            try:
+                if self.db and doc.get('structure'):
+                    self._write_node_profiles(db_doc_id, doc['structure'])
+            except Exception as e:
+                logging.warning("Node profile build failed for doc %d: %s", db_doc_id, e)
 
         doc_ids = [r[0] for r in phase1_results]
         logging.info("Batch indexing complete: %d documents", len(doc_ids))

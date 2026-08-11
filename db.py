@@ -191,6 +191,19 @@ class PageIndexDB:
                 CREATE INDEX IF NOT EXISTS idx_entity_mentions_doc ON entity_mentions(doc_id);
                 CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
 
+                -- Node profiles (P1.2): per-TOC-node attribute signature
+                -- (canonical entities / keywords / tags) for O(1) lookups.
+                CREATE TABLE IF NOT EXISTS node_profiles (
+                    doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    node_id TEXT NOT NULL,
+                    entities TEXT NOT NULL DEFAULT '[]',
+                    keywords TEXT NOT NULL DEFAULT '[]',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY (doc_id, node_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_node_profiles_doc
+                    ON node_profiles(doc_id);
+
                 CREATE TABLE IF NOT EXISTS entity_relations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     subject_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
@@ -459,6 +472,55 @@ class PageIndexDB:
                 (doc_id,),
             ).fetchall()
         return [{"tag_text": r[0], "confidence": r[1]} for r in rows]
+
+    def upsert_node_profiles(self, doc_id, profiles):
+        """Replace the node profiles of a document (idempotent re-index).
+
+        Each profile dict: {node_id, entities: [{name, type}], keywords: [...],
+        tags: [...]}. Deletes the doc's existing rows first so stale nodes from
+        a previous index don't survive, then bulk INSERT OR REPLACE.
+        """
+        with self._connect() as conn:
+            conn.execute("DELETE FROM node_profiles WHERE doc_id = ?", (doc_id,))
+            if not profiles:
+                return
+            records = [
+                (
+                    doc_id,
+                    p["node_id"],
+                    json.dumps(p.get("entities", []), ensure_ascii=False),
+                    json.dumps(p.get("keywords", []), ensure_ascii=False),
+                    json.dumps(p.get("tags", []), ensure_ascii=False),
+                )
+                for p in profiles
+            ]
+            for i in range(0, len(records), 100):
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO node_profiles
+                    (doc_id, node_id, entities, keywords, tags)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    records[i:i + 100],
+                )
+
+    def get_node_profiles(self, doc_id):
+        """Return a document's node profiles with JSON fields parsed."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT node_id, entities, keywords, tags FROM node_profiles "
+            "WHERE doc_id = ? ORDER BY node_id",
+            (doc_id,),
+        ).fetchall()
+        return [
+            {
+                "node_id": r["node_id"],
+                "entities": json.loads(r["entities"] or "[]"),
+                "keywords": json.loads(r["keywords"] or "[]"),
+                "tags": json.loads(r["tags"] or "[]"),
+            }
+            for r in rows
+        ]
 
     def delete_document(self, doc_id: int) -> None:
         """Delete a document and cascade-delete its child rows.
@@ -800,6 +862,13 @@ class PageIndexDB:
                 ) WHERE id = ?
                 """,
                 (entity_id, entity_id)
+            )
+
+    def delete_entity_mentions(self, doc_id: int) -> None:
+        """Delete all entity mentions of a document (pre-reindex cleanup)."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM entity_mentions WHERE doc_id = ?", (doc_id,)
             )
 
     def insert_entity_mentions_batch(self, records: list[tuple]) -> None:
