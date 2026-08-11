@@ -3,7 +3,8 @@
 > 日期：2026-08-04　状态：**总体设计定稿（全程无向量）· 评审修订 v2 · P0-P4 全部交付**
 > 评审修订 v2（2026-08-04）：同步 P0 已交付实况（[S9]/[S10]/[S11]）；补增量标签归一/簇卡界时机（[S3]）、软归属去重与延迟纪律（[S6]）、向量通道 C 去留（[S10]）、`search_entities` 分词前置改造（[S7.2]）、`_fuzzy_match` 范围（[S7.1]）、延迟风险（[S12]）。架构决策未变。
 > **实施完成（2026-08-04）**：P0-P4 全部交付，269 测试通过，每个任务通过规格评审 + 代码质量评审双重门控。多跳效果验证待 pageindex-paper 建多跳基准。
-> **本文档为最终定稿，取代以下早期文档**：`docs/rag-quality-optimization-options.md`、`docs/rag-progressive-disclosure-options.md`、`docs/compose/specs/2026-08-03-massive-rag-three-layer-architecture.md`、`docs/compose/specs/2026-08-04-corpus-tree-plan.md`（其结论已并入本文，那些文档仅作历史存档）。
+> **本文档为总体设计定稿，取代以下早期文档**（结论已并入本文，均已移入 `docs/archive/` 仅作历史存档）：`docs/archive/rag-quality-optimization-options.md`、`docs/archive/rag-progressive-disclosure-options.md`、`docs/archive/2026-08-03-massive-rag-three-layer-architecture.md`、`docs/archive/2026-08-04-corpus-tree-plan.md`。
+> **后续演进**：`2026-08-11-enhanced-toc-graph-unified-retrieval.md` 是在本定稿之上的**增量优化方案（讨论稿，规划中、尚未实现）**，不推翻本定稿骨架；涉及与本文不一致处，以该演进方向为准（实现后再回填本文）。
 > 范式定位：**树结构为主干 · 借鉴 skill/MCP 海量加载管理 · 融合图谱辅助**。
 > 一句话：构建"**按量级自适应的语义树导航**"（Adaptive Semantic Tree Navigation）——
 > 语料库是一棵树，检索 = 在树上用语义理解逐层导航，图谱在实体/多跳处加速，规模决定导航档位。

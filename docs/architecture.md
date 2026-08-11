@@ -1,5 +1,10 @@
 # Architecture
 
+> **文档导航** — 本文描述**当前已实现**的架构。
+> - 总体设计定稿：`docs/compose/specs/2026-08-04-overall-architecture-semantic-tree-navigation.md`（语义树导航，[S1]–[S13]）
+> - 规划中的演进方案：`docs/compose/specs/2026-08-11-enhanced-toc-graph-unified-retrieval.md`（增强 TOC 图谱 + 统一检索增强，**尚未实现**，勿当现状）
+> - 历史/被取代文档：`docs/archive/`（含归档索引）
+
 PageIndex-UV is a **hybrid retrieval RAG** tool over long documents (PDF / Markdown / DOCX / PPTX / XLSX). It supports keyword, vector (ChromaDB), and hybrid search backends with reasoning-based document selection. It exposes both an interactive CLI and an MCP server, backed by a shared `PageIndexClient` runtime.
 
 ## At a glance
