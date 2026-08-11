@@ -390,7 +390,11 @@ class TestEntityNormalizationMergesSynonyms:
         assert "张先生" in names
 
     def test_normalize_groups_by_type(self, db):
-        """normalize_entities_batch processes each entity type separately."""
+        """normalize_entities_batch processes each in-scope entity type separately.
+
+        类型分期（P1.1）：主动批归一只覆盖 person/project/organization，
+        concept 后置 —— 不喂给 LLM。
+        """
         from pageindex_mutil.entity_extractor import EntityExtractor
 
         extractor = EntityExtractor(model="test", retrieve_model="test")
@@ -398,8 +402,11 @@ class TestEntityNormalizationMergesSynonyms:
         # Need 2+ entities per type to trigger normalization
         db.insert_entity("person", "张三")
         db.insert_entity("person", "张先生")
-        db.insert_entity("concept", "风控")
-        db.insert_entity("concept", "风险管理")
+        db.insert_entity("project", "风控")
+        db.insert_entity("project", "风险管理")
+        # concept: 分期后置，不参与批归一
+        db.insert_entity("concept", "数据安全")
+        db.insert_entity("concept", "信息安全")
 
         llm_calls = []
 
@@ -418,8 +425,10 @@ class TestEntityNormalizationMergesSynonyms:
         with patch("pageindex_mutil.entity_extractor.llm_completion", side_effect=mock_llm):
             extractor.normalize_entities_batch(db)
 
-        # Should make 2 LLM calls (one per type)
+        # Should make 2 LLM calls (one per in-scope type; concept skipped)
         assert len(llm_calls) == 2
+        assert all("数据安全" not in p and "信息安全" not in p for p in llm_calls), \
+            "concept 实体分期后置，不应进入批归一 prompt"
 
     def test_normalize_merges_mentions_to_canonical(self, db):
         """After merge, mentions of synonym entity should point to canonical."""

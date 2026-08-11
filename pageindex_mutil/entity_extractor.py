@@ -13,6 +13,82 @@ from .utils import llm_completion, extract_json
 
 logger = logging.getLogger(__name__)
 
+# --- 实体消歧 blocking（轻量候选预裁剪）参数 ---
+# 批归一分块大小：单次 LLM prompt 最多喂入的名字数，防止大语料爆上下文
+NORMALIZE_BATCH_CHUNK_SIZE = 200
+# 批归一类型分期：主动批归一先只覆盖 person/project/organization，concept 后置。
+# 注意：增量单实体消歧 disambiguate_entity 不受此限制，所有类型仍走 _resolve_entity。
+BATCH_NORMALIZE_ENTITY_TYPES = ["person", "project", "organization"]
+# 字符集 Jaccard 阈值：≥ 该值视为疑似同簇
+BLOCKING_JACCARD_THRESHOLD = 0.5
+# 前缀匹配最小长度：单字前缀太宽泛，不作为信号
+BLOCKING_MIN_PREFIX_LEN = 2
+# 送入 LLM 裁定的候选上限（按信号强度取 top-N）
+BLOCKING_MAX_CANDIDATES = 20
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein 编辑距离（两行 DP，无外部依赖）。"""
+    if a == b:
+        return 0
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost))
+        prev = cur
+    return prev[-1]
+
+
+def _blocking_score(query_names: List[str], candidate_names: List[str]) -> Optional[float]:
+    """blocking 轻量信号：新实体名/别名 vs 候选实体名/别名，任一命中返回强度分，否则 None。
+
+    只做 LLM 前置裁剪（疑似同簇才送 LLM 裁定），不直接决定合并；
+    保守原则：信号宁缺毋滥，漏掉的疑似对由后续批归一兜底。
+
+    信号（case-insensitive，strip 后比较）：
+      1. 精确匹配            → 1.0
+      2. 前缀匹配（≥2 字）   → 0.9
+      3. 字符集 Jaccard ≥ BLOCKING_JACCARD_THRESHOLD → jaccard 值
+      4. 编辑距离 ≤ max(2, 较长串长 // 4) 且至少共享一个字符 → 强度分
+         （附加共享字符约束：极短串的编辑距离 ≤2 可能只是整串替换，
+           不构成相似信号；"小张" vs "张三" 距离=2 且共享 "张" → 疑似对）
+    """
+    q = [n.strip().casefold() for n in query_names if n and n.strip()]
+    c = [n.strip().casefold() for n in candidate_names if n and n.strip()]
+    if not q or not c:
+        return None
+
+    best: Optional[float] = None
+    for a in q:
+        for b in c:
+            score: Optional[float] = None
+            if a == b:
+                score = 1.0
+            else:
+                prefix_len = len(a) if b.startswith(a) else (len(b) if a.startswith(b) else 0)
+                if prefix_len >= BLOCKING_MIN_PREFIX_LEN:
+                    score = 0.9
+            if score is None:
+                set_a, set_b = set(a), set(b)
+                inter = len(set_a & set_b)
+                if inter:
+                    jaccard = inter / len(set_a | set_b)
+                    if jaccard >= BLOCKING_JACCARD_THRESHOLD:
+                        score = jaccard
+                    threshold = max(2, max(len(a), len(b)) // 4)
+                    dist = _edit_distance(a, b)
+                    if dist <= threshold:
+                        # 强度下限 0.1：命中 blocking 即有最低强度，避免等长全替换对得 0 分
+                        edit_score = max(0.1, 1.0 - dist / max(len(a), len(b), 1))
+                        score = max(score or 0.0, edit_score)
+            if score is not None and (best is None or score > best):
+                best = score
+    return best
+
 
 @dataclass
 class Entity:
@@ -287,18 +363,43 @@ class EntityExtractor:
     ) -> Optional[Dict]:
         """Decide whether a new entity should merge with an existing one.
 
-        Uses LLM (retrieve_model per NFR4) to compare the new entity against
-        existing entities of the same type.  Returns the canonical entity dict
-        to merge into, or None if no merge is appropriate.
-
-        On LLM failure, conservatively returns None (no merge).
+        Blocking 预裁剪 + LLM 裁定（retrieve_model per NFR4）:
+        1. 轻量信号（_blocking_score）从同类型已有实体中筛出疑似同簇候选；
+           无候选命中 → 直接跳过 LLM（保守不合并）。
+        2. 仅对信号强度 top-N 的候选调 LLM 裁是否合并。
+        返回应合入的 canonical 实体 dict，或 None（不确定/失败一律不合并）。
         """
         if not existing_entities:
             return None
 
+        # --- Blocking: 只把疑似同簇候选喂给 LLM，调用量 O(全量) → O(疑似对) ---
+        query_names = [new_name] + list(new_aliases or [])
+        blocked: List[Tuple[float, Dict, List[str]]] = []
+        for entity in existing_entities:
+            aliases_raw = entity.get("aliases", "[]") or "[]"
+            if isinstance(aliases_raw, str):
+                try:
+                    cand_aliases = json.loads(aliases_raw)
+                    if not isinstance(cand_aliases, list):
+                        cand_aliases = []
+                except ValueError:
+                    cand_aliases = []
+            else:
+                cand_aliases = list(aliases_raw)
+            score = _blocking_score(query_names, [entity["name"]] + cand_aliases)
+            if score is not None:
+                blocked.append((score, entity, cand_aliases))
+
+        if not blocked:
+            # 无疑似候选 → 跳过 LLM，保守不合并
+            return None
+
+        blocked.sort(key=lambda item: item[0], reverse=True)
+        candidates = blocked[:BLOCKING_MAX_CANDIDATES]
+
         candidates_text = json.dumps(
-            [{"name": e["name"], "aliases": json.loads(e.get("aliases", "[]") or "[]")}
-             for e in existing_entities[:20]],
+            [{"name": e["name"], "aliases": aliases}
+             for _, e, aliases in candidates],
             ensure_ascii=False,
         )
 
@@ -331,8 +432,8 @@ class EntityExtractor:
             if not canonical_name:
                 return None
 
-            # Find the matching existing entity
-            for entity in existing_entities:
+            # Find the matching candidate (LLM 只见过 blocking 幸存者)
+            for _, entity, _aliases in candidates:
                 if entity["name"] == canonical_name:
                     return entity
 
@@ -351,8 +452,9 @@ class EntityExtractor:
         - Apply: merge duplicate entities, update mentions
         - Conservative on failure (identity mapping)
         """
-        entity_types = ["person", "project", "organization", "concept"]
-        for etype in entity_types:
+        # 类型分期：主动批归一先只覆盖 person/project/organization，concept 后置
+        # （增量单实体消歧 disambiguate_entity 不受限，仍覆盖所有类型）
+        for etype in BATCH_NORMALIZE_ENTITY_TYPES:
             entities = db.get_entities_by_type(etype)
             if len(entities) <= 1:
                 continue
@@ -386,7 +488,34 @@ class EntityExtractor:
     def _normalize_entities_llm(self, names: list[str]) -> dict[str, str]:
         """LLM merges synonym entity names → raw→canonical mapping.
 
+        批归一分块（bounded chunk）+ map-reduce：
+        - map：按 NORMALIZE_BATCH_CHUNK_SIZE 分块，块内 LLM 归一；
+        - reduce：多块时对各块归一后的代表元（canonical 名）再做一轮合并，
+          杜绝大语料单 prompt 爆上下文。
         Mirrors _normalize_tags in corpus_tree.py. Conservative on failure.
+        """
+        mapping = {n: n for n in names}
+        if len(names) <= 1:
+            return mapping
+        chunks = [names[i:i + NORMALIZE_BATCH_CHUNK_SIZE]
+                  for i in range(0, len(names), NORMALIZE_BATCH_CHUNK_SIZE)]
+        if len(chunks) == 1:
+            return self._normalize_chunk_llm(names)
+        # map: 各块独立归一
+        for chunk in chunks:
+            mapping.update(self._normalize_chunk_llm(chunk))
+        # reduce: 块间代表元合一轮（保守：合并结果以 LLM 返回为准）
+        representatives = list(dict.fromkeys(mapping.values()))
+        if len(representatives) > 1:
+            consolidation = self._normalize_chunk_llm(representatives)
+            mapping = {raw: consolidation.get(canonical, canonical)
+                       for raw, canonical in mapping.items()}
+        return mapping
+
+    def _normalize_chunk_llm(self, names: list[str]) -> dict[str, str]:
+        """单次 LLM 归一（单块或 reduce 合并轮）→ raw→canonical mapping。
+
+        Conservative on failure: 恒等映射（不合并）。
         """
         mapping = {n: n for n in names}
         if len(names) <= 1:
