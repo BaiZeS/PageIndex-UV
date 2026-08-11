@@ -836,7 +836,6 @@ class TestMultiHopCRAGVerification:
 
         result = self._run_multi_hop(reasoner, router, client)
 
-        router.verifier.verify.assert_called_once()
         # (answer, aggregated_ctx, query, source_docs, covered_nodes)
         args = router.verifier.verify.call_args[0]
         assert args[0] == "final answer"
@@ -844,7 +843,6 @@ class TestMultiHopCRAGVerification:
         assert args[2] == "q"
         assert args[3] == 1  # len(all_matched_docs)
         assert args[4] == 2  # len(all_selected_nodes)
-        answer_mock = router._load_main_funcs.return_value["generate_answer"]
         assert router.verifier.verify.call_count == 1
         assert result["answer"] == "final answer"
 
@@ -892,86 +890,109 @@ class TestMultiHopEntityToDocE2E:
     break still downstream'."""
 
     def test_entity_to_document_chain_end_to_end(self):
-        # test_router.py may re-seed sys.modules["pageindex_mutil.utils"] with a
-        # stub lacking create_node_mapping (collection order); restore the real
-        # helper so the real router chain also works in combined runs.
-        utils_entry = sys.modules.get("pageindex_mutil.utils")
-        if utils_entry is not None and not hasattr(utils_entry, "create_node_mapping"):
-            utils_entry.create_node_mapping = utils_mod.create_node_mapping
+        # The real router methods below do call-time relative imports
+        # (router.py:246 `from ..utils import create_node_mapping`,
+        # router.py:334 `from ..utils import count_tokens`, router.py:336
+        # `from ..reasoning import ...`) that resolve against sys.modules and
+        # can add/replace pageindex_mutil* entries (last-writer-wins between
+        # test files). Snapshot every pageindex_mutil* entry and restore it in
+        # finally so this test stays sys.modules-neutral regardless of
+        # collection order — even if the test itself fails.
+        _saved_modules = {
+            name: mod for name, mod in sys.modules.items()
+            if name.startswith("pageindex_mutil")
+        }
+        try:
+            # test_router.py may re-seed sys.modules["pageindex_mutil.utils"]
+            # with a stub lacking create_node_mapping (collection order);
+            # restore the real helper so the real router chain also works in
+            # combined runs. count_tokens must be attached too: the real
+            # _act_tree_search imports it at router.py:334 OUTSIDE any
+            # try/except, so a stub without it aborts the test.
+            utils_entry = sys.modules.get("pageindex_mutil.utils")
+            if utils_entry is not None and not hasattr(utils_entry, "create_node_mapping"):
+                utils_entry.create_node_mapping = utils_mod.create_node_mapping
+            if utils_entry is not None and not hasattr(utils_entry, "count_tokens"):
+                utils_entry.count_tokens = utils_mod.count_tokens
 
-        client = _make_mock_client()
+            client = _make_mock_client()
 
-        # Entity→document ids are DB integers; the mapper knows only 10→uuid.
-        db = client.db
-        db.search_entities.return_value = [{"id": 1, "name": "Alpha"}]
-        db.get_entity_relations.return_value = []
-        db.get_entity_documents.return_value = [{"id": 10, "pdf_name": "doc_A.pdf"}]
+            # Entity→document ids are DB integers; the mapper knows only 10→uuid.
+            db = client.db
+            db.search_entities.return_value = [{"id": 1, "name": "Alpha"}]
+            db.get_entity_relations.return_value = []
+            db.get_entity_documents.return_value = [{"id": 10, "pdf_name": "doc_A.pdf"}]
 
-        # In-memory documents are keyed by UUID (as in PageIndexClient).
-        client._id_mapper = _FakeIdMapper({10: "uuid-doc-10"})
-        client.documents = {
-            "uuid-doc-10": {
-                "doc_name": "doc_A.pdf",
-                "type": "md",
-                "structure": [{
-                    "node_id": "n1",
-                    "title": "Alpha",
-                    "text": "Alpha 实体内容 ENTITY_CONTENT_MARKER",
-                    "start_index": 0,
-                    "end_index": 0,
-                }],
+            # In-memory documents are keyed by UUID (as in PageIndexClient).
+            client._id_mapper = _FakeIdMapper({10: "uuid-doc-10"})
+            client.documents = {
+                "uuid-doc-10": {
+                    "doc_name": "doc_A.pdf",
+                    "type": "md",
+                    "structure": [{
+                        "node_id": "n1",
+                        "title": "Alpha",
+                        "text": "Alpha 实体内容 ENTITY_CONTENT_MARKER",
+                        "start_index": 0,
+                        "end_index": 0,
+                    }],
+                }
             }
-        }
 
-        # Router: mock everything except the REAL _act_tree_search and
-        # _recall_nodes_for_doc, which form the chain under test.
-        router = MagicMock(spec=AgenticRouter)
-        router.client = client
-        router.verifier = MagicMock()
-        router.verifier.verify.return_value = MagicMock(action="answer")
-        router._load_main_funcs.return_value = {
-            "get_relevant_nodes": MagicMock(return_value=["n1"]),
-            "pages_from_nodes": MagicMock(return_value=[1]),
-            "build_context_for_doc": MagicMock(
-                side_effect=lambda doc, selected, pages: "\n".join(
-                    n.get("text", "") for n in selected
-                )
-            ),
-            "generate_answer": MagicMock(return_value="e2e final answer"),
-        }
-        router._act_tree_search = types.MethodType(AgenticRouter._act_tree_search, router)
-        router._recall_nodes_for_doc = types.MethodType(AgenticRouter._recall_nodes_for_doc, router)
+            # Router: mock everything except the REAL _act_tree_search and
+            # _recall_nodes_for_doc, which form the chain under test.
+            router = MagicMock(spec=AgenticRouter)
+            router.client = client
+            router.verifier = MagicMock()
+            router.verifier.verify.return_value = MagicMock(action="answer")
+            router._load_main_funcs.return_value = {
+                "get_relevant_nodes": MagicMock(return_value=["n1"]),
+                "pages_from_nodes": MagicMock(return_value=[1]),
+                "build_context_for_doc": MagicMock(
+                    side_effect=lambda doc, selected, pages: "\n".join(
+                        n.get("text", "") for n in selected
+                    )
+                ),
+                "generate_answer": MagicMock(return_value="e2e final answer"),
+            }
+            router._act_tree_search = types.MethodType(AgenticRouter._act_tree_search, router)
+            router._recall_nodes_for_doc = types.MethodType(AgenticRouter._recall_nodes_for_doc, router)
 
-        reasoner = MultiHopReasoner(model="m", retrieve_model="m")
+            reasoner = MultiHopReasoner(model="m", retrieve_model="m")
 
-        decompose = json.dumps({"decomposable": True, "sub_queries": ["Q1"]})
-        # Hop 1 extracts nothing new → loop ends after hop 1.
-        extract = json.dumps({"entities": [], "facts": [], "next_hop_hint": ""})
+            decompose = json.dumps({"decomposable": True, "sub_queries": ["Q1"]})
+            # Hop 1 extracts nothing new → loop ends after hop 1.
+            extract = json.dumps({"entities": [], "facts": [], "next_hop_hint": ""})
 
-        with patch.object(
-            multi_hop_mod, "llm_acompletion",
-            side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract,
-        ):
-            result = asyncio.run(reasoner.execute("Alpha 是什么?", router, db))
+            with patch.object(
+                multi_hop_mod, "llm_acompletion",
+                side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract,
+            ):
+                result = asyncio.run(reasoner.execute("Alpha 是什么?", router, db))
 
-        # 1) Candidate docs reached tree search as UUIDs, not stringified DB ids:
-        #    matched_docs is keyed by whatever _act_tree_search resolved.
-        matched_ids = [d["doc_id"] for d in result["matched_docs"]]
-        assert "uuid-doc-10" in matched_ids
-        assert "10" not in matched_ids
+            # 1) Candidate docs reached tree search as UUIDs, not stringified DB ids:
+            #    matched_docs is keyed by whatever _act_tree_search resolved.
+            matched_ids = [d["doc_id"] for d in result["matched_docs"]]
+            assert "uuid-doc-10" in matched_ids
+            assert "10" not in matched_ids
 
-        # 2) The UUID-resolved doc's entity content made it into hop context.
-        assert any("ENTITY_CONTENT_MARKER" in c for c in result["hop_contexts"])
+            # 2) The UUID-resolved doc's entity content made it into hop context.
+            assert any("ENTITY_CONTENT_MARKER" in c for c in result["hop_contexts"])
 
-        # 3) Final answer generated and CRAG-verified.
-        assert result["answer"] == "e2e final answer"
-        assert result["confidence"] == "high"
-        assert result["hop_count"] == 1
+            # 3) Final answer generated and CRAG-verified.
+            assert result["answer"] == "e2e final answer"
+            assert result["confidence"] == "high"
+            assert result["hop_count"] == 1
 
-        # 4) Chain proof: real recall succeeds for the UUID and returns None for
-        #    the old stringified DB id (which is what broke the link).
-        ok = asyncio.run(router._recall_nodes_for_doc("q", "uuid-doc-10"))
-        assert ok is not None
-        assert ok["doc_id"] == "uuid-doc-10"
-        broken = asyncio.run(router._recall_nodes_for_doc("q", "10"))
-        assert broken is None
+            # 4) Chain proof: real recall succeeds for the UUID and returns None for
+            #    the old stringified DB id (which is what broke the link).
+            ok = asyncio.run(router._recall_nodes_for_doc("q", "uuid-doc-10"))
+            assert ok is not None
+            assert ok["doc_id"] == "uuid-doc-10"
+            broken = asyncio.run(router._recall_nodes_for_doc("q", "10"))
+            assert broken is None
+        finally:
+            for name in [n for n in sys.modules if n.startswith("pageindex_mutil")]:
+                if name not in _saved_modules:
+                    del sys.modules[name]
+            sys.modules.update(_saved_modules)
