@@ -3,7 +3,8 @@
 覆盖：
 1. 量级档位探测（小直连 / 中单层路由 / 海量层级树，按文档数，阈值可配）；
 2. 宽层语义预筛（jieba 关键词 + closet_tags 倒排，严格无向量，保召回）；
-3. 图谱信号加权（现有 search_entities 实体命中 → 加权/捞回，绝不硬删）；
+3. 图谱信号加权（L0 实体距离加权：查询实体 → 距离衰减×关系类型权重表 →
+   节点子树查表打分，作为四通道之一（D 通道）；证据加权，不再强制捞回被切节点）；
 4. LLM 逐层精挑（可变数量、宁缺毋滥，T9 H02 修复的泛化；retrieve_model 接线）；
 5. 层级树导航（渐进披露：只展开选中分支；分支并行展开 asyncio.gather；
    软归属 doc_id 去重保留最大权重；语料树缺失优雅降级返回 None）；
@@ -227,21 +228,53 @@ class TestNodePrefilter:
 
 
 # ---------------------------------------------------------------------------
-# [S6]② 图谱信号加权（复用现有 search_entities）
+# [S6]② 图谱信号加权（L0 实体距离加权：D 通道）
 # ---------------------------------------------------------------------------
 
 
 class TestEntityBoost:
-    def test_entity_document_ids(self, nav_index):
+    """实体图谱信号 = 四通道打分中的 D 通道（现行 L0 实现）。
+
+    四通道重构废弃了旧 API（`_entity_document_ids` 实体→文档集反查、
+    `_entity_boost_nodes` 带切节点强制捞回）。现行链路：
+    `_precompute_entity_distances` 以 search_entities 命中实体为种子（距离 0，
+    权重 1.0）做一次 BFS（距离衰减 × 关系类型权重）生成 entity_table；
+    `_get_node_entity_boost` 对节点子树文档的提及逐层查表取最大权重；
+    `_score_nodes`/`_prefilter_nodes` 将其作为加权通道（最高贡献 0.2）。
+    实体信号不再能强制捞回被截断的节点——硬捞回语义留待 P2 的
+    并集 + 延迟池重构（spec [3.3]：实体信号重定义为证据）。
+    """
+
+    def test_entity_boost_weights_node_with_mention(self, nav_index):
+        """查询实体以距离 0/权重 1.0 入 entity_table；仅含提及的节点获加权。"""
         st, db, _ = nav_index
         d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
         d2 = db.insert_document("b.pdf", "/tmp/b.pdf")
         eid = db.insert_entity("person", "张三")
         db.insert_entity_mention(eid, d2, confidence=0.9)
-        assert st._entity_document_ids("张三") == {d2}
-        assert st._entity_document_ids("无实体查询") == set()
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        n1 = db.insert_corpus_tree_node(root, "甲簇", "", 1, kind="cluster")
+        n2 = db.insert_corpus_tree_node(root, "乙簇", "", 1, kind="cluster")
+        db.add_corpus_membership(d1, n1, 1.0)
+        db.add_corpus_membership(d2, n2, 1.0)
+        view = st._load_corpus_tree()
+
+        table = st._precompute_entity_distances("张三")
+        assert table[eid]["distance"] == 0
+        assert table[eid]["weight"] == 1.0
+        assert table[eid]["name"] == "张三"
+
+        boost2, info2 = st._get_node_entity_boost(n2, view, table)
+        assert boost2 > 0  # 含查询实体提及的节点被加权
+        assert info2 and info2["name"] == "张三"
+        boost1, info1 = st._get_node_entity_boost(n1, view, table)
+        assert boost1 == 0  # 无实体提及的兄弟节点不加权
+        assert info1 is None
+        # 查询未命中任何实体 → 空表（对应旧 test_entity_document_ids 的空查断言）
+        assert st._precompute_entity_distances("无实体查询") == {}
 
     def test_entity_hit_node_ranked_first(self, nav_index):
+        """D 通道加权使含实体节点在打分与预筛排序中升到零信号兄弟之前。"""
         st, db, _ = nav_index
         d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
         d2 = db.insert_document("b.pdf", "/tmp/b.pdf")
@@ -253,32 +286,45 @@ class TestEntityBoost:
         db.add_corpus_membership(d1, n1, 1.0)
         db.add_corpus_membership(d2, n2, 1.0)
         view = st._load_corpus_tree()
-        entity_docs = st._entity_document_ids("张三")
-        boosted = st._entity_boost_nodes(
-            [view.nodes_by_id[n1], view.nodes_by_id[n2]],
-            [view.nodes_by_id[n1], view.nodes_by_id[n2]],
-            view, entity_docs)
-        assert boosted[0]["id"] == n2  # 含查询实体的节点被加权提前
 
-    def test_entity_hit_recovered_from_prefilter_cut(self, nav_index):
-        """实体命中是比词面更强的证据：被预筛切掉的兄弟节点若含实体则捞回。"""
+        entity_table = st._precompute_entity_distances("张三")
+        nodes = [view.nodes_by_id[n1], view.nodes_by_id[n2]]
+        scores = st._score_nodes("张三", nodes, view, entity_table)
+        assert scores[n2]["entity_boost"] > scores[n1]["entity_boost"]
+        assert scores[n2]["total_score"] > scores[n1]["total_score"]
+        out = st._prefilter_nodes("张三", nodes, view, entity_table)
+        assert out[0]["id"] == n2  # 含查询实体的节点被加权提前
+
+    def test_entity_hit_survives_prefilter_cut(self, nav_index):
+        """实体证据胜过零信号：预筛截断到 1 个时含实体节点存活。
+
+        语义变更说明：旧 `_entity_boost_nodes` 会把被预筛切掉的含实体节点
+        强制捞回（"绝不硬删"）。现行实现中实体信号只是四通道之一（最高
+        贡献 0.2），_prefilter_nodes 按总分截断、不再强制捞回——该语义留待
+        P2 的并集 + 延迟池重构恢复（spec [3.3] 将实体信号重定义为证据）。
+        本测试因此只断言现行实现实际保证的东西：有实体证据的节点排序严格
+        高于零信号节点，即使 topk=1 也不会被静默丢失。
+        """
         st, db, _ = nav_index
+        st._NODE_PREFILTER_TOPK = 1
         d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
         d2 = db.insert_document("b.pdf", "/tmp/b.pdf")
         eid = db.insert_entity("person", "张三")
         db.insert_entity_mention(eid, d2, confidence=0.9)
         root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
-        n1 = db.insert_corpus_tree_node(root, "甲簇", "", 1, kind="cluster")
-        n2 = db.insert_corpus_tree_node(root, "乙簇", "", 1, kind="cluster")
-        db.add_corpus_membership(d1, n1, 1.0)
-        db.add_corpus_membership(d2, n2, 1.0)
+        n_zero_a = db.insert_corpus_tree_node(root, "甲簇", "", 1, kind="cluster")
+        n_zero_b = db.insert_corpus_tree_node(root, "乙簇", "", 1, kind="cluster")
+        n_entity = db.insert_corpus_tree_node(root, "丙簇", "", 1, kind="cluster")
+        db.add_corpus_membership(d1, n_zero_a, 1.0)  # d1 无实体提及 → 零信号
+        db.add_corpus_membership(d2, n_entity, 1.0)  # d2 含张三 → 唯一证据
         view = st._load_corpus_tree()
-        entity_docs = st._entity_document_ids("张三")
-        boosted = st._entity_boost_nodes(
-            [view.nodes_by_id[n1]],  # 预筛只剩 n1
-            [view.nodes_by_id[n1], view.nodes_by_id[n2]],
-            view, entity_docs)
-        assert {n["id"] for n in boosted} == {n1, n2}  # n2 被捞回，无硬删
+
+        entity_table = st._precompute_entity_distances("张三")
+        nodes = [view.nodes_by_id[n_zero_a], view.nodes_by_id[n_zero_b],
+                 view.nodes_by_id[n_entity]]
+        out = st._prefilter_nodes("张三", nodes, view, entity_table)
+        assert len(out) == 1
+        assert out[0]["id"] == n_entity  # 证据胜过无证据，实体节点不被截丢
 
 
 # ---------------------------------------------------------------------------
