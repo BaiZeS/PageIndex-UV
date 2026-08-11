@@ -97,6 +97,8 @@ class ClosetIndex:
                     conf = float(item.get("confidence", 0))
                     if text and conf >= self._MIN_TAG_CONFIDENCE:
                         tags.append(Tag(text=text.strip(), confidence=conf))
+            # K-cap 前按置信度降序（稳定排序）：模型超量返回时高置信标签优先留存
+            tags.sort(key=lambda t: t.confidence, reverse=True)
             return tags[: self._MAX_TAGS_PER_DOC]
         except Exception as e:
             logging.warning(f"Tag extraction failed for {doc_name}: {e}")

@@ -340,12 +340,18 @@ class TestIdempotencyAndDeterminism:
         assert all(r["source"] == "fallback" for r in second)
 
     def test_extract_caps_at_five_tags(self, db, closet):
-        """确定性抽取 K 上限：超出 _MAX_TAGS_PER_DOC 的标签被截断。"""
+        """确定性抽取 K 上限：模型超量返回时按置信度降序留存 top-K。"""
         assert closet._MAX_TAGS_PER_DOC == 5
         doc_id = db.insert_document("a.pdf", "/tmp/a.pdf")
-        tags = [{"tag": f"标签{i}", "confidence": 0.9} for i in range(7)]
+        # 7 个标签、乱序置信度：只留置信度最高的 5 个（稳定排序，
+        # 同置信度保持模型返回顺序）
+        confs = [0.55, 0.92, 0.60, 0.97, 0.71, 0.88, 0.80]
+        tags = [{"tag": f"标签{i}", "confidence": c} for i, c in enumerate(confs)]
         fake = _route_llm({M_EXTRACT: json.dumps(tags)})
         with _patch_llm(fake):
             closet.add_document(doc_id, "多标签文档", "", [{"title": "x"}])
         rows = _raw_rows(db, doc_id)
-        assert [r["tag_text"] for r in rows] == [f"标签{i}" for i in range(5)]
+        assert [(r["tag_text"], r["confidence"]) for r in rows] == [
+            ("标签3", 0.97), ("标签1", 0.92), ("标签5", 0.88),
+            ("标签6", 0.80), ("标签4", 0.71),
+        ]

@@ -267,6 +267,18 @@ class PageIndexDB:
             except sqlite3.OperationalError:
                 conn.execute("ALTER TABLE documents ADD COLUMN doc_description TEXT")
 
+            # One-shot backfill (idempotent): before a93ee95,
+            # ClosetIndex.add_document hardcoded source="llm" for jieba
+            # fallback tags, so legacy DBs carry fallback words mislabeled
+            # "llm" that pollute the (now-gated) semantic channel. Collision
+            # free: fallback tags have confidence exactly 0.3 while LLM tags
+            # are stored only with conf >= 0.5 (_MIN_TAG_CONFIDENCE). No-op
+            # once applied (source already "fallback") and on fresh DBs.
+            conn.execute(
+                "UPDATE closet_tags SET source = 'fallback' "
+                "WHERE source = 'llm' AND abs(confidence - 0.3) < 1e-9"
+            )
+
     def insert_document(self, pdf_name, pdf_path, doc_description=None):
         with self._connect() as conn:
             cur = conn.execute(

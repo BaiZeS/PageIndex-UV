@@ -345,7 +345,8 @@ class PageIndexClient:
         Profiles aggregate entity_mentions (node-level rows) joined with the
         entities table, so names are ALWAYS canonical (post merge/normalize).
         Keywords are per-node TF-IDF top-K salient tokens (pure statistics,
-        no LLM). Tags reuse the doc-level closet_tags. When a structure is
+        no LLM). Tags reuse the semantic subset of the doc-level closet_tags
+        (source="llm" only; jieba fallback words are excluded). When a structure is
         given, EVERY node gets a profile row (entities may be empty) and the
         'entities'/'keywords' keys are attached onto the live structure node
         dicts. Returns the list of profile dicts written.
