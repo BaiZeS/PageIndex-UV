@@ -1,10 +1,12 @@
 import logging
+import math
 import os
 import threading
 import uuid
 import json
 import asyncio
 import concurrent.futures
+from collections import Counter
 from pathlib import Path
 
 from .page_index import page_index
@@ -12,7 +14,7 @@ from .page_index_md import md_to_tree
 from .retrieve import get_document, get_document_structure, get_page_content
 from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, create_node_mapping, configure_llm
 from .closet_index import ClosetIndex
-from .super_tree import SuperTreeIndex
+from .super_tree import SuperTreeIndex, KeywordIndex
 from .corpus_tree import CorpusTreeBuilder
 from .page_index_liteparse import is_liteparse_format, liteparse_to_tree
 
@@ -53,6 +55,53 @@ def _iter_structure_nodes(structure):
         children = node.get("nodes")
         if children:
             yield from _iter_structure_nodes(children)
+
+
+def _compute_node_keywords(structure, topk):
+    """Per-node salient keywords via within-document TF-IDF (P1.4, no LLM).
+
+    Tokenizes each node's title + (text or summary) with the shared jieba
+    tokenizer (min length 2, stopwords dropped — same convention as
+    entity→node attribution). tf = normalized count within the node;
+    idf = smoothed log over the document's N nodes: log((N+1)/(df+1)) + 1,
+    so a term in every node gets the minimum weight 1.0 while a term unique
+    to one node is boosted. Returns {node_id: [<= topk tokens]} ordered by
+    score desc (ties broken by token for determinism). Nodes without usable
+    text map to []. Complexity is O(total tokens) per document.
+    """
+    node_tokens = []
+    for node in _iter_structure_nodes(structure):
+        node_id = node.get("node_id")
+        if not node_id:
+            continue
+        text = f"{node.get('title') or ''} " \
+               f"{node.get('text') or node.get('summary') or ''}"
+        # KeywordIndex._tokenize does not use `self`; reuse the canonical
+        # jieba + _STOPWORDS filtering without constructing an index.
+        node_tokens.append((node_id, KeywordIndex._tokenize(None, text)))
+
+    if not node_tokens or topk <= 0:
+        return {node_id: [] for node_id, _ in node_tokens}
+
+    n_docs = len(node_tokens)
+    df = Counter()
+    for _, tokens in node_tokens:
+        df.update(set(tokens))
+
+    keywords_by_node = {}
+    for node_id, tokens in node_tokens:
+        if not tokens:
+            keywords_by_node[node_id] = []
+            continue
+        total = len(tokens)
+        counts = Counter(tokens)
+        scored = sorted(
+            (-(cnt / total) * (math.log((n_docs + 1) / (df[tok] + 1)) + 1.0),
+             tok)
+            for tok, cnt in counts.items()
+        )
+        keywords_by_node[node_id] = [tok for _, tok in scored[:topk]]
+    return keywords_by_node
 
 
 class DocIdMapper:
@@ -113,6 +162,8 @@ class PageIndexClient:
         opt = ConfigLoader().load(overrides or None)
         self.model = opt.model
         self.retrieve_model = _normalize_retrieve_model(opt.retrieve_model or self.model)
+        # P1.4: per-node salient-keyword count for the node profile signature.
+        self._node_keyword_topk = int(getattr(opt, "node_keyword_topk", 5))
         if self.workspace:
             self.workspace.mkdir(parents=True, exist_ok=True)
         self.documents = {}
@@ -289,13 +340,15 @@ class PageIndexClient:
             )
 
     def _write_node_profiles(self, db_doc_id, structure=None):
-        """Build and persist node profiles for a document (P1.2).
+        """Build and persist node profiles for a document (P1.2 + P1.4).
 
         Profiles aggregate entity_mentions (node-level rows) joined with the
         entities table, so names are ALWAYS canonical (post merge/normalize).
-        Tags reuse the doc-level closet_tags. Optionally attaches the
-        'entities' key onto the live structure node dicts. Returns the list
-        of profile dicts written.
+        Keywords are per-node TF-IDF top-K salient tokens (pure statistics,
+        no LLM). Tags reuse the doc-level closet_tags. When a structure is
+        given, EVERY node gets a profile row (entities may be empty) and the
+        'entities'/'keywords' keys are attached onto the live structure node
+        dicts. Returns the list of profile dicts written.
         """
         profiles_by_node = {}
         for m in self.db.get_entity_mentions_by_doc(db_doc_id):
@@ -306,16 +359,39 @@ class PageIndexClient:
             entry = {"name": m["entity_name"], "type": m["entity_type"]}
             if entry not in entries:
                 entries.append(entry)
+        keywords_by_node = (
+            _compute_node_keywords(structure, self._node_keyword_topk)
+            if structure else {}
+        )
+        # Union: structure nodes in document order, then any mention-only
+        # node ids not present in the structure (defensive).
+        node_ids = []
+        seen = set()
+        if structure:
+            for node in _iter_structure_nodes(structure):
+                node_id = node.get("node_id")
+                if node_id and node_id not in seen:
+                    seen.add(node_id)
+                    node_ids.append(node_id)
+        for node_id in profiles_by_node:
+            if node_id not in seen:
+                seen.add(node_id)
+                node_ids.append(node_id)
         # Node-profile 标签是语义属性：只取 LLM 抽象标签（fallback 原词不进语义漏斗）
         tags = [t["tag_text"] for t in self.db.get_doc_tags(db_doc_id, source="llm")]
         profiles = [
-            {"node_id": node_id, "entities": entries, "keywords": [], "tags": tags}
-            for node_id, entries in profiles_by_node.items()
+            {"node_id": node_id,
+             "entities": profiles_by_node.get(node_id, []),
+             "keywords": keywords_by_node.get(node_id, []),
+             "tags": tags}
+            for node_id in node_ids
         ]
         self.db.upsert_node_profiles(db_doc_id, profiles)
         if structure:
             for node in _iter_structure_nodes(structure):
-                node["entities"] = profiles_by_node.get(node.get("node_id"), [])
+                node_id = node.get("node_id")
+                node["entities"] = profiles_by_node.get(node_id, [])
+                node["keywords"] = keywords_by_node.get(node_id, [])
         return profiles
 
     def index(self, file_path: str, mode: str = "auto", sync: bool = True) -> str:

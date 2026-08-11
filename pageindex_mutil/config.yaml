@@ -59,6 +59,7 @@ scale_massive_min_docs: 500 # 文档数 >= 该值 → 海量层级树导航
 node_prefilter_topk: 20     # 宽层语义预筛 top-k
 narrow_layer_max: 16        # 兄弟数 <= 该值视为窄层，跳过预筛直接给 LLM
 entity_boost_weight: 1.0    # 图谱实体命中加权强度
+node_keyword_topk: 5        # 节点签名显著词个数（TF-IDF top-K，[2.1] keywords）
 
 # LiteParse multi-format parsing
 liteparse_ocr_enabled: true

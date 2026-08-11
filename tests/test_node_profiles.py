@@ -1,10 +1,11 @@
-"""T5.2 / P1.2-entity: node-level entity attribution + node_profiles persistence.
+"""T5.2 / P1.2-entity + T5.4 / P1.4-keywords: node profile signatures.
 
 Scope:
 - Deterministic entity→TOC-node attribution (fills entity_mentions.node_id).
 - node_profiles table round-trip (upsert/get accessors).
 - Canonical entity names in profiles (post merge / post batch-normalization).
-- "entities" key attached to doc["structure"] node dicts (single-doc path).
+- "entities" / "keywords" keys attached to doc["structure"] node dicts.
+- Node-level salient keywords: TF-IDF top-K per node, no LLM (P1.4).
 
 All LLM calls mocked. No real LLM, no vectors, no new LLM call sites.
 """
@@ -496,5 +497,163 @@ class TestBatchProfiles:
             assert all(e["name"] != "张先生"
                        for p in (p1, p2) for prof in p.values()
                        for e in prof["entities"])
+        finally:
+            client.close()
+
+
+# ===========================================================================
+# (6) Node-level keywords: TF-IDF top-K, no LLM (P1.4)
+# ===========================================================================
+
+
+def _kw_helper(structure, topk=5):
+    """Access the pure keyword-computation helper via the real module ref."""
+    return client_mod._compute_node_keywords(structure, topk)
+
+
+class TestKeywordComputation:
+    """Pure TF-IDF computation (no DB, no client, no LLM)."""
+
+    def test_stopwords_and_short_tokens_excluded(self):
+        """Stopwords, len<2 tokens and single-char CJK noise never surface."""
+        st = [{"node_id": "n1", "title": "的",
+               "text": "一个 没有 the a is 我 有 值"}]
+        assert _kw_helper(st) == {"n1": []}
+
+    def test_empty_or_textless_node_empty_keywords(self):
+        st = [
+            {"node_id": "n1", "title": "", "text": ""},
+            {"node_id": "n2"},  # PDF-ish: no title/text/summary at all
+        ]
+        assert _kw_helper(st) == {"n1": [], "n2": []}
+
+    def test_summary_fallback_when_no_text(self):
+        """Same convention as entity attribution: text or fall back to summary."""
+        st = [{"node_id": "n1", "title": "T", "summary": "浴血值机制 浴血值机制"}]
+        assert "浴血" in _kw_helper(st)["n1"]
+
+    def test_topk_cap_respected(self):
+        st = [{"node_id": "n1", "title": "",
+               "text": "攻击力 防御力 魔法值 暴击率 闪避率 命中率 抗性 治疗量"}]
+        kw = _kw_helper(st, topk=3)
+        assert len(kw["n1"]) == 3
+        assert len(_kw_helper(st, topk=0)["n1"]) == 0
+
+    def test_idf_universal_term_below_rare_term(self):
+        """N=3 controlled fixture: 系统 in EVERY node (df=N, lowest idf),
+        引擎 only in node 1 (df=1). Equal tf → rare term must rank first."""
+        st = [
+            {"node_id": "n1", "text": "系统 引擎"},
+            {"node_id": "n2", "text": "系统 网络"},
+            {"node_id": "n3", "text": "系统 存储"},
+        ]
+        kw = _kw_helper(st, topk=1)
+        assert kw["n1"] == ["引擎"]
+
+    def test_empty_structure(self):
+        assert _kw_helper(None) == {}
+        assert _kw_helper([]) == {}
+
+    def test_deterministic(self):
+        st = _two_node_structure()
+        assert _kw_helper(st) == _kw_helper(st)
+
+
+class TestSingleDocKeywords:
+    """Single-doc index flow: keywords in node_profiles table + structure JSON."""
+
+    def test_salient_keyword_attributed_to_correct_node(self, client_factory, tmp_path):
+        """浴血值 recurs in node A only → keyword present in A's profile,
+        absent from B's. jieba splits 浴血值 → 浴血 + 值 (单字噪声被过滤)."""
+        client = client_factory()
+        try:
+            _prepare_client_for_index(client)
+            client.entity_extractor.extract_from_document = _mock_extract_single()
+
+            md_path = tmp_path / "doc.md"
+            md_path.write_text("# Test\n\ncontent\n", encoding="utf-8")
+            with _patch_md(_two_node_structure()):
+                client.index(str(md_path), mode="md")
+
+            db_doc = client.db.get_document_by_name("doc.md")
+            by_node = {p["node_id"]: p
+                       for p in client.db.get_node_profiles(db_doc["id"])}
+            assert "浴血" in by_node["node-a"]["keywords"]
+            assert "浴血" not in by_node.get("node-b", {}).get("keywords", [])
+            assert len(by_node["node-a"]["keywords"]) <= client._node_keyword_topk
+            # entity signature (P1.2) still intact alongside keywords
+            assert {"name": "浴血值", "type": "concept"} in by_node["node-a"]["entities"]
+        finally:
+            client.close()
+
+    def test_reindex_idempotent_and_deterministic(self, client_factory, tmp_path):
+        """Indexing the same doc twice: identical keyword sets, row count stable."""
+        client = client_factory()
+        try:
+            _prepare_client_for_index(client)
+            client.entity_extractor.extract_from_document = _mock_extract_single()
+
+            md_path = tmp_path / "doc.md"
+            md_path.write_text("# Test\n\ncontent\n", encoding="utf-8")
+            with _patch_md(_two_node_structure()):
+                client.index(str(md_path), mode="md")
+            db_doc = client.db.get_document_by_name("doc.md")
+            first = client.db.get_node_profiles(db_doc["id"])
+
+            with _patch_md(_two_node_structure()):
+                client.index(str(md_path), mode="md")
+            second = client.db.get_node_profiles(db_doc["id"])
+
+            assert len(second) == len(first)
+            assert first == second  # ORDER BY node_id → comparable as-is
+        finally:
+            client.close()
+
+    def test_topk_override_shrinks_keywords(self, client_factory, tmp_path):
+        """topk=1 → node A's single keyword is 浴血 (tf=3/10 dominates)."""
+        client = client_factory()
+        try:
+            _prepare_client_for_index(client)
+            client.entity_extractor.extract_from_document = _mock_extract_single()
+            client._node_keyword_topk = 1
+
+            md_path = tmp_path / "doc.md"
+            md_path.write_text("# Test\n\ncontent\n", encoding="utf-8")
+            with _patch_md(_two_node_structure()):
+                client.index(str(md_path), mode="md")
+
+            db_doc = client.db.get_document_by_name("doc.md")
+            profiles = client.db.get_node_profiles(db_doc["id"])
+            assert all(len(p["keywords"]) <= 1 for p in profiles)
+            by_node = {p["node_id"]: p for p in profiles}
+            assert by_node["node-a"]["keywords"] == ["浴血"]
+        finally:
+            client.close()
+
+    def test_default_topk_from_config(self, client_factory):
+        """config.yaml ships node_keyword_topk: 5 and the client picks it up."""
+        client = client_factory(workspace=False)
+        try:
+            assert client._node_keyword_topk == 5
+        finally:
+            client.close()
+
+    def test_structure_json_carries_keywords(self, client_factory, tmp_path):
+        """Sync path: doc['structure'] node dicts carry the 'keywords' key."""
+        client = client_factory()
+        try:
+            _prepare_client_for_index(client)
+            client.entity_extractor.extract_from_document = _mock_extract_single()
+
+            md_path = tmp_path / "doc.md"
+            md_path.write_text("# Test\n\ncontent\n", encoding="utf-8")
+            with _patch_md(_two_node_structure()):
+                doc_uuid = client.index(str(md_path), mode="md")
+
+            data = json.loads((client.workspace / f"{doc_uuid}.json").read_text())
+            nodes = {n["node_id"]: n for n in data["structure"]}
+            assert "keywords" in nodes["node-a"]
+            assert "浴血" in nodes["node-a"]["keywords"]
+            assert "浴血" not in nodes["node-b"]["keywords"]
         finally:
             client.close()
