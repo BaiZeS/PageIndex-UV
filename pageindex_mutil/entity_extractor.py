@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 # --- 实体消歧 blocking（轻量候选预裁剪）参数 ---
 # 批归一分块大小：单次 LLM prompt 最多喂入的名字数，防止大语料爆上下文
 NORMALIZE_BATCH_CHUNK_SIZE = 200
+# reduce 收敛守卫：代表元仍超块大小时分块 reduce 迭代，最多轮数
+# （零合并输入由恒等映射守卫提前终止；超轮数记 warning 并保留当前映射）
+NORMALIZE_REDUCE_MAX_ROUNDS = 3
 # 批归一类型分期：主动批归一先只覆盖 person/project/organization，concept 后置。
 # 注意：增量单实体消歧 disambiguate_entity 不受此限制，所有类型仍走 _resolve_entity。
 BATCH_NORMALIZE_ENTITY_TYPES = ["person", "project", "organization"]
@@ -25,6 +28,13 @@ BLOCKING_JACCARD_THRESHOLD = 0.5
 BLOCKING_MIN_PREFIX_LEN = 2
 # 送入 LLM 裁定的候选上限（按信号强度取 top-N）
 BLOCKING_MAX_CANDIDATES = 20
+# blocking 信号强度分：精确匹配 / 前缀匹配 / 命中强度下限
+# （下限：命中 blocking 即有最低强度，避免等长全替换对得 0 分）
+BLOCKING_EXACT_SCORE = 1.0
+BLOCKING_PREFIX_SCORE = 0.9
+BLOCKING_MIN_SCORE = 0.1
+# 编辑距离阈值的长度除数：threshold = max(2, 较长串长 // 除数)
+BLOCKING_EDIT_DIST_DIVISOR = 4
 
 
 def _edit_distance(a: str, b: str) -> int:
@@ -47,18 +57,23 @@ def _blocking_score(query_names: List[str], candidate_names: List[str]) -> Optio
     """blocking 轻量信号：新实体名/别名 vs 候选实体名/别名，任一命中返回强度分，否则 None。
 
     只做 LLM 前置裁剪（疑似同簇才送 LLM 裁定），不直接决定合并；
-    保守原则：信号宁缺毋滥，漏掉的疑似对由后续批归一兜底。
+    保守原则：信号宁缺毋滥。漏掉的疑似对中，person/project/organization
+    尚可由批归一兜底；concept 已退出批归一（类型分期），仅依赖增量单实体
+    消歧（disambiguate_entity），漏掉即不再合并。
 
-    信号（case-insensitive，strip 后比较）：
-      1. 精确匹配            → 1.0
-      2. 前缀匹配（≥2 字）   → 0.9
+    信号（case-insensitive，strip 后比较；非字符串条目直接忽略）：
+      1. 精确匹配            → BLOCKING_EXACT_SCORE
+      2. 前缀匹配（≥2 字）   → BLOCKING_PREFIX_SCORE
       3. 字符集 Jaccard ≥ BLOCKING_JACCARD_THRESHOLD → jaccard 值
-      4. 编辑距离 ≤ max(2, 较长串长 // 4) 且至少共享一个字符 → 强度分
+      4. 编辑距离 ≤ max(2, 较长串长 // BLOCKING_EDIT_DIST_DIVISOR) 且至少共享一个字符
+         → 强度分（下限 BLOCKING_MIN_SCORE）
          （附加共享字符约束：极短串的编辑距离 ≤2 可能只是整串替换，
            不构成相似信号；"小张" vs "张三" 距离=2 且共享 "张" → 疑似对）
     """
-    q = [n.strip().casefold() for n in query_names if n and n.strip()]
-    c = [n.strip().casefold() for n in candidate_names if n and n.strip()]
+    q = [n.strip().casefold() for n in query_names
+         if isinstance(n, str) and n.strip()]
+    c = [n.strip().casefold() for n in candidate_names
+         if isinstance(n, str) and n.strip()]
     if not q or not c:
         return None
 
@@ -67,11 +82,11 @@ def _blocking_score(query_names: List[str], candidate_names: List[str]) -> Optio
         for b in c:
             score: Optional[float] = None
             if a == b:
-                score = 1.0
+                score = BLOCKING_EXACT_SCORE
             else:
                 prefix_len = len(a) if b.startswith(a) else (len(b) if a.startswith(b) else 0)
                 if prefix_len >= BLOCKING_MIN_PREFIX_LEN:
-                    score = 0.9
+                    score = BLOCKING_PREFIX_SCORE
             if score is None:
                 set_a, set_b = set(a), set(b)
                 inter = len(set_a & set_b)
@@ -79,12 +94,14 @@ def _blocking_score(query_names: List[str], candidate_names: List[str]) -> Optio
                     jaccard = inter / len(set_a | set_b)
                     if jaccard >= BLOCKING_JACCARD_THRESHOLD:
                         score = jaccard
-                    threshold = max(2, max(len(a), len(b)) // 4)
-                    dist = _edit_distance(a, b)
-                    if dist <= threshold:
-                        # 强度下限 0.1：命中 blocking 即有最低强度，避免等长全替换对得 0 分
-                        edit_score = max(0.1, 1.0 - dist / max(len(a), len(b), 1))
-                        score = max(score or 0.0, edit_score)
+                    threshold = max(2, max(len(a), len(b)) // BLOCKING_EDIT_DIST_DIVISOR)
+                    # 长度差剪枝：编辑距离 >= 长度差，超阈值必不过，免跑 DP
+                    if abs(len(a) - len(b)) <= threshold:
+                        dist = _edit_distance(a, b)
+                        if dist <= threshold:
+                            edit_score = max(BLOCKING_MIN_SCORE,
+                                             BLOCKING_EXACT_SCORE - dist / max(len(a), len(b), 1))
+                            score = max(score or 0.0, edit_score)
             if score is not None and (best is None or score > best):
                 best = score
     return best
@@ -188,7 +205,12 @@ class EntityExtractor:
                     aliases = item.get("aliases", [])
                     if isinstance(aliases, str):
                         aliases = [aliases]
-                    
+                    if not isinstance(aliases, list):
+                        aliases = []
+                    # 只保留非空字符串别名（不做 str() 强转，脏数据直接丢弃）
+                    aliases = [a.strip() for a in aliases
+                               if isinstance(a, str) and a.strip()]
+
                     confidence = float(item.get("confidence", 0.5))
                     
                     entities.append(Entity(
@@ -490,8 +512,12 @@ class EntityExtractor:
 
         批归一分块（bounded chunk）+ map-reduce：
         - map：按 NORMALIZE_BATCH_CHUNK_SIZE 分块，块内 LLM 归一；
-        - reduce：多块时对各块归一后的代表元（canonical 名）再做一轮合并，
-          杜绝大语料单 prompt 爆上下文。
+        - reduce：有界迭代分块归并（收敛守卫），单次 prompt 永不超块大小：
+          代表元 ≤ 块大小 → 单次调用收口；
+          代表元 > 块大小 → 按 ≤ 块大小分块归并，每轮后重算代表元（去重 canonical），
+          满足任一即停：(a) 代表元 ≤ 块大小（经最终单次收口）；
+          (b) 本轮映射恒等（不动点，零合并输入必在第 1 轮由此终止，不会死循环）；
+          (c) 达 NORMALIZE_REDUCE_MAX_ROUNDS 轮（记 warning，保留当前映射）。
         Mirrors _normalize_tags in corpus_tree.py. Conservative on failure.
         """
         mapping = {n: n for n in names}
@@ -504,12 +530,32 @@ class EntityExtractor:
         # map: 各块独立归一
         for chunk in chunks:
             mapping.update(self._normalize_chunk_llm(chunk))
-        # reduce: 块间代表元合一轮（保守：合并结果以 LLM 返回为准）
-        representatives = list(dict.fromkeys(mapping.values()))
-        if len(representatives) > 1:
-            consolidation = self._normalize_chunk_llm(representatives)
-            mapping = {raw: consolidation.get(canonical, canonical)
+        # reduce: 有界迭代分块归并
+        for _round in range(NORMALIZE_REDUCE_MAX_ROUNDS):
+            representatives = list(dict.fromkeys(mapping.values()))
+            if len(representatives) <= 1:
+                break
+            if len(representatives) <= NORMALIZE_BATCH_CHUNK_SIZE:
+                # (a) 代表元可单 prompt 容纳 → 最终单次收口
+                consolidation = self._normalize_chunk_llm(representatives)
+                mapping = {raw: consolidation.get(canonical, canonical)
+                           for raw, canonical in mapping.items()}
+                break
+            # 代表元仍超块大小 → 分块归并（每块 ≤ NORMALIZE_BATCH_CHUNK_SIZE）
+            round_mapping: dict[str, str] = {}
+            for i in range(0, len(representatives), NORMALIZE_BATCH_CHUNK_SIZE):
+                round_mapping.update(self._normalize_chunk_llm(
+                    representatives[i:i + NORMALIZE_BATCH_CHUNK_SIZE]))
+            if all(round_mapping.get(rep, rep) == rep for rep in representatives):
+                break  # (b) 恒等映射 → 不动点，无变化即停
+            mapping = {raw: round_mapping.get(canonical, canonical)
                        for raw, canonical in mapping.items()}
+        else:
+            # (c) 达到最大轮数仍在变化且代表元超块大小
+            logger.warning(
+                "Entity batch normalization reduce did not converge within %d "
+                "rounds (%d representatives remain), keeping current mapping",
+                NORMALIZE_REDUCE_MAX_ROUNDS, len(set(mapping.values())))
         return mapping
 
     def _normalize_chunk_llm(self, names: list[str]) -> dict[str, str]:
