@@ -285,7 +285,9 @@ class AgenticRouter:
 
         pages = pages_from_nodes(selected)
         if not pages:
-            return None
+            if doc.get("type") == "pdf":
+                return None
+            # MD 文档节点无页码索引；上下文由 build_context_for_doc 走节点 text 组装
 
         # 相关度 = 召回覆盖度（selected / 全部候选节点），确定性 (0,1]，
         # 与单文档 _search_single 的 matched_docs score 语义统一。

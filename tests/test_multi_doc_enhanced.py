@@ -82,14 +82,15 @@ def _select_json(selected, pool_concern=False, concern_reason=""):
     })
 
 
-def _router_with_doc(structure, doc_id="doc1", model="m-model", retrieve_model="r-model"):
+def _router_with_doc(structure, doc_id="doc1", model="m-model", retrieve_model="r-model",
+                     doc_type="md"):
     """Build a real AgenticRouter over a MagicMock client holding one in-memory doc."""
     AgenticRouter = _router_mod().AgenticRouter
     client = MagicMock()
     client.documents = {
         doc_id: {
-            "doc_name": "test.md",
-            "type": "md",
+            "doc_name": f"test.{doc_type}",
+            "type": doc_type,
             "structure": structure,
             "pages": [],
         }
@@ -566,3 +567,96 @@ class TestMultiHopMatchedScores:
             result = asyncio.run(reasoner.execute("q", router, db))
 
         assert result["matched_docs"] == [{"doc_id": "uuid-10", "score": 0.5}]
+
+
+# ---------------------------------------------------------------------------
+# 5. T20：MD 文档节点无页码索引——pages 门槛不得拦截召回，
+#    多文档 MD 语料上下文组装走节点 text（build_context_for_doc 的 md 分支）
+# ---------------------------------------------------------------------------
+
+
+def _md_node(nid, title="标题", summary="摘要", text="正文", **extra):
+    """真实 MD 节点形态：page_index_md.py 不写 start_index/end_index，
+    因此 pages_from_nodes 必为空——T20 回归守卫的靶子形状。"""
+    node = {"node_id": nid, "title": title, "summary": summary, "text": text}
+    node.update(extra)
+    return node
+
+
+class TestMdNodeRecallNoPagesGate:
+    def test_md_recall_returns_selected_with_empty_pages(self):
+        """MD 文档：节点无页码 → pages 为空但召回成功（dict 而非 None）。"""
+        router, _ = _router_with_doc([
+            _md_node("n1", title="浴血值获取",
+                     text="浴血值可以通过日常任务获得。", keywords=["浴血值"]),
+            _md_node("n2", title="天气", text="今天天气不错。"),
+        ])
+        with _patch_enhance_llm(return_value=_select_json(["n1"])):
+            result = asyncio.run(router._recall_nodes_for_doc("浴血值怎么获得", "doc1"))
+        assert result is not None
+        assert [n["node_id"] for n in result["selected"]] == ["n1"]
+        assert result["pages"] == []  # MD 节点无页码索引
+        assert result["relevance_score"] == 0.5  # 1/2 候选覆盖度
+
+    def test_pdf_without_pages_still_gated(self):
+        """PDF 门槛保持原样：PDF 节点也无页码（异常态）→ 仍返回 None。"""
+        router, _ = _router_with_doc([_md_node("n1")], doc_type="pdf")
+        with _patch_enhance_llm(return_value=_select_json(["n1"])):
+            result = asyncio.run(router._recall_nodes_for_doc("q", "doc1"))
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_act_tree_search_builds_context_from_md_node_text(self):
+        """_act_tree_search：MD 召回结果经节点 text 组装非空上下文，
+        覆盖度进 doc_scores_out；空页列表被 doc_pages_map/pages_with_text 容忍。"""
+        router, _ = _router_with_doc([
+            _md_node("n1", title="浴血值获取",
+                     text="浴血值可以通过日常任务获得。", keywords=["浴血值"]),
+            _md_node("n2", title="天气", text="今天天气不错。"),
+        ])
+        scores = {}
+        with _patch_enhance_llm(return_value=_select_json(["n1"])):
+            ctx, nodes, src_docs, cov, dpm, pwt = await router._act_tree_search(
+                "浴血值怎么获得", ["doc1"], doc_scores_out=scores,
+            )
+        assert ctx  # 非空上下文
+        assert "浴血值可以通过日常任务获得。" in ctx  # 节点 text 进上下文
+        assert "浴血值获取" in ctx  # 节点标题进上下文
+        assert [n["node_id"] for n in nodes] == ["n1"]
+        assert src_docs == 1
+        assert scores == {"doc1": 0.5}
+        assert dpm.get("doc1") == []  # 空页列表容忍，不抛错
+
+    def test_super_tree_end_to_end_md_corpus_matched_and_context(self):
+        """端到端：MD 语料经 _search_super_tree → matched_docs 非空（覆盖度
+        分数），且传给答案 LLM 的上下文含节点 text（不再 No relevant content）。"""
+        router, _ = _router_with_doc([
+            _md_node("n1", title="浴血值获取",
+                     text="浴血值可以通过日常任务获得。", keywords=["浴血值"]),
+            _md_node("n2", title="天气", text="今天天气不错。"),
+        ])
+
+        mock_st = MagicMock()
+        mock_st.prefilter.return_value = {1: 1.0}
+        mock_st.select_documents = AsyncMock(return_value=["doc1"])
+        router.super_tree_index = mock_st
+        router.planner.plan = AsyncMock(return_value=_plan_result())
+        router.verifier.verify = MagicMock(return_value=MagicMock(action="answer"))
+
+        gen_calls = []
+
+        def fake_generate(query, ctx):
+            gen_calls.append((query, ctx))
+            return "最终答案"
+
+        with _patch_enhance_llm(return_value=_select_json(["n1"])), \
+                patch.object(_reasoning_mod(), "generate_answer", fake_generate):
+            result = asyncio.run(router._search_super_tree("浴血值怎么获得", top_k=3))
+
+        # 召回未被 pages 门槛拦截 → 覆盖度证据进 matched（0.5，非硬编码）
+        assert result["matched_docs"] == [{"doc_id": "doc1", "score": 0.5}]
+        assert result["answer"] == "最终答案"
+        assert result["confidence"] == "high"
+        # 传给答案 LLM 的上下文确实含节点 text（证据接地闭环）
+        assert len(gen_calls) == 1
+        assert "浴血值可以通过日常任务获得。" in gen_calls[0][1]
