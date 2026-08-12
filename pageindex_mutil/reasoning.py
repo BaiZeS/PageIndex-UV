@@ -165,6 +165,7 @@ def generate_answer(question, context):
     prompt = f"""
         Answer the user's question based on the following context.
         If the answer is not in the context, say "I cannot find the answer in the provided context."
+        如证据分布在多个段落，请综合多处证据作答。
 
         Context:
         {context}

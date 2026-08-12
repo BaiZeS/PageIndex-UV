@@ -22,7 +22,7 @@ import inspect
 import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -622,6 +622,139 @@ class TestAsyncAPIAndConfig:
                 enh.enhance_and_select("q", [_cand("n0")], {})
             )
         assert set(result.keys()) == {"selected_ids", "pool_concern", "concern_reason", "deferred"}
+
+
+# ===========================================================================
+# T6.2: max_candidates 上限覆盖（pool_concern 放宽重选用，[3.2.1]）
+# ===========================================================================
+
+
+class TestMaxCandidatesOverride:
+    """max_candidates=None → 配置上限；显式传值 → 本次调用覆盖（不改实例配置）。"""
+
+    @staticmethod
+    def _fixture(cap):
+        candidates = [_cand("a"), _cand("b"), _cand("c"), _cand("d")]
+        profiles = {
+            "a": {"entities": [{"name": "张三", "type": "person"}], "keywords": [], "tags": []},
+            "b": {"entities": [], "keywords": [], "tags": ["游戏机制"]},
+            "c": {"entities": [], "keywords": ["浴血"], "tags": []},
+            "d": {"entities": [], "keywords": [], "tags": []},
+        }
+        kwargs = dict(
+            query="浴血 游戏机制",
+            candidates=candidates,
+            profiles=profiles,
+            query_entities=["张三"],
+        )
+        return _enhancer(cap=cap), kwargs
+
+    def test_none_uses_configured_cap(self):
+        enh, kwargs = self._fixture(cap=2)
+        result, _ = _select_call(
+            enh, return_value=_resp(["a", "b", "c"]), **kwargs
+        )
+        assert result["deferred"] == ["c"]
+        assert result["selected_ids"] == ["a", "b"]
+
+    def test_override_raises_cap_for_this_call(self):
+        enh, kwargs = self._fixture(cap=2)
+        result, mock_llm = _select_call(
+            enh, return_value=_resp(["a", "b", "c"]),
+            max_candidates=3, **kwargs
+        )
+        # 上限放宽到 3：c 不再进延迟池，LLM 可选全部 union 成员
+        assert result["deferred"] == []
+        assert result["selected_ids"] == ["a", "b", "c"]
+        prompt = _prompt_of(mock_llm)
+        assert "候选节点 c" in prompt
+
+    def test_override_does_not_mutate_instance_config(self):
+        enh, kwargs = self._fixture(cap=2)
+        _select_call(enh, return_value=_resp([]), max_candidates=3, **kwargs)
+        assert enh.union_max_candidates == 2  # 实例配置不变
+
+
+# ===========================================================================
+# T6.2: resolve_query_entities（共享助手；router T6.4 复用）
+# ===========================================================================
+
+
+class TestResolveQueryEntities:
+    def test_names_and_aliases_flattened_in_order(self):
+        from pageindex_mutil.agentic.enhance import resolve_query_entities
+        db = MagicMock()
+        db.search_entities.return_value = [
+            {"name": "张三", "aliases": '["张生", "张三丰"]'},
+            {"name": "李四", "aliases": "[]"},
+        ]
+        assert resolve_query_entities(db, "张三和李四") == ["张三", "张生", "张三丰", "李四"]
+        db.search_entities.assert_called_once_with("张三和李四", limit=5)
+
+    def test_custom_limit_forwarded(self):
+        from pageindex_mutil.agentic.enhance import resolve_query_entities
+        db = MagicMock()
+        db.search_entities.return_value = []
+        resolve_query_entities(db, "q", limit=3)
+        db.search_entities.assert_called_once_with("q", limit=3)
+
+    def test_casefold_dedup_keeps_first_spelling(self):
+        from pageindex_mutil.agentic.enhance import resolve_query_entities
+        db = MagicMock()
+        db.search_entities.return_value = [
+            {"name": "Hero", "aliases": '["hero", "HERO 2", "Hero"]'},
+        ]
+        assert resolve_query_entities(db, "hero") == ["Hero", "HERO 2"]
+
+    def test_malformed_aliases_json_skipped_not_raised(self):
+        from pageindex_mutil.agentic.enhance import resolve_query_entities
+        db = MagicMock()
+        db.search_entities.return_value = [
+            {"name": "A", "aliases": "这不是JSON"},
+            {"name": "B", "aliases": None},
+            {"name": "C"},  # 无 aliases 键
+            {"name": "D", "aliases": '["d1"]'},
+        ]
+        assert resolve_query_entities(db, "q") == ["A", "B", "C", "D", "d1"]
+
+    def test_aliases_as_list_object_also_accepted(self):
+        from pageindex_mutil.agentic.enhance import resolve_query_entities
+        db = MagicMock()
+        db.search_entities.return_value = [{"name": "A", "aliases": ["a1"]}]
+        assert resolve_query_entities(db, "q") == ["A", "a1"]
+
+    def test_none_db_or_blank_query_returns_empty(self):
+        from pageindex_mutil.agentic.enhance import resolve_query_entities
+        db = MagicMock()
+        assert resolve_query_entities(None, "q") == []
+        assert resolve_query_entities(db, "") == []
+        assert resolve_query_entities(db, "   ") == []
+        db.search_entities.assert_not_called()
+
+    def test_search_entities_exception_degrades_to_empty(self):
+        from pageindex_mutil.agentic.enhance import resolve_query_entities
+        db = MagicMock()
+        db.search_entities.side_effect = RuntimeError("boom")
+        assert resolve_query_entities(db, "q") == []
+
+    def test_real_db_roundtrip_name_and_alias(self):
+        """真实 PageIndexDB：实体名与别名都能被解析出来。"""
+        import os
+        import tempfile
+        from db import PageIndexDB
+        from pageindex_mutil.agentic.enhance import resolve_query_entities
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            db = PageIndexDB(db_path)
+            db.insert_entity("concept", "浴血值", ["浴血点数"])
+            names = resolve_query_entities(db, "浴血值怎么获得")
+            assert "浴血值" in names
+            assert "浴血点数" in names
+            db.close()
+        finally:
+            os.unlink(db_path)
 
     def test_config_defaults_wired(self):
         """config.yaml 新增键生效（union_max_candidates/evidence_max_chars）。"""

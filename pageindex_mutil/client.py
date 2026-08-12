@@ -47,6 +47,10 @@ META_INDEX = "_meta.json"
 # attribution can fan out on repetitive docs; keep the table bounded.
 _MAX_NODE_MENTIONS_PER_ENTITY = 20
 
+# [3.2.1] pool_concern 重选：union 上限放宽倍数。候选/签名不变，被截候选经
+# union 自然回池，该参数只抬高上限让延迟池节点重新可被 LLM 精挑。
+POOL_CONCERN_RETRY_CAP_MULTIPLIER = 2
+
 
 def _iter_structure_nodes(structure):
     """Yield every node dict in a nested TOC structure, depth-first."""
@@ -1093,8 +1097,55 @@ class PageIndexClient:
         scored.sort(key=lambda x: x[1], reverse=True)
         return [nid for nid, _ in scored]
 
+    def _resolve_node_profiles(self, doc_id: str, mapping: dict) -> dict:
+        """Resolve per-node evidence signatures for enhance_and_select ([3.4]).
+
+        Resolution order: DB node_profiles first (authoritative when the doc
+        was indexed with sync=True); fall back to entities/keywords/tags keys
+        carried on the structure node dicts (async path / workspace JSON);
+        else an empty dict (enhance handles missing profiles gracefully, [7.7]).
+        """
+        if self.db is not None:
+            db_doc_id = self._id_mapper.to_db(doc_id)
+            if db_doc_id is not None:
+                rows = None
+                try:
+                    rows = self.db.get_node_profiles(db_doc_id)
+                except Exception as e:
+                    logging.warning(
+                        "get_node_profiles failed for doc %s: %s", doc_id, e
+                    )
+                if rows:
+                    return {
+                        p["node_id"]: {
+                            "entities": p.get("entities") or [],
+                            "keywords": p.get("keywords") or [],
+                            "tags": p.get("tags") or [],
+                        }
+                        for p in rows if p.get("node_id")
+                    }
+        profiles = {}
+        for nid, node in mapping.items():
+            prof = {
+                key: node.get(key)
+                for key in ("entities", "keywords", "tags")
+                if node.get(key)
+            }
+            if prof:
+                profiles[nid] = prof
+        return profiles
+
     async def _search_single(self, query: str, doc_id: str) -> dict:
-        """Direct tree search for a single document (zero router overhead)."""
+        """Direct tree search for a single document (zero router overhead).
+
+        [3.4][3.2.1]: the LLM remains the node-selection decision maker via
+        enhance_and_select, with keyword/entity signatures injected as
+        grounding evidence. No len(summary) re-rank and no hardcoded scores:
+        node order preserves the LLM's selection order, matched_docs score is
+        the "selection coverage" (selected nodes / all candidate nodes), and
+        confidence is "high" unless a pool_concern signal survived the
+        optional retry (then "medium").
+        """
         if self.workspace:
             self._ensure_doc_loaded(doc_id)
 
@@ -1125,8 +1176,7 @@ class PageIndexClient:
         # Import shared reasoning helpers
         try:
             from .reasoning import (
-                get_relevant_nodes, pages_from_nodes, generate_answer,
-                build_context_for_doc,
+                pages_from_nodes, generate_answer, build_context_for_doc,
             )
         except ImportError:
             return {
@@ -1139,86 +1189,97 @@ class PageIndexClient:
                 "pages": [],
             }
 
-        tree_json = json.dumps(structure, ensure_ascii=False)
-        node_ids = get_relevant_nodes(query, tree_json)
+        try:
+            from .agentic.enhance import (
+                UnifiedNodeEnhancement, resolve_query_entities,
+            )
+        except ImportError:
+            return {
+                "query": query,
+                "mode": "single",
+                "answer": "Search backend not available.",
+                "confidence": "unknown",
+                "matched_docs": [],
+                "selected_nodes": [],
+                "pages": [],
+            }
 
-        # Keyword fallback: if LLM returned nothing or selected nodes
-        # don't contain query keywords, try keyword-based selection.
+        # unit = 节点：扁平结构全量节点作为候选（[3.2.1]）
         mapping = create_node_mapping(structure)
-        llm_nodes_contain_keywords = False
-        if node_ids:
-            try:
-                import jieba
-                from .closet_index import _STOPWORDS
-                tokens = {
-                    t.strip().lower() for t in jieba.lcut(query)
-                    if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
-                }
-            except Exception:
-                tokens = set()
-            if tokens:
-                for nid in node_ids:
-                    node = mapping.get(nid)
-                    if node:
-                        text = (node.get("text") or "").lower()
-                        if any(t in text for t in tokens):
-                            llm_nodes_contain_keywords = True
-                            break
+        candidates = [
+            {
+                "node_id": nid,
+                "title": node.get("title") or "",
+                "summary": node.get("summary") or "",
+            }
+            for nid, node in mapping.items()
+        ]
 
-        if not node_ids or not llm_nodes_contain_keywords:
-            keyword_ids = self._keyword_select_nodes(query, structure)
-            # Merge: keep LLM selections + keyword matches (deduplicated)
-            seen = set(node_ids or [])
-            for kid in keyword_ids:
-                if kid not in seen:
-                    node_ids.append(kid)
-                    seen.add(kid)
+        profiles = self._resolve_node_profiles(doc_id, mapping)
+        query_entities = (
+            resolve_query_entities(self.db, query, limit=5) if self.db else []
+        )
 
-        if not node_ids:
+        # NFR4: retrieval LLM call site uses retrieve_model with model fallback
+        enhancer = UnifiedNodeEnhancement(self.model, retrieve_model=self.retrieve_model)
+        result = await enhancer.enhance_and_select(
+            query, candidates, profiles, query_entities=query_entities,
+        )
+
+        # [3.2.1] pool_concern 且存在被截候选 → 放宽 union 上限重选一次。
+        # 候选/签名不变，被截候选经 union 自然回池；上限放宽只抬高 cap。
+        if result["pool_concern"] and result["deferred"]:
+            result = await enhancer.enhance_and_select(
+                query, candidates, profiles, query_entities=query_entities,
+                max_candidates=max(1, int(enhancer.union_max_candidates))
+                * POOL_CONCERN_RETRY_CAP_MULTIPLIER,
+            )
+
+        selected_ids = result["selected_ids"]
+        if not selected_ids:
             return {
                 "query": query,
                 "mode": "single",
                 "answer": "No relevant sections found.",
                 "confidence": "low",
-                "matched_docs": [{"doc_id": doc_id, "score": 1.0}],
+                "matched_docs": [],
                 "selected_nodes": [],
                 "pages": [],
             }
 
-        selected = [mapping.get(nid) for nid in node_ids if nid in mapping]
-        selected = [n for n in selected if n]
+        # Preserve the LLM's selection order — no len(summary) re-rank ([3.4])
+        selected = [mapping[nid] for nid in selected_ids if nid in mapping]
         if not selected:
             return {
                 "query": query,
                 "mode": "single",
                 "answer": "No valid sections found.",
                 "confidence": "low",
-                "matched_docs": [{"doc_id": doc_id, "score": 1.0}],
+                "matched_docs": [],
                 "selected_nodes": [],
                 "pages": [],
             }
 
-        # Rank nodes by relevance: prefer nodes with longer summaries
-        # (more detailed summaries indicate deeper coverage of the topic)
-        selected.sort(
-            key=lambda n: len(n.get("summary", "")),
-            reverse=True
-        )
-
         pages = pages_from_nodes(selected)
 
-        # Assemble context using shared helper
+        # Context assembly covers ALL selected nodes ([3.4.1]① multi-span)
         context = build_context_for_doc(doc, selected, pages)
         answer = generate_answer(query, context)
 
         page_map = {p["page"]: p["content"] for p in doc.get("pages", [])}
 
+        # matched_docs score = selection coverage (selected / all candidates),
+        # evidence-derived in (0,1]; replaces the legacy hardcoded 1.0.
+        score = min(round(len(selected) / max(len(candidates), 1), 4), 1.0)
+
         return {
             "query": query,
             "mode": "single",
             "answer": answer,
-            "confidence": "high",
-            "matched_docs": [{"doc_id": doc_id, "score": 1.0}],
+            # confidence: high = 无 pool_concern（候选池完整，精挑可信）；
+            # medium = pool_concern 留存（候选或被截，答案仅供参考）
+            "confidence": "medium" if result["pool_concern"] else "high",
+            "matched_docs": [{"doc_id": doc_id, "score": score}],
             "selected_nodes": [
                 {
                     "node_id": n.get("node_id"),

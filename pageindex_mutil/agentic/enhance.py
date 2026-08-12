@@ -11,6 +11,7 @@ union/证据组装为纯 Python（查表 + 集合并，全程无 LLM）([7.3])�
 LLM 失效时不做启发式裁剪——放行证据（union 候选即选中），保证"LLM 唯一裁剪"语义 ([7.7])。
 """
 import asyncio
+import json
 import logging
 
 from ..utils import llm_completion, extract_json
@@ -277,6 +278,7 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         query_entities=None,
         node_budget=None,
         token_budget=None,
+        max_candidates=None,
     ) -> dict:
         """四通道高召回 union → 证据组装 → LLM 精挑。
 
@@ -284,6 +286,8 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         profiles:   {node_id: {"entities": [{"name","type"}], "keywords": [...], "tags": [...]}}
                     （缺失节点 → 空证据，仍可被选中，[7.7] 签名缺失退化）
         query_entities: 实体名字符串列表（由调用方解析，含别名）
+        max_candidates: 本次调用的 union 上限覆盖（None → 实例配置的
+                    union_max_candidates）；pool_concern 放宽重选时用 ([3.2.1])
         返回: {"selected_ids": [...], "pool_concern": bool,
                "concern_reason": str, "deferred": [node_ids]}
         """
@@ -339,7 +343,10 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
 
         # ①b union 防爆炸（[1.2]）
         deferred = []
-        cap = max(1, int(self.union_max_candidates))
+        cap_source = (
+            self.union_max_candidates if max_candidates is None else max_candidates
+        )
+        cap = max(1, int(cap_source))
         if len(union) > cap:
             if all(node_signals[nid]["score"] == 0 for nid in union):
                 # 零值泛滥防护：禁止按 score 收缩——输入顺序 + 绝对上限兜底
@@ -392,3 +399,49 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
             "concern_reason": str(data.get("concern_reason") or ""),
             "deferred": deferred,
         }
+
+
+def resolve_query_entities(db, query, limit=5) -> list:
+    """查询实体解析（共享助手）：search_entities 命中实体的规范名 + 别名展开。
+
+    供检索路径（T6.2 单文档 / T6.4 router）复用：把 query 命中的实体名与别名
+    展平为字符串列表，交给 enhance_and_select 的实体通道。确定性：按搜索结果
+    顺序去重（casefold 判重，保留首见写法）。防御性：db 调用异常、别名 JSON
+    解析失败均不抛出——坏条目跳过，其余照常返回。
+    """
+    if db is None or not query or not str(query).strip():
+        return []
+    try:
+        rows = db.search_entities(query, limit=limit)
+    except Exception as e:
+        logging.warning("resolve_query_entities: search_entities failed: %s", e)
+        return []
+
+    names = []
+    seen = set()
+
+    def _add(value):
+        if not isinstance(value, str):
+            return
+        v = value.strip()
+        if not v:
+            return
+        key = v.casefold()
+        if key not in seen:
+            seen.add(key)
+            names.append(v)
+
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        _add(row.get("name"))
+        aliases = row.get("aliases")
+        if isinstance(aliases, str):
+            try:
+                aliases = json.loads(aliases)
+            except (TypeError, ValueError):
+                aliases = []
+        if isinstance(aliases, list):
+            for alias in aliases:
+                _add(alias)
+    return names
