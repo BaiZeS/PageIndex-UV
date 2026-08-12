@@ -60,6 +60,9 @@ node_prefilter_topk: 20     # 宽层语义预筛 top-k
 narrow_layer_max: 16        # 兄弟数 <= 该值视为窄层，跳过预筛直接给 LLM
 entity_boost_weight: 1.0    # 图谱实体命中加权强度
 node_keyword_topk: 5        # 节点签名显著词个数（TF-IDF top-K，[2.1] keywords）
+# P2 统一检索增强（UnifiedNodeEnhancement，[3.2]/[1.2]/[7.4]）
+union_max_candidates: 80    # union 候选安全上限（宽松可配 60–100，宁多勿漏）；超限多信号加权收缩，被截进延迟池
+evidence_max_chars: 6000    # 跨节点证据总字符预算；超限按证据强度退化最弱候选为"标题+摘要"一行
 
 # LiteParse multi-format parsing
 liteparse_ocr_enabled: true
