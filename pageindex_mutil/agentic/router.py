@@ -208,9 +208,11 @@ class AgenticRouter:
             self.client._ensure_doc_loaded(doc_id)
         doc = self.client.documents.get(doc_id)
         if not doc:
+            logging.info("[Recall] doc=%s not loaded; skip", doc_id)
             return None
         structure = doc.get("structure", [])
         if not structure:
+            logging.info("[Recall] doc=%s has empty structure; skip", doc_id)
             return None
 
         from ..utils import create_node_mapping
@@ -275,12 +277,15 @@ class AgenticRouter:
 
         selected_ids = result["selected_ids"]
         if not selected_ids:
+            logging.info("[Recall] doc=%s empty selection (candidates=%d, concern_reason=%r)",
+                         doc_id, len(candidates), result.get("concern_reason", ""))
             return None
 
         # 保持 LLM 精挑顺序（无重排）
         selected = [mapping[nid] for nid in selected_ids if nid in mapping]
         selected = [n for n in selected if n]
         if not selected:
+            logging.info("[Recall] doc=%s selected ids missed mapping: %s", doc_id, selected_ids[:5])
             return None
 
         pages = pages_from_nodes(selected)
@@ -334,11 +339,16 @@ class AgenticRouter:
         ]
         recall_results = await asyncio.gather(*recall_tasks, return_exceptions=True)
 
-        # Filter out failures and sort by relevance score (descending)
+        # Filter out failures and sort by relevance score (descending).
+        # gather(return_exceptions=True) 会静默吞掉召回异常——显式记录，
+        # 否则整批召回失败时只剩空上下文，无从定位。
         doc_results = []
-        for r in recall_results:
+        for doc_id, r in zip(unique_docs, recall_results):
             if isinstance(r, dict):
                 doc_results.append(r)
+            elif isinstance(r, Exception):
+                logging.warning("[Act] node recall raised for doc=%s: %s: %s",
+                                doc_id, type(r).__name__, r)
 
         doc_results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
 
