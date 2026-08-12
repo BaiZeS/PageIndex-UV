@@ -14,6 +14,10 @@
    非法 selected_ids（未知 id/重复）被过滤；空选择合法（宁缺毋滥）；
 9. LLM 失效降级：不做启发式裁剪，放行 union 全部候选（[7.7]）；
 10. NFR4 retrieve_model 接线；async API 可经 asyncio.run 使用。
+11. 审查修复：全局注记按 distinct 节点计数（大小写变体/重复条目不得重复计入，
+    注记文本节点 id 无重复）；cap 钳位 ≥1 且非法配置逐级回退（永不抛出）；
+    平分确定性裁决；顶层 list JSON 降级；query_entities=[] ≡ None；
+    非正预算视为未给；不可哈希 node_id 不抛出。
 
 全部 LLM 调用均 mock —— 无真实 LLM。
 """
@@ -467,6 +471,18 @@ class TestPromptContent:
         prompt = self._capture()
         assert "预算约束" not in prompt
 
+    def test_non_positive_or_invalid_budgets_treated_as_absent(self):
+        """#7：node_budget/token_budget ≤0（或非法值）→ 视为未给，不渲染预算块。"""
+        for kwargs in (
+            dict(node_budget=0),
+            dict(token_budget=-1),
+            dict(node_budget=0, token_budget=0),
+            dict(node_budget="not-a-number"),
+        ):
+            prompt = self._capture(**kwargs)
+            assert "预算约束" not in prompt
+            assert "最多选 0 个节点" not in prompt
+
 
 # ===========================================================================
 # 6. JSON passthrough 与校验过滤
@@ -587,6 +603,23 @@ class TestDegradation:
             profiles=profiles,
         )
         assert result["selected_ids"] == ["n0"]
+        assert result["concern_reason"] == "llm_unavailable"
+
+    def test_llm_toplevel_list_json_degrades(self):
+        """顶层 JSON 数组（非约定对象）→ 按 LLM 失效降级，放行 union。"""
+        candidates = [_cand("n_hit"), _cand("n_miss")]
+        profiles = {"n_hit": {"entities": [], "keywords": ["浴血"], "tags": []},
+                    "n_miss": {"entities": [], "keywords": ["天气"], "tags": []}}
+        enh = _enhancer()
+        result, _ = _select_call(
+            enh,
+            return_value=json.dumps(["n_hit", "n_miss"]),
+            query="浴血",
+            candidates=candidates,
+            profiles=profiles,
+        )
+        assert result["selected_ids"] == ["n_hit"]
+        assert result["pool_concern"] is False
         assert result["concern_reason"] == "llm_unavailable"
 
 
@@ -766,3 +799,161 @@ class TestResolveQueryEntities:
         """[1.2]③ w_e > w_t > w_k。"""
         assert WEIGHT_ENTITY > WEIGHT_TAG > WEIGHT_KEYWORD
         assert ABSOLUTE_CEILING_MULTIPLIER == 2
+
+
+# ===========================================================================
+# 11. P2 审查修复回归
+# ===========================================================================
+
+
+class TestGlobalNoteDistinctNodes:
+    """#1 回归：全局注记计数 distinct 节点——同 profile 的大小写变体/重复条目
+    不得把同一节点重复计入，注记文本节点 id 无重复。"""
+
+    def test_case_variant_entries_do_not_trigger_premature_note(self):
+        # 2 节点 × 2 个大小写变体 = 4 条目 > 阈值，但 distinct 节点仅 2 → 不得出注记
+        candidates = [_cand("n0"), _cand("n1")]
+        profiles = {
+            nid: {"entities": [{"name": "Einstein", "type": "person"},
+                               {"name": "einstein", "type": "person"}],
+                  "keywords": [], "tags": []}
+            for nid in ("n0", "n1")
+        }
+        enh = _enhancer()
+        _, mock_llm = _select_call(
+            enh,
+            return_value=_resp(["n0", "n1"]),
+            query="物理学家的贡献",
+            candidates=candidates,
+            profiles=profiles,
+            query_entities=["Einstein"],
+        )
+        section = _evidence_section(_prompt_of(mock_llm))
+        assert "命中于节点" not in section
+        # 两个节点各自保留实体展开（未发生 keeper 折叠）
+        assert section.count("实体匹配") == 2
+
+    def test_note_text_lists_each_node_id_once(self):
+        # 4 节点各带大小写变体 + 重复关键词条目 → 注记合法触发，但每个节点 id 只出现一次
+        candidates = [_cand(f"n{i}") for i in range(4)]
+        profiles = {
+            f"n{i}": {"entities": [{"name": "Einstein", "type": "person"},
+                                    {"name": "einstein", "type": "person"}],
+                      "keywords": ["武功", "武功"], "tags": []}
+            for i in range(4)
+        }
+        enh = _enhancer()
+        _, mock_llm = _select_call(
+            enh,
+            return_value=_resp([f"n{i}" for i in range(4)]),
+            query="武功秘籍",
+            candidates=candidates,
+            profiles=profiles,
+            query_entities=["Einstein"],
+        )
+        section = _evidence_section(_prompt_of(mock_llm))
+        ent_note = next(l for l in section.splitlines() if l.startswith("注：实体"))
+        kw_note = next(l for l in section.splitlines() if l.startswith("注：关键词"))
+        for note in (ent_note, kw_note):
+            for i in range(4):
+                assert note.count(f"n{i}") == 1, f"{note} 中 n{i} 出现多次"
+
+
+class TestCapRobustness:
+    """#2 回归：cap ≤0 钳位 ≥1；非法覆盖/实例配置逐级回退——enhance_and_select 永不抛出。"""
+
+    def test_zero_and_negative_configured_cap_clamps_to_one(self):
+        for bad_cap in (0, -3):
+            enh, kwargs = TestMaxCandidatesOverride._fixture(cap=bad_cap)
+            result, _ = _select_call(enh, return_value="", **kwargs)
+            # 钳位到 1：保留分数最高的 a(3.0)，b/c 进延迟池
+            assert result["selected_ids"] == ["a"], bad_cap
+            assert result["deferred"] == ["b", "c"], bad_cap
+
+    def test_invalid_max_candidates_falls_back_to_configured_cap(self):
+        enh, kwargs = TestMaxCandidatesOverride._fixture(cap=2)
+        for bad in ("not-a-number", object(), []):
+            result, _ = _select_call(
+                enh, return_value=_resp(["a", "b", "c"]),
+                max_candidates=bad, **kwargs,
+            )
+            assert result["deferred"] == ["c"], bad
+            assert result["selected_ids"] == ["a", "b"], bad
+
+    def test_invalid_instance_cap_falls_back_to_class_default(self):
+        candidates = [_cand(f"n{i}") for i in range(4)]
+        profiles = {
+            f"n{i}": {"entities": [], "keywords": ["武功"], "tags": []} for i in range(4)
+        }
+        enh = _enhancer()
+        enh.union_max_candidates = "oops"
+        result, _ = _select_call(
+            enh,
+            return_value="",
+            query="武功秘籍",
+            candidates=candidates,
+            profiles=profiles,
+        )
+        assert result["deferred"] == []
+        assert result["selected_ids"] == [f"n{i}" for i in range(4)]
+
+
+class TestTieBreakDeterminism:
+    """平分裁决确定性：同多信号分 → 输入顺序保留，重复运行输出一致。"""
+
+    def test_equal_scores_preserve_input_order_and_are_deterministic(self):
+        candidates = [_cand("n0"), _cand("n1"), _cand("n2")]
+        profiles = {
+            f"n{i}": {"entities": [], "keywords": ["武功"], "tags": []} for i in range(3)
+        }
+        call = dict(query="武功秘籍", candidates=candidates, profiles=profiles)
+        enh = _enhancer(cap=2)
+        r1, _ = _select_call(enh, return_value="", **call)
+        r2, _ = _select_call(enh, return_value="", **call)
+        assert r1 == r2
+        # 平分（各 1.0）→ 稳定排序按输入序：保留 n0/n1，延迟 n2
+        assert r1["selected_ids"] == ["n0", "n1"]
+        assert r1["deferred"] == ["n2"]
+
+
+class TestQueryEntitiesEquivalence:
+    """query_entities=[] 与 None 完全等价（无实体通道信号）。"""
+
+    def test_empty_list_behaves_identically_to_none(self):
+        candidates = [_cand("n_ent"), _cand("n_kw")]
+        profiles = {
+            "n_ent": {"entities": [{"name": "张三", "type": "person"}], "keywords": [], "tags": []},
+            "n_kw": {"entities": [], "keywords": ["浴血"], "tags": []},
+        }
+        call = dict(query="浴血", candidates=candidates, profiles=profiles)
+        enh = _enhancer()
+        r_none, m_none = _select_call(
+            enh, return_value=_resp(["n_ent", "n_kw"]), query_entities=None, **call
+        )
+        r_empty, m_empty = _select_call(
+            enh, return_value=_resp(["n_ent", "n_kw"]), query_entities=[], **call
+        )
+        assert r_none == r_empty
+        assert _prompt_of(m_none) == _prompt_of(m_empty)
+        # [] 不带实体 → n_ent 不进 union，LLM 选了也被校验过滤
+        assert r_none["selected_ids"] == ["n_kw"]
+
+
+class TestUnhashableNodeId:
+    """#4 回归：不可哈希 node_id（如 list）不抛出——profiles 查表回退 str 键。"""
+
+    def test_unhashable_node_id_does_not_raise(self):
+        candidates = [
+            {"node_id": ["bad"], "title": "脏", "summary": "脏"},
+            _cand("n0"),
+        ]
+        profiles = {"n0": {"entities": [], "keywords": ["浴血"], "tags": []}}
+        enh = _enhancer()
+        result, _ = _select_call(
+            enh,
+            return_value=_resp(["n0"]),
+            query="浴血",
+            candidates=candidates,
+            profiles=profiles,
+        )
+        assert result["selected_ids"] == ["n0"]

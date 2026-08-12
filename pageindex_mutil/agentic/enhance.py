@@ -37,6 +37,14 @@ _DEFAULT_UNION_MAX_CANDIDATES = 80
 _DEFAULT_EVIDENCE_MAX_CHARS = 6000
 
 
+def _coerce_cap(value):
+    """cap 强制：合法值钳到 ≥1；非数值/无效值 → None（调用方回退下一级，绝不抛出）。"""
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 class UnifiedNodeEnhancement:
     """高召回 union 收窄 + 证据组装 + LLM 精挑（唯一裁剪者）。"""
 
@@ -88,10 +96,9 @@ class UnifiedNodeEnhancement:
         return hits
 
     @staticmethod
-    def _tag_hits(query_tokens: list, query: str, tags) -> list:
-        """标签通道：query token/整串子串 vs 节点标签。"""
+    def _tag_hits(query_tokens: list, query_cf: str, tags) -> list:
+        """标签通道：query token/整串子串 vs 节点标签（query_cf 为调用方提升的 query.casefold()）。"""
         hits = []
-        query_cf = (query or "").casefold()
         for tag in tags or []:
             if not isinstance(tag, str) or not tag.strip():
                 continue
@@ -155,16 +162,20 @@ class UnifiedNodeEnhancement:
 
         notes = []
         # 实体全局注记：同一实体命中 >GLOBAL_NOTE_THRESHOLD 个节点
+        # （按 (key, nid) 去重——计数 distinct 节点：同 profile 的大小写变体不得重复计入）
         ent_spread = {}
         for nid in union:
             for ent in matches[nid]["entities"]:
-                ent_spread.setdefault(str(ent["name"]).casefold(), []).append(nid)
+                bucket = ent_spread.setdefault(str(ent["name"]).casefold(), [])
+                if nid not in bucket:
+                    bucket.append(nid)
         for key, node_ids in ent_spread.items():
             if len(node_ids) > GLOBAL_NOTE_THRESHOLD:
                 keeper = keeper_of(node_ids)
                 name = next(
-                    e["name"] for nid in union for e in matches[nid]["entities"]
-                    if nid in node_ids and str(e["name"]).casefold() == key
+                    (e["name"] for nid in union for e in matches[nid]["entities"]
+                     if nid in node_ids and str(e["name"]).casefold() == key),
+                    key,
                 )
                 notes.append(f"注：实体 {name} 命中于节点 {'、'.join(node_ids)}")
                 for nid in node_ids:
@@ -173,11 +184,13 @@ class UnifiedNodeEnhancement:
                             e for e in matches[nid]["entities"]
                             if str(e["name"]).casefold() != key
                         ]
-        # 关键词全局注记
+        # 关键词全局注记（同上：按 (key, nid) 去重，重复关键词条目只计一次节点）
         kw_spread = {}
         for nid in union:
             for kw in matches[nid]["keywords"]:
-                kw_spread.setdefault(str(kw).lower(), []).append(nid)
+                bucket = kw_spread.setdefault(str(kw).lower(), [])
+                if nid not in bucket:
+                    bucket.append(nid)
         for key, node_ids in kw_spread.items():
             if len(node_ids) > GLOBAL_NOTE_THRESHOLD:
                 keeper = keeper_of(node_ids)
@@ -214,6 +227,7 @@ class UnifiedNodeEnhancement:
             blocks[nid] = "\n".join(lines)
 
         # [7.4] 跨节点总预算：超限按证据强度（多信号分）升序退化弱候选为"标题+摘要"一行
+        # 注：每节点一行、注记不动是有意的尽力下限——极小 evidence_max_chars 下仍可能超限，不再进一步裁剪。
         total = sum(len(b) for b in blocks.values()) + sum(len(n) for n in notes)
         if total > self.evidence_max_chars:
             degradables = sorted(
@@ -235,8 +249,18 @@ class UnifiedNodeEnhancement:
     # ------------------------------------------------------------------
     # prompt 构建
     # ------------------------------------------------------------------
+    @staticmethod
+    def _positive_budget(v):
+        """非正/非数值预算 → None（视为未给），避免渲染"最多选 0 个节点"之类无效条款。"""
+        try:
+            return v if float(v) > 0 else None
+        except (TypeError, ValueError):
+            return None
+
     def _build_budget_block(self, node_budget, token_budget) -> str:
         """[7.5]b 预算转 prompt 指令：预算只是约束，不替 LLM 决定谁相关。"""
+        node_budget = self._positive_budget(node_budget)
+        token_budget = self._positive_budget(token_budget)
         if node_budget is None and token_budget is None:
             return ""
         clauses = []
@@ -314,17 +338,23 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
 
         # ① union（纯查表/集合并，全程无 LLM，[7.3]）
         query_tokens = self._tokenize(query)
+        query_cf = query.casefold()
         node_signals = {}
         union = []
         for pos, nid in norm:
             cand = cand_by_id[nid]
-            prof = profiles.get(cand.get("node_id"))
+            raw_id = cand.get("node_id")
+            try:
+                prof = profiles.get(raw_id)
+            except TypeError:
+                # 不可哈希的 node_id（list/dict 等）：回退到归一后的 str(nid) 查表
+                prof = None
             if prof is None:
                 prof = profiles.get(nid)
             prof = prof if isinstance(prof, dict) else {}
             ents = self._entity_hits(query_entities, prof.get("entities"))
             kws = self._keyword_hits(query_tokens, prof.get("keywords"))
-            tags = self._tag_hits(query_tokens, query, prof.get("tags"))
+            tags = self._tag_hits(query_tokens, query_cf, prof.get("tags"))
             score = (
                 WEIGHT_ENTITY * len(ents)
                 + WEIGHT_TAG * len(tags)
@@ -342,11 +372,13 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
             union = [nid for _, nid in norm]
 
         # ①b union 防爆炸（[1.2]）
+        # cap 解析链：显式覆盖 → 实例配置 → 类默认；任一级非法值回退下一级，绝不抛出
         deferred = []
-        cap_source = (
-            self.union_max_candidates if max_candidates is None else max_candidates
-        )
-        cap = max(1, int(cap_source))
+        cap = _coerce_cap(max_candidates)
+        if cap is None:
+            cap = _coerce_cap(self.union_max_candidates)
+        if cap is None:
+            cap = _coerce_cap(_DEFAULT_UNION_MAX_CANDIDATES)
         if len(union) > cap:
             if all(node_signals[nid]["score"] == 0 for nid in union):
                 # 零值泛滥防护：禁止按 score 收缩——输入顺序 + 绝对上限兜底
