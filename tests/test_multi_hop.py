@@ -622,7 +622,7 @@ class TestGraphGuidedNextHop:
         ]
 
         hop_count = [0]
-        def mock_act_tree(query, docs):
+        def mock_act_tree(query, docs, **kw):
             hop_count[0] += 1
             return (f"ctx_hop{hop_count[0]}", [], 1, 1, {}, [])
 
@@ -734,11 +734,17 @@ class TestMatchedDocsPopulated:
         client.db.get_entity_documents.return_value = [{"id": 10, "pdf_name": "doc.pdf"}]
 
         # Hop 1 returns doc_pages_map with doc "doc-uuid-1", hop 2 with "doc-uuid-2"
+        # T6.4: doc_scores_out 回填节点召回覆盖度（evidence-derived score）
         hop_count = [0]
-        def mock_act_tree(query, docs):
+        def mock_act_tree(query, docs, **kw):
             hop_count[0] += 1
+            scores = kw.get("doc_scores_out")
             if hop_count[0] == 1:
+                if scores is not None:
+                    scores["doc-uuid-1"] = 0.25
                 return ("ctx1", [{"node_id": "n1"}], 1, 1, {"doc-uuid-1": [1, 2]}, [])
+            if scores is not None:
+                scores["doc-uuid-2"] = 0.5
             return ("ctx2", [{"node_id": "n2"}], 1, 1, {"doc-uuid-2": [3]}, [])
 
         router._act_tree_search = AsyncMock(side_effect=mock_act_tree)
@@ -763,6 +769,11 @@ class TestMatchedDocsPopulated:
         doc_ids = {d["doc_id"] for d in result["matched_docs"]}
         assert "doc-uuid-1" in doc_ids, "doc-uuid-1 from hop 1 missing from matched_docs"
         assert "doc-uuid-2" in doc_ids, "doc-uuid-2 from hop 2 missing from matched_docs"
+        # T6.4 score 语义统一：覆盖度分数（doc_scores_out 回填），确定性 (0,1]
+        scores_by_id = {d["doc_id"]: d["score"] for d in result["matched_docs"]}
+        assert scores_by_id["doc-uuid-1"] == 0.25
+        assert scores_by_id["doc-uuid-2"] == 0.5
+        assert all(0 < s <= 1.0 for s in scores_by_id.values())
 
 
 class TestCandidateDocIdMapping:
@@ -941,12 +952,15 @@ class TestMultiHopEntityToDocE2E:
 
             # Router: mock everything except the REAL _act_tree_search and
             # _recall_nodes_for_doc, which form the chain under test.
+            # T6.4: _recall_nodes_for_doc 走 enhance_and_select（LLM 精挑）——
+            # model/retrieve_model 供 enhancer 构造，精挑 LLM 经 enhance 模块 patch。
             router = MagicMock(spec=AgenticRouter)
+            router.model = "m"
+            router.retrieve_model = "m"
             router.client = client
             router.verifier = MagicMock()
             router.verifier.verify.return_value = MagicMock(action="answer")
             router._load_main_funcs.return_value = {
-                "get_relevant_nodes": MagicMock(return_value=["n1"]),
                 "pages_from_nodes": MagicMock(return_value=[1]),
                 "build_context_for_doc": MagicMock(
                     side_effect=lambda doc, selected, pages: "\n".join(
@@ -964,33 +978,45 @@ class TestMultiHopEntityToDocE2E:
             # Hop 1 extracts nothing new → loop ends after hop 1.
             extract = json.dumps({"entities": [], "facts": [], "next_hop_hint": ""})
 
+            # enhance 精挑 LLM（调用时惰性导入 pageindex_mutil.agentic.enhance，
+            # sys.modules 解析 → patch 当前生效模块的属性即命中）
+            import importlib
+            enhance_mod_e2e = importlib.import_module("pageindex_mutil.agentic.enhance")
+
             with patch.object(
                 multi_hop_mod, "llm_acompletion",
                 side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract,
+            ), patch.object(
+                enhance_mod_e2e, "llm_completion",
+                return_value=json.dumps({
+                    "selected_ids": ["n1"], "pool_concern": False, "concern_reason": "",
+                }),
             ):
                 result = asyncio.run(reasoner.execute("Alpha 是什么?", router, db))
 
-            # 1) Candidate docs reached tree search as UUIDs, not stringified DB ids:
-            #    matched_docs is keyed by whatever _act_tree_search resolved.
-            matched_ids = [d["doc_id"] for d in result["matched_docs"]]
-            assert "uuid-doc-10" in matched_ids
-            assert "10" not in matched_ids
+                # 1) Candidate docs reached tree search as UUIDs, not stringified DB ids:
+                #    matched_docs is keyed by whatever _act_tree_search resolved.
+                matched_ids = [d["doc_id"] for d in result["matched_docs"]]
+                assert "uuid-doc-10" in matched_ids
+                assert "10" not in matched_ids
+                # T6.4: matched score = 节点召回覆盖度（1/1 候选 = 1.0），(0,1]
+                assert all(0 < d["score"] <= 1.0 for d in result["matched_docs"])
 
-            # 2) The UUID-resolved doc's entity content made it into hop context.
-            assert any("ENTITY_CONTENT_MARKER" in c for c in result["hop_contexts"])
+                # 2) The UUID-resolved doc's entity content made it into hop context.
+                assert any("ENTITY_CONTENT_MARKER" in c for c in result["hop_contexts"])
 
-            # 3) Final answer generated and CRAG-verified.
-            assert result["answer"] == "e2e final answer"
-            assert result["confidence"] == "high"
-            assert result["hop_count"] == 1
+                # 3) Final answer generated and CRAG-verified.
+                assert result["answer"] == "e2e final answer"
+                assert result["confidence"] == "high"
+                assert result["hop_count"] == 1
 
-            # 4) Chain proof: real recall succeeds for the UUID and returns None for
-            #    the old stringified DB id (which is what broke the link).
-            ok = asyncio.run(router._recall_nodes_for_doc("q", "uuid-doc-10"))
-            assert ok is not None
-            assert ok["doc_id"] == "uuid-doc-10"
-            broken = asyncio.run(router._recall_nodes_for_doc("q", "10"))
-            assert broken is None
+                # 4) Chain proof: real recall succeeds for the UUID and returns None for
+                #    the old stringified DB id (which is what broke the link).
+                ok = asyncio.run(router._recall_nodes_for_doc("q", "uuid-doc-10"))
+                assert ok is not None
+                assert ok["doc_id"] == "uuid-doc-10"
+                broken = asyncio.run(router._recall_nodes_for_doc("q", "10"))
+                assert broken is None
         finally:
             for name in [n for n in sys.modules if n.startswith("pageindex_mutil")]:
                 if name not in _saved_modules:

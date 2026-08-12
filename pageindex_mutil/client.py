@@ -47,9 +47,9 @@ META_INDEX = "_meta.json"
 # attribution can fan out on repetitive docs; keep the table bounded.
 _MAX_NODE_MENTIONS_PER_ENTITY = 20
 
-# [3.2.1] pool_concern 重选：union 上限放宽倍数。候选/签名不变，被截候选经
-# union 自然回池，该参数只抬高上限让延迟池节点重新可被 LLM 精挑。
-POOL_CONCERN_RETRY_CAP_MULTIPLIER = 2
+# [3.2.1] pool_concern 重选：union 上限放宽倍数。规范定义在 agentic.enhance
+# （T6.4 起单文档/多文档/语料树逐层三个接入点共用），此处保留同名再导出。
+from .agentic.enhance import POOL_CONCERN_RETRY_CAP_MULTIPLIER  # noqa: E402
 
 
 def _iter_structure_nodes(structure):
@@ -1067,73 +1067,16 @@ class PageIndexClient:
             "pages": [],
         }
 
-    @staticmethod
-    def _keyword_select_nodes(query: str, structure: list) -> list[str]:
-        """Select node IDs by keyword matching on text content.
-
-        Used as fallback when LLM-based selection misses the answer node.
-        """
-        try:
-            import jieba
-            from .closet_index import _STOPWORDS
-            tokens = {
-                t.strip().lower() for t in jieba.lcut(query)
-                if len(t.strip()) > 1 and t.strip().lower() not in _STOPWORDS
-            }
-        except Exception:
-            tokens = {w.lower() for w in query.split() if len(w) > 1}
-        if not tokens:
-            return []
-
-        mapping = create_node_mapping(structure)
-        scored = []
-        for nid, node in mapping.items():
-            text = (node.get("text") or "").lower()
-            if not text:
-                continue
-            hits = sum(1 for t in tokens if t in text)
-            if hits > 0:
-                scored.append((nid, hits))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [nid for nid, _ in scored]
-
     def _resolve_node_profiles(self, doc_id: str, mapping: dict) -> dict:
         """Resolve per-node evidence signatures for enhance_and_select ([3.4]).
 
-        Resolution order: DB node_profiles first (authoritative when the doc
-        was indexed with sync=True); fall back to entities/keywords/tags keys
-        carried on the structure node dicts (async path / workspace JSON);
+        Delegates to the shared resolve_node_profiles helper (T6.4): DB
+        node_profiles first via the doc's integer id; structure-key fallback;
         else an empty dict (enhance handles missing profiles gracefully, [7.7]).
         """
-        if self.db is not None:
-            db_doc_id = self._id_mapper.to_db(doc_id)
-            if db_doc_id is not None:
-                rows = None
-                try:
-                    rows = self.db.get_node_profiles(db_doc_id)
-                except Exception as e:
-                    logging.warning(
-                        "get_node_profiles failed for doc %s: %s", doc_id, e
-                    )
-                if rows:
-                    return {
-                        p["node_id"]: {
-                            "entities": p.get("entities") or [],
-                            "keywords": p.get("keywords") or [],
-                            "tags": p.get("tags") or [],
-                        }
-                        for p in rows if p.get("node_id")
-                    }
-        profiles = {}
-        for nid, node in mapping.items():
-            prof = {
-                key: node.get(key)
-                for key in ("entities", "keywords", "tags")
-                if node.get(key)
-            }
-            if prof:
-                profiles[nid] = prof
-        return profiles
+        from .agentic.enhance import resolve_node_profiles
+        db_doc_id = self._id_mapper.to_db(doc_id) if self.db is not None else None
+        return resolve_node_profiles(self.db, db_doc_id, mapping)
 
     async def _search_single(self, query: str, doc_id: str) -> dict:
         """Direct tree search for a single document (zero router overhead).

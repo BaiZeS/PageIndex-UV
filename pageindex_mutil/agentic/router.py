@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 from typing import List, Tuple, Dict
 
@@ -40,14 +39,12 @@ class AgenticRouter:
         if self._main_funcs is None:
             try:
                 from ..reasoning import (
-                    get_relevant_nodes,
                     build_context_with_budget,
                     generate_answer,
                     pages_from_nodes,
                     build_context_for_doc,
                 )
                 self._main_funcs = {
-                    "get_relevant_nodes": get_relevant_nodes,
                     "build_context_with_budget": build_context_with_budget,
                     "generate_answer": generate_answer,
                     "pages_from_nodes": pages_from_nodes,
@@ -193,45 +190,17 @@ class AgenticRouter:
     # ------------------------------------------------------------------
     # Act — tree search + context assembly (parallelized)
     # ------------------------------------------------------------------
-    def _enhance_tree_with_matches(self, structure: List[Dict], matched_info: List[Dict]) -> List[Dict]:
-        """Enhance tree nodes with keyword match context for LLM.
-
-        Preserves original tree structure including nested nodes.
-        """
-        match_map = {}
-        for m in matched_info:
-            node_id = m.get("node_id")
-            if node_id:
-                match_map[node_id] = m
-
-        def enhance_node(node):
-            """Recursively enhance a node and its children."""
-            node_data = dict(node)  # Copy all original fields
-
-            # Add match context if available
-            node_id = node.get("node_id")
-            if node_id in match_map:
-                match = match_map[node_id]
-                node_data["matched_keyword"] = match.get("keyword", "")
-                node_data["matched_context"] = match.get("context", "")
-
-            # Recursively enhance child nodes
-            if "nodes" in node and isinstance(node["nodes"], list):
-                node_data["nodes"] = [enhance_node(child) for child in node["nodes"]]
-
-            return node_data
-
-        return [enhance_node(node) for node in structure]
-
     async def _recall_nodes_for_doc(self, query: str, doc_id: str,
                                       matched_info: List[Dict] = None):
         """Recall relevant nodes for a single document (runs in thread).
 
-        Uses enhanced tree with keyword match context for better LLM decisions.
-        LLM is the final decision maker (PageIndex core principle).
+        [3.2.1] unit = 节点：enhance_and_select 统一接入——四通道 union 宽召回 +
+        证据接地 + LLM 精挑（唯一裁剪者）。node_profiles 签名（DB 优先）与
+        查询实体作为证据注入；内容策略命中词并入关键词证据（只喂证据，不替代
+        精挑）。LLM 失效时不做启发式兜底裁剪（[7.7] 放行 union）——不再有
+        get_relevant_nodes 旧路，也不再有启发式关键词兜底。
         """
         funcs = self._load_main_funcs()
-        get_relevant_nodes = funcs.get("get_relevant_nodes")
         pages_from_nodes = funcs.get("pages_from_nodes")
 
         if hasattr(self.client, "_ensure_doc_loaded"):
@@ -244,27 +213,71 @@ class AgenticRouter:
             return None
 
         from ..utils import create_node_mapping
+        from .enhance import (
+            UnifiedNodeEnhancement,
+            resolve_query_entities,
+            resolve_node_profiles,
+            POOL_CONCERN_RETRY_CAP_MULTIPLIER,
+        )
+
         mapping = create_node_mapping(structure)
+        candidates = [
+            {
+                "node_id": nid,
+                "title": node.get("title") or "",
+                "summary": node.get("summary") or "",
+            }
+            for nid, node in mapping.items()
+        ]
 
-        # Enhance tree with match context if available
+        # 签名解析（[3.4] 共享助手）：DB node_profiles 优先 → structure 键兜底
+        db = getattr(self.client, "db", None)
+        id_mapper = getattr(self.client, "_id_mapper", None)
+        db_doc_id = None
+        if db is not None and id_mapper is not None and hasattr(id_mapper, "to_db"):
+            db_doc_id = id_mapper.to_db(doc_id)
+        profiles = resolve_node_profiles(db, db_doc_id, mapping)
+        query_entities = resolve_query_entities(db, query, limit=5) if db else []
+
+        # 内容策略命中词并入关键词证据（v2 词面接地的保全，仅证据不裁决）。
+        # 写时拷贝：structure 兜底签名的 list 与内存文档节点共享引用，
+        # 不得把查询期命中词污染进在内存文档结构。
         if matched_info:
-            enhanced_tree = self._enhance_tree_with_matches(structure, matched_info)
-            tree_json = json.dumps(enhanced_tree, ensure_ascii=False)
-        else:
-            tree_json = json.dumps(structure, ensure_ascii=False)
+            for m in matched_info:
+                if not isinstance(m, dict):
+                    continue
+                nid, kw = m.get("node_id"), m.get("keyword")
+                if not nid or not isinstance(kw, str) or not kw.strip():
+                    continue
+                prof = profiles.get(nid)
+                prof = dict(prof) if prof else {"entities": [], "keywords": [], "tags": []}
+                kws = list(prof.get("keywords") or [])
+                if kw.strip() not in kws:
+                    kws.append(kw.strip())
+                prof["keywords"] = kws
+                profiles[nid] = prof
 
-        # LLM-based selection with enhanced context (LLM is the decision maker)
-        node_ids = await asyncio.to_thread(get_relevant_nodes, query, tree_json)
+        # NFR4: 检索 LLM 调用点用 retrieve_model（model 兜底）
+        enhancer = UnifiedNodeEnhancement(self.model, retrieve_model=self.retrieve_model)
+        result = await enhancer.enhance_and_select(
+            query, candidates, profiles, query_entities=query_entities,
+        )
 
-        # Keyword fallback if LLM returns nothing
-        if not node_ids:
-            from ..client import PageIndexClient
-            node_ids = PageIndexClient._keyword_select_nodes(query, structure)
+        # [3.2.1] pool_concern 且存在被截候选 → 放宽 union 上限重选一次。
+        # 候选/签名不变，被截候选经 union 自然回池；上限放宽只抬高 cap。
+        if result["pool_concern"] and result["deferred"]:
+            result = await enhancer.enhance_and_select(
+                query, candidates, profiles, query_entities=query_entities,
+                max_candidates=max(1, int(enhancer.union_max_candidates))
+                * POOL_CONCERN_RETRY_CAP_MULTIPLIER,
+            )
 
-        if not node_ids:
+        selected_ids = result["selected_ids"]
+        if not selected_ids:
             return None
 
-        selected = [mapping.get(nid) for nid in node_ids if nid in mapping]
+        # 保持 LLM 精挑顺序（无重排）
+        selected = [mapping[nid] for nid in selected_ids if nid in mapping]
         selected = [n for n in selected if n]
         if not selected:
             return None
@@ -273,9 +286,9 @@ class AgenticRouter:
         if not pages:
             return None
 
-        # Compute a simple relevance score based on number of matched nodes
-        # (more matched nodes = higher relevance)
-        relevance_score = len(selected) / max(len(structure), 1)
+        # 相关度 = 召回覆盖度（selected / 全部候选节点），确定性 (0,1]，
+        # 与单文档 _search_single 的 matched_docs score 语义统一。
+        relevance_score = min(round(len(selected) / max(len(candidates), 1), 4), 1.0)
 
         return {
             "doc_id": doc_id,
@@ -288,8 +301,12 @@ class AgenticRouter:
 
     async def _act_tree_search(
         self, query: str, candidate_docs: List[str],
-        node_matches: Dict[str, List[Dict]] = None
+        node_matches: Dict[str, List[Dict]] = None,
+        doc_scores_out: Dict[str, float] = None,
     ) -> Tuple[str, List[dict], int, int, Dict[str, List[int]], List[dict]]:
+        """Act 阶段树搜索。doc_scores_out 非 None 时回填每篇召回成功文档的
+        证据派生分数（节点召回覆盖度 (0,1]）——供调用方构造 matched_docs，
+        不再硬编码 1.0（T6.4 score 语义统一）。"""
         funcs = self._load_main_funcs()
         pages_from_nodes = funcs.get("pages_from_nodes")
         if not pages_from_nodes:
@@ -321,6 +338,11 @@ class AgenticRouter:
                 doc_results.append(r)
 
         doc_results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+
+        # 证据派生分数回填（预算截断前全量记录——召回并发完成，与准入无关）
+        if doc_scores_out is not None:
+            for r in doc_results:
+                doc_scores_out[r["doc_id"]] = float(r.get("relevance_score", 0.0))
 
         contexts = []
         all_nodes = []
@@ -568,13 +590,11 @@ class AgenticRouter:
                 "pages": [],
             }
 
-        # Build matched_docs with scores (all selected get score 1.0)
-        matched = [{"doc_id": doc_id, "score": 1.0} for doc_id in selected_uuids]
-
         # L2/L3: Act — tree search on selected documents (reuse existing _act_tree_search)
+        doc_scores: Dict[str, float] = {}
         try:
             ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = await self._act_tree_search(
-                query, selected_uuids
+                query, selected_uuids, doc_scores_out=doc_scores
             )
             logging.info("[SuperTree] L2/L3 context_len=%d src_docs=%d nodes=%d",
                         len(ctx), src_docs, cov_nodes)
@@ -585,10 +605,18 @@ class AgenticRouter:
                 "mode": "multi",
                 "answer": f"Failed to retrieve content: {e}",
                 "confidence": "unknown",
-                "matched_docs": matched,
+                # 无节点级证据接地 → 不虚报匹配（与单文档空选择语义一致）
+                "matched_docs": [],
                 "selected_nodes": [],
                 "pages": [],
             }
+
+        # matched_docs score = 节点召回覆盖度（evidence-derived，(0,1]），
+        # 取代旧硬编码 1.0；召回无果（LLM 精挑为空）的文档不进 matched。
+        matched = [
+            {"doc_id": doc_id, "score": round(doc_scores[doc_id], 4)}
+            for doc_id in selected_uuids if doc_id in doc_scores
+        ]
 
         if not ctx:
             return {

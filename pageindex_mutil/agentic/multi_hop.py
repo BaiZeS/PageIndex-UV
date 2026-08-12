@@ -78,10 +78,13 @@ class MultiHopReasoner:
             logger.info("[MultiHop] hop %d/%d query=%r", hop_idx + 1, max_hops, current_query)
 
             # Navigate: use tree navigation for current sub-query
+            hop_scores: Dict[str, float] = {}
             try:
                 candidate_docs = self._get_candidate_docs(db, current_query, visited_entities, to_uuid)
                 ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = (
-                    await router._act_tree_search(current_query, candidate_docs)
+                    await router._act_tree_search(
+                        current_query, candidate_docs, doc_scores_out=hop_scores
+                    )
                 )
             except Exception as e:
                 logger.warning("[MultiHop] hop %d tree search failed: %s", hop_idx + 1, e)
@@ -104,10 +107,13 @@ class MultiHopReasoner:
             all_selected_nodes.extend(nodes or [])
             all_pages.extend(pages_with_text or [])
             if doc_pages_map:
+                # score = 节点召回覆盖度（_act_tree_search 经 doc_scores_out 回填，
+                # evidence-derived，(0,1]）；覆盖度缺失（防御场景）回退 1.0。
+                seen_docs = {d["doc_id"] for d in all_matched_docs}
                 all_matched_docs.extend(
-                    {"doc_id": did, "score": 1.0}
+                    {"doc_id": did, "score": round(float(hop_scores.get(did, 1.0)), 4)}
                     for did in doc_pages_map
-                    if did not in {d["doc_id"] for d in all_matched_docs}
+                    if did not in seen_docs
                 )
 
             # Extract: LLM extracts intermediate entities/facts

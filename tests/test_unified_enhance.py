@@ -802,6 +802,58 @@ class TestResolveQueryEntities:
 
 
 # ===========================================================================
+# T6.4: resolve_node_profiles（共享助手——单文档/多文档路径共用）
+# ===========================================================================
+
+
+class TestResolveNodeProfiles:
+    def test_db_profiles_preferred_over_structure_keys(self):
+        from pageindex_mutil.agentic.enhance import resolve_node_profiles
+        db = MagicMock()
+        db.get_node_profiles.return_value = [
+            {"node_id": "n1", "entities": [{"name": "E", "type": "t"}],
+             "keywords": ["k1"], "tags": None},
+        ]
+        mapping = {"n1": {"keywords": ["不该被采用"]}}
+        profiles = resolve_node_profiles(db, 7, mapping)
+        db.get_node_profiles.assert_called_once_with(7)  # db 整数 id
+        assert profiles == {
+            "n1": {"entities": [{"name": "E", "type": "t"}],
+                   "keywords": ["k1"], "tags": []}
+        }
+
+    def test_db_empty_rows_falls_back_to_structure_keys(self):
+        from pageindex_mutil.agentic.enhance import resolve_node_profiles
+        db = MagicMock()
+        db.get_node_profiles.return_value = []
+        mapping = {
+            "n1": {"keywords": ["k"], "entities": None},
+            "n2": {},  # 无签名键 → 不进 profiles
+        }
+        assert resolve_node_profiles(db, 1, mapping) == {"n1": {"keywords": ["k"]}}
+
+    def test_db_none_or_doc_id_none_uses_structure_keys(self):
+        from pageindex_mutil.agentic.enhance import resolve_node_profiles
+        mapping = {"n1": {"tags": ["t1"]}}
+        assert resolve_node_profiles(None, 1, mapping) == {"n1": {"tags": ["t1"]}}
+        db = MagicMock()
+        assert resolve_node_profiles(db, None, mapping) == {"n1": {"tags": ["t1"]}}
+        db.get_node_profiles.assert_not_called()
+
+    def test_db_exception_degrades_to_structure_keys(self):
+        from pageindex_mutil.agentic.enhance import resolve_node_profiles
+        db = MagicMock()
+        db.get_node_profiles.side_effect = RuntimeError("boom")
+        mapping = {"n1": {"keywords": ["k"]}}
+        assert resolve_node_profiles(db, 9, mapping) == {"n1": {"keywords": ["k"]}}
+
+    def test_nothing_available_returns_empty(self):
+        from pageindex_mutil.agentic.enhance import resolve_node_profiles
+        assert resolve_node_profiles(None, None, {"n1": {}}) == {}
+        assert resolve_node_profiles(None, None, {}) == {}
+
+
+# ===========================================================================
 # 11. P2 审查修复回归
 # ===========================================================================
 

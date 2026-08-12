@@ -13,11 +13,11 @@
 
 全部 LLM 调用均 mock —— 无真实 LLM、无向量（FULLY VECTORLESS）。
 """
-import asyncio
 import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -102,8 +102,50 @@ else:
                 return None
         super_tree_mod.extract_json = _fixed_extract_json
 
-# Prompt marker for the per-level LLM node selection ([S6] step 3).
-M_NAV = "树导航精挑"
+# T6.4/P2.7：逐层精挑统一走 enhance_and_select（_select_nodes 老路已移除）。
+# 隔离策略与 super_tree 相同：standalone 收集时 spec 加载 enhance 预置到
+# sys.modules；全量套件收集时复用已加载的模块。关键：其他测试文件会在收集期
+# purge/重导入 pageindex_mutil.*，运行期生效的 enhance 模块对象可能不是收集期
+# 那一个——而 super_tree.navigate_tree 是调用时经 sys.modules 惰性解析
+# `from .agentic.enhance import ...`，因此所有 patch 必须经 _enhance_module()
+# 惰性访问器取"当前生效"的模块对象（与 test_search_single_enhanced 同理）。
+if "pageindex_mutil.agentic.enhance" not in sys.modules:
+    enh_spec = importlib.util.spec_from_file_location(
+        "pageindex_mutil.agentic.enhance", pkg_path / "agentic" / "enhance.py"
+    )
+    _enhance_mod_seeded = importlib.util.module_from_spec(enh_spec)
+    sys.modules["pageindex_mutil.agentic.enhance"] = _enhance_mod_seeded
+    enh_spec.loader.exec_module(_enhance_mod_seeded)
+
+
+def _enhance_module():
+    """当前生效的 enhance 模块（运行期 sys.modules 解析，与被测惰性导入同源）。
+
+    顺带修复坏 extract_json stub：enhance 的 llm_completion/extract_json 绑定自
+    其加载时刻的 utils 模块，可能是永远返回 None 的 stub。
+    """
+    m = sys.modules.get("pageindex_mutil.agentic.enhance")
+    if m is None:
+        import pageindex_mutil.agentic.enhance as _m
+        m = _m
+    ej = getattr(m, "extract_json", None)
+    if ej is not None and callable(ej):
+        try:
+            probe = ej('{"a":1}')
+        except Exception:
+            probe = None
+        if probe is None:
+            def _fixed_enh_extract_json(text):
+                try:
+                    return json.loads(text)
+                except Exception:
+                    return None
+            m.extract_json = _fixed_enh_extract_json
+    return m
+
+
+# Prompt marker for enhance_and_select 精挑（逐层分支选择）。
+M_ENH = "检索增强专家"
 # Prompt marker for T9 holistic document selection.
 M_DOC = "文档检索专家"
 
@@ -125,10 +167,30 @@ def nav_index():
     os.unlink(path)
 
 
-def _nodes_in_prompt(prompt):
-    """Extract {title: node_id} from a 树导航精挑 prompt."""
-    chunk = prompt.split("[候选分支节点]\n", 1)[1].split("\n\n", 1)[0]
-    return {n["title"]: n["node_id"] for n in json.loads(chunk)}
+def _candidates_in_enhance_prompt(prompt):
+    """Extract {title: node_id(str)} from an enhance_and_select 精挑 prompt.
+
+    证据块格式（[3.2.2]）："候选节点 {nid}：\n标题：{title}\n..."——逐块解析，
+    全局注记（"注：…"）不含"候选节点 "前缀，天然不干扰。
+    """
+    cands = {}
+    for chunk in prompt.split("候选节点 ")[1:]:
+        nid = chunk.split("：", 1)[0].strip()
+        title = ""
+        for line in chunk.splitlines():
+            if line.startswith("标题："):
+                title = line[len("标题："):]
+                break
+        cands[title] = nid
+    return cands
+
+
+def _enh_response(selected, pool_concern=False, concern_reason=""):
+    return json.dumps({
+        "selected_ids": selected,
+        "pool_concern": pool_concern,
+        "concern_reason": concern_reason,
+    })
 
 
 def _two_cluster_tree(db):
@@ -199,16 +261,18 @@ class TestNodePrefilter:
         out = st._prefilter_nodes("风控合规", nodes)
         assert out[0]["id"] == 3
 
-    def test_wide_layer_caps_at_topk(self, nav_index):
+    def test_wide_layer_no_hard_drop_signal_nodes_ranked_first(self, nav_index):
+        """P2.9：宽层废除 top-k 硬截断——信号节点全部保留并排前，零丢弃；
+        超限收窄由 enhance_and_select 的 union cap + 延迟池承担（[3.2.1]）。"""
         st, _, _ = nav_index
-        st._NODE_PREFILTER_TOPK = 5
         nodes = [{"id": i, "title": f"节点{i}", "summary": "", "tag": None}
                  for i in range(1, 21)]
-        for i in (3, 7, 11, 15, 19, 20):
+        signal_ids = {3, 7, 11, 15, 19, 20}
+        for i in signal_ids:
             nodes[i - 1]["tag"] = "风控"
         out = st._prefilter_nodes("风控", nodes)
-        assert len(out) == 5
-        assert {n["id"] for n in out} <= {3, 7, 11, 15, 19, 20}
+        assert len(out) == 20  # 无丢弃：全部节点保留
+        assert {n["id"] for n in out[: len(signal_ids)]} == signal_ids  # 信号节点排前
 
     def test_no_signal_keeps_all(self, nav_index):
         """无任何匹配信号时不硬过滤，全量交给 LLM 精挑（保召回）。"""
@@ -295,18 +359,13 @@ class TestEntityBoost:
         out = st._prefilter_nodes("张三", nodes, view, entity_table)
         assert out[0]["id"] == n2  # 含查询实体的节点被加权提前
 
-    def test_entity_hit_survives_prefilter_cut(self, nav_index):
-        """实体证据胜过零信号：预筛截断到 1 个时含实体节点存活。
-
-        语义变更说明：旧 `_entity_boost_nodes` 会把被预筛切掉的含实体节点
-        强制捞回（"绝不硬删"）。现行实现中实体信号只是四通道之一（最高
-        贡献 0.2），_prefilter_nodes 按总分截断、不再强制捞回——该语义留待
-        P2 的并集 + 延迟池重构恢复（spec [3.3] 将实体信号重定义为证据）。
-        本测试因此只断言现行实现实际保证的东西：有实体证据的节点排序严格
-        高于零信号节点，即使 topk=1 也不会被静默丢失。
+    def test_entity_hit_survives_without_hard_cut(self, nav_index):
+        """P2.9 语义落地：预筛不再截断（旧 topk 硬切废除）——含实体证据的
+        节点排序严格优先且零丢弃。超限候选的唯一溢出目标是 enhance_and_select
+        的延迟池（deferred，可经 pool_concern 回捞），任何一层不再出现
+        "分数硬截后直接丢弃"（[3.2.1] 收窄纪律；[3.3] 实体信号=证据）。
         """
         st, db, _ = nav_index
-        st._NODE_PREFILTER_TOPK = 1
         d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
         d2 = db.insert_document("b.pdf", "/tmp/b.pdf")
         eid = db.insert_entity("person", "张三")
@@ -323,8 +382,8 @@ class TestEntityBoost:
         nodes = [view.nodes_by_id[n_zero_a], view.nodes_by_id[n_zero_b],
                  view.nodes_by_id[n_entity]]
         out = st._prefilter_nodes("张三", nodes, view, entity_table)
-        assert len(out) == 1
-        assert out[0]["id"] == n_entity  # 证据胜过无证据，实体节点不被截丢
+        assert len(out) == 3  # 零丢弃：无硬截断
+        assert out[0]["id"] == n_entity  # 证据胜过无证据，实体节点排最前
 
 
 # ---------------------------------------------------------------------------
@@ -332,63 +391,103 @@ class TestEntityBoost:
 # ---------------------------------------------------------------------------
 
 
-class TestSelectNodes:
+class TestLayerSelectionViaEnhance:
+    """[3.2.1]/P2.7 层精挑统一走 enhance_and_select（_select_nodes 老路已移除）。"""
+
     @pytest.mark.asyncio
     async def test_variable_count(self, nav_index):
         """宁缺毋滥：LLM 只挑 1 个分支时不凑数。"""
-        st, _, _ = nav_index
-        nodes = [{"id": i, "title": f"t{i}", "summary": ""} for i in (1, 2, 3)]
-        with patch.object(super_tree_mod, "llm_acompletion",
-                          return_value=json.dumps({"node_ids": [2]})) as mock_llm:
-            out = await st._select_nodes("q", nodes)
-        assert out == [2]
-        mock_llm.assert_awaited_once()
+        st, db, _ = nav_index
+        _two_cluster_tree(db)
+        prompts = []
+
+        def fake(model, prompt, **kw):
+            if M_ENH not in prompt:
+                return ""
+            prompts.append(prompt)
+            titles = _candidates_in_enhance_prompt(prompt)
+            if "风控管理" in titles:
+                return _enh_response([titles["风控管理"]])  # 只挑 1 个
+            if "风控制度" in titles:
+                return _enh_response([titles["风控制度"]])
+            return _enh_response([])
+
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
+            docs = await st.navigate_tree("风控制度")
+        assert set(docs) == {1}  # 仅风控制度分支下的文档
+        assert any("财务审计" in _candidates_in_enhance_prompt(p) for p in prompts[:1])
 
     @pytest.mark.asyncio
     async def test_select_none(self, nav_index):
-        st, _, _ = nav_index
-        nodes = [{"id": i, "title": f"t{i}", "summary": ""} for i in (1, 2)]
-        with patch.object(super_tree_mod, "llm_acompletion",
-                          return_value=json.dumps({"node_ids": []})):
-            assert await st._select_nodes("q", nodes) == []
+        """L1 全拒 → 导航空结果（调用方回退扁平候选）。"""
+        st, db, _ = nav_index
+        _two_cluster_tree(db)
+        with patch.object(_enhance_module(), "llm_completion",
+                          return_value=_enh_response([])):
+            docs = await st.navigate_tree("风控")
+        assert docs == {}
 
     @pytest.mark.asyncio
     async def test_invalid_ids_filtered(self, nav_index):
-        st, _, _ = nav_index
-        nodes = [{"id": i, "title": f"t{i}", "summary": ""} for i in (1, 2)]
-        with patch.object(super_tree_mod, "llm_acompletion",
-                          return_value=json.dumps({"node_ids": [99, 1, "x", 1]})):
-            assert await st._select_nodes("q", nodes) == [1]
+        """LLM 返回未知/非法 id 被过滤，合法 id 照常展开。"""
+        st, db, _ = nav_index
+        _two_cluster_tree(db)
+
+        def fake(model, prompt, **kw):
+            if M_ENH not in prompt:
+                return ""
+            titles = _candidates_in_enhance_prompt(prompt)
+            if "风控管理" in titles:
+                return _enh_response([999, titles["风控管理"], "x", titles["风控管理"]])
+            return _enh_response(list(titles.values()))
+
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
+            docs = await st.navigate_tree("风控")
+        assert set(docs) == {1, 2}  # A 分支照常展开（非法 id 忽略，重复去重）
 
     @pytest.mark.asyncio
-    async def test_single_node_short_circuit(self, nav_index):
-        st, _, _ = nav_index
-        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
-            out = await st._select_nodes("q", [{"id": 7, "title": "t", "summary": ""}])
-        assert out == [7]
-        mock_llm.assert_not_awaited()
+    async def test_llm_failure_degrades_union_passes_through(self, nav_index):
+        """[7.7] LLM 失效不做启发式裁剪：union 候选放行，导航仍有产出。"""
+        st, db, _ = nav_index
+        _two_cluster_tree(db)
+        with patch.object(_enhance_module(), "llm_completion", return_value=""):
+            docs = await st.navigate_tree("风控")
+        # 零信号 → 全量 union → LLM 空回复降级放行 → 两簇及子簇展开
+        assert set(docs) == {1, 2, 3}
 
     @pytest.mark.asyncio
-    async def test_uses_retrieve_model(self):
-        """NFR4：新 LLM 调用点必须传 retrieve_model or model。"""
-        st = SuperTreeIndex(db=MagicMock(), model="m", client=MagicMock(),
-                            retrieve_model="r-model")
-        nodes = [{"id": i, "title": f"t{i}", "summary": ""} for i in (1, 2)]
-        with patch.object(super_tree_mod, "llm_acompletion",
-                          return_value='{"node_ids":[]}') as mock_llm:
-            await st._select_nodes("q", nodes)
-            assert mock_llm.call_args[0][0] == "r-model"
+    async def test_layer_selection_uses_retrieve_model(self, nav_index):
+        """NFR4：层精挑 LLM（enhance 内）用 retrieve_model（model 兜底）。"""
+        st, db, client = nav_index
+        _two_cluster_tree(db)
+        st2 = SuperTreeIndex(db, model="m", client=client, retrieve_model="r-model")
+        models = []
+
+        def fake(model, prompt, **kw):
+            if M_ENH in prompt:
+                models.append(model)
+            return _enh_response([])
+
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
+            await st2.navigate_tree("风控")
+        assert models and all(m == "r-model" for m in models)
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_model(self):
+    async def test_layer_selection_falls_back_to_model(self, nav_index):
         """NFR4：retrieve_model=None → 用 model。"""
-        st = SuperTreeIndex(db=MagicMock(), model="m", client=MagicMock(),
-                            retrieve_model=None)
-        nodes = [{"id": i, "title": f"t{i}", "summary": ""} for i in (1, 2)]
-        with patch.object(super_tree_mod, "llm_acompletion",
-                          return_value='{"node_ids":[]}') as mock_llm:
-            await st._select_nodes("q", nodes)
-            assert mock_llm.call_args[0][0] == "m"
+        st, db, client = nav_index
+        _two_cluster_tree(db)
+        st2 = SuperTreeIndex(db, model="m", client=client, retrieve_model=None)
+        models = []
+
+        def fake(model, prompt, **kw):
+            if M_ENH in prompt:
+                models.append(model)
+            return _enh_response([])
+
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
+            await st2.navigate_tree("风控")
+        assert models and all(m == "m" for m in models)
 
 
 # ---------------------------------------------------------------------------
@@ -410,18 +509,18 @@ class TestNavigateTree:
         _two_cluster_tree(db)
         prompts = []
 
-        async def fake(model, prompt, *a, **k):
-            if M_NAV not in prompt:
+        def fake(model, prompt, *a, **k):
+            if M_ENH not in prompt:
                 return ""
             prompts.append(prompt)
-            titles = _nodes_in_prompt(prompt)
+            titles = _candidates_in_enhance_prompt(prompt)
             if "风控管理" in titles and "财务审计" in titles:
-                return json.dumps({"node_ids": [titles["风控管理"]]})
+                return _enh_response([titles["风控管理"]])
             if "风控制度" in titles:
-                return json.dumps({"node_ids": [titles["风控制度"]]})
-            return json.dumps({"node_ids": []})
+                return _enh_response([titles["风控制度"]])
+            return _enh_response([])
 
-        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
             docs = await st.navigate_tree("风控制度")
         assert set(docs) == {1}
         assert len(prompts) == 2  # 仅 level1 + A 的 level2
@@ -429,22 +528,25 @@ class TestNavigateTree:
 
     @pytest.mark.asyncio
     async def test_parallel_branch_expansion(self, nav_index):
-        """延迟纪律：一层选中多个分支后，下一层导航并行展开（asyncio.gather）。"""
+        """延迟纪律：一层选中多个分支后，下一层导航并行展开（asyncio.gather）。
+
+        enhance 的 LLM 调用经 asyncio.to_thread（线程池），层间并行不变。
+        """
         st, db, _ = nav_index
         _two_cluster_tree(db)
         active = {"n": 0, "max": 0}
 
-        async def fake(model, prompt, *a, **k):
-            if M_NAV not in prompt:
+        def fake(model, prompt, *a, **k):
+            if M_ENH not in prompt:
                 return ""
             active["n"] += 1
             active["max"] = max(active["max"], active["n"])
-            await asyncio.sleep(0.02)
+            time.sleep(0.02)
             active["n"] -= 1
-            titles = _nodes_in_prompt(prompt)
-            return json.dumps({"node_ids": list(titles.values())})  # 全选
+            titles = _candidates_in_enhance_prompt(prompt)
+            return _enh_response(list(titles.values()))  # 全选
 
-        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
             docs = await st.navigate_tree("风控 审计")
         assert set(docs) == {1, 2, 3}
         assert active["max"] >= 2  # A/B 两支的下一层导航并行执行
@@ -462,13 +564,13 @@ class TestNavigateTree:
         db.add_corpus_membership(d1, cb, 0.9)
         db.add_corpus_membership(d2, ca, 0.6)
 
-        async def fake(model, prompt, *a, **k):
-            if M_NAV in prompt:
-                titles = _nodes_in_prompt(prompt)
-                return json.dumps({"node_ids": list(titles.values())})  # 两簇都选
+        def fake(model, prompt, *a, **k):
+            if M_ENH in prompt:
+                titles = _candidates_in_enhance_prompt(prompt)
+                return _enh_response(list(titles.values()))  # 两簇都选
             return ""
 
-        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
             docs = await st.navigate_tree("风控 合规")
         assert set(docs) == {d1, d2}
         assert docs[d1] == 0.9  # 去重后保留最大权重
@@ -480,20 +582,20 @@ class TestNavigateTree:
         st, db, client = nav_index
         _two_cluster_tree(db)
 
-        async def fake(model, prompt, *a, **k):
-            if M_NAV in prompt:
-                titles = _nodes_in_prompt(prompt)
-                return json.dumps({"node_ids": list(titles.values())})
+        def fake(model, prompt, *a, **k):
+            if M_ENH in prompt:
+                titles = _candidates_in_enhance_prompt(prompt)
+                return _enh_response(list(titles.values()))
             return ""
 
-        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
             docs = await st.navigate_tree("风控")
         assert docs
         client.search_backend.search.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_narrow_layer_skips_prefilter(self, nav_index):
-        """窄层（兄弟数 ≤ 阈值）跳过预筛，全部直接给 LLM 精挑。"""
+    async def test_narrow_layer_all_siblings_reach_llm(self, nav_index):
+        """窄层（兄弟数 ≤ 阈值）跳过信号排序，全部直达 enhance 精挑。"""
         st, db, _ = nav_index
         st._NARROW_LAYER_MAX = 8
         root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
@@ -502,40 +604,65 @@ class TestNavigateTree:
             db.insert_corpus_tree_node(root, t, "", 1, kind="cluster")
         seen = []
 
-        async def fake(model, prompt, *a, **k):
-            if M_NAV in prompt:
+        def fake(model, prompt, *a, **k):
+            if M_ENH in prompt:
                 seen.append(prompt)
-            return json.dumps({"node_ids": []})
+            return _enh_response([])
 
-        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
             await st.navigate_tree("完全无关查询")
         assert len(seen) == 1
-        got = _nodes_in_prompt(seen[0])
+        got = _candidates_in_enhance_prompt(seen[0])
         assert set(got) == set(titles)  # 5 个兄弟全部直达精挑
 
     @pytest.mark.asyncio
-    async def test_wide_layer_prefilters_before_llm(self, nav_index):
-        """宽层（兄弟数 > 阈值）先预筛到 top-k，LLM 永不直面宽扇出。"""
+    async def test_wide_layer_union_narrowing_via_profiles(self, nav_index):
+        """P2.9：宽层收窄 = 高召回 union——签名命中节点经标签通道进 union，
+        无签名兄弟不进 union（union 收窄，非 top-k 硬截）；命中节点必达精挑。"""
         st, db, _ = nav_index
         st._NARROW_LAYER_MAX = 3
-        st._NODE_PREFILTER_TOPK = 2
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
         root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
         for i in range(1, 7):
             db.insert_corpus_tree_node(root, f"无关簇{i}", "", 1, kind="cluster")
         hit = db.insert_corpus_tree_node(root, "风控专区", "", 1, kind="cluster", tag="风控")
+        db.add_corpus_membership(d1, hit, 1.0)
+        db.insert_closet_tags(d1, [(d1, "风控", "风控", 0.9, "llm")])
         seen = []
 
-        async def fake(model, prompt, *a, **k):
-            if M_NAV in prompt:
+        def fake(model, prompt, *a, **k):
+            if M_ENH in prompt:
                 seen.append(prompt)
-            return json.dumps({"node_ids": []})
+            return _enh_response([])
 
-        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
             await st.navigate_tree("风控")
-        got = _nodes_in_prompt(seen[0])
-        assert len(got) <= 2
-        assert "风控专区" in got  # 命中标签的节点必在 top-k 内
+        got = _candidates_in_enhance_prompt(seen[0])
+        assert "风控专区" in got  # 签名命中节点必在 union
+        assert len(got) == 1  # 无签名兄弟被 union 收窄（非硬截丢弃——零信号保护见专项）
         _ = hit
+
+    @pytest.mark.asyncio
+    async def test_zero_signal_wide_layer_passes_all_siblings(self, nav_index):
+        """零信号保护：宽层全无签名时全量兄弟进精挑（[1.1] 保召回，无硬丢弃）。"""
+        st, db, _ = nav_index
+        st._NARROW_LAYER_MAX = 2
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        titles = [f"普通簇{i}" for i in range(1, 8)]
+        for t in titles:
+            db.insert_corpus_tree_node(root, t, "", 1, kind="cluster")
+        seen = []
+
+        def fake(model, prompt, *a, **k):
+            if M_ENH in prompt:
+                seen.append(prompt)
+            return _enh_response([])
+
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
+            await st.navigate_tree("完全无关的查询zz")
+        assert len(seen) == 1
+        got = _candidates_in_enhance_prompt(seen[0])
+        assert set(got) == set(titles)  # 7 个兄弟全部进精挑，无一硬丢
 
 
 # ---------------------------------------------------------------------------
@@ -559,10 +686,13 @@ class TestAdaptiveSelectDocuments:
                 return json.dumps({"doc_ids": ["uuid-1"]})
             return ""
 
-        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
+        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake), \
+                patch.object(_enhance_module(), "llm_completion",
+                             side_effect=lambda m, p, **k: _enh_response([])) as mock_enh:
             result = await st.select_documents("q", {d1: 1.0, d2: 1.0})
         assert result == ["uuid-1"]
-        assert not any(M_NAV in p for p in prompts)
+        assert not any(M_ENH in p for p in prompts)
+        mock_enh.assert_not_called()  # 小语料直连：不触发树导航精挑
 
     @pytest.mark.asyncio
     async def test_massive_tier_uses_tree_navigation(self, nav_index):
@@ -573,17 +703,21 @@ class TestAdaptiveSelectDocuments:
         ids = _two_cluster_tree(db)
         client._uuid_to_db = {"uuid-1": 1, "uuid-2": 2, "uuid-3": 3}
 
-        async def fake(model, prompt, *a, **k):
-            if M_NAV in prompt:
-                titles = _nodes_in_prompt(prompt)
-                if "风控管理" in titles and "财务审计" in titles:
-                    return json.dumps({"node_ids": [titles["风控管理"]]})
-                return json.dumps({"node_ids": list(titles.values())})
+        async def fake_acompletion(model, prompt, *a, **k):
             if M_DOC in prompt:
                 return json.dumps({"doc_ids": ["uuid-2"]})  # 只挑 1 篇（宁缺毋滥）
             return ""
 
-        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
+        def fake_completion(model, prompt, *a, **k):
+            if M_ENH in prompt:
+                titles = _candidates_in_enhance_prompt(prompt)
+                if "风控管理" in titles and "财务审计" in titles:
+                    return _enh_response([titles["风控管理"]])
+                return _enh_response(list(titles.values()))
+            return ""
+
+        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake_acompletion), \
+                patch.object(_enhance_module(), "llm_completion", side_effect=fake_completion):
             result = await st.select_documents("风控制度", {1: 1.0, 2: 1.0, 3: 1.0})
         assert result == ["uuid-2"]
         _ = ids
@@ -608,7 +742,7 @@ class TestAdaptiveSelectDocuments:
         with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
             result = await st.select_documents("q", {d1: 1.0, d2: 1.0})
         assert result == ["uuid-2"]
-        assert not any(M_NAV in p for p in prompts)
+        assert not any(M_ENH in p for p in prompts)  # 无树 → 无逐层精挑
 
     @pytest.mark.asyncio
     async def test_massive_nav_empty_falls_back_flat(self, nav_index):
@@ -619,14 +753,14 @@ class TestAdaptiveSelectDocuments:
         _two_cluster_tree(db)
         client._uuid_to_db = {"uuid-1": 1, "uuid-2": 2, "uuid-3": 3}
 
-        async def fake(model, prompt, *a, **k):
-            if M_NAV in prompt:
-                return json.dumps({"node_ids": []})  # 树导航无人命中
+        async def fake_acompletion(model, prompt, *a, **k):
             if M_DOC in prompt:
                 return json.dumps({"doc_ids": ["uuid-3"]})
             return ""
 
-        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
+        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake_acompletion), \
+                patch.object(_enhance_module(), "llm_completion",
+                             side_effect=lambda m, p, **k: _enh_response([])):
             result = await st.select_documents("q", {1: 1.0, 2: 1.0, 3: 1.0})
         assert result == ["uuid-3"]
 
@@ -680,3 +814,266 @@ class TestAdaptiveSelectDocuments:
             result = await st.select_documents("风控", {d1: 1.0, d2: 1.0})
         assert result == ["uuid-1"]
         spy.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# T6.4 簇聚合签名（unit=层分支节点；子树 top 实体/关键词/标签 + run 缓存）
+# ---------------------------------------------------------------------------
+
+
+class TestClusterProfileAggregation:
+    """查询时簇聚合签名：真实 DB 夹具验证实体/关键词/标签聚合与上限。"""
+
+    def test_aggregates_entities_keywords_tags_from_subtree(self, nav_index):
+        st, db, _ = nav_index
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        d2 = db.insert_document("b.pdf", "/tmp/b.pdf")
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        cluster = db.insert_corpus_tree_node(root, "风控管理", "", 1, kind="cluster")
+        db.add_corpus_membership(d1, cluster, 1.0)
+        db.add_corpus_membership(d2, cluster, 0.5)
+
+        eid_zs = db.insert_entity("person", "张三")
+        eid_ls = db.insert_entity("person", "李四")
+        db.insert_entity_mention(eid_zs, d1, confidence=0.9)
+        db.insert_entity_mention(eid_zs, d2, confidence=0.8)
+        db.insert_entity_mention(eid_ls, d1, confidence=0.7)
+        db.upsert_node_profiles(d1, [
+            {"node_id": "n1", "entities": [], "keywords": ["风控", "合规"], "tags": []},
+        ])
+        db.upsert_node_profiles(d2, [
+            {"node_id": "n2", "entities": [], "keywords": ["风控", "审计"], "tags": []},
+        ])
+        db.insert_closet_tags(d1, [
+            (d1, "风险管理", "风控", 0.9, "llm"),
+            (d1, "原词兜底", "兜底", 0.5, "fallback"),  # fallback 源不进语义漏斗
+        ])
+        db.insert_closet_tags(d2, [(d2, "风险管理", "风控", 0.8, "llm")])
+
+        view = st._load_corpus_tree()
+        profile = st._aggregate_cluster_profile(cluster, view, {})
+
+        # 实体：跨文档频次排序（张三 2 篇 > 李四 1 篇），canonical 名来自 entities 表
+        assert [e["name"] for e in profile["entities"]] == ["张三", "李四"]
+        # 关键词：风控 2 次排前
+        assert profile["keywords"][0] == "风控"
+        assert set(profile["keywords"]) == {"风控", "合规", "审计"}
+        # 标签：只认 source='llm'（closet_tags 源门控，[7.2]）
+        assert profile["tags"] == ["风险管理"]
+
+    def test_entity_table_distance_annotation(self, nav_index):
+        """[3.3] L0 实体距离作证据：命中 entity_table 的实体注释距离/关系类型。"""
+        st, db, _ = nav_index
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        cluster = db.insert_corpus_tree_node(root, "簇", "", 1, kind="cluster")
+        db.add_corpus_membership(d1, cluster, 1.0)
+        eid = db.insert_entity("person", "张三")
+        db.insert_entity_mention(eid, d1, confidence=0.9)
+        view = st._load_corpus_tree()
+        table = {eid: {"distance": 1, "relation_type": "part_of",
+                       "weight": 0.56, "name": "张三"}}
+        profile = st._aggregate_cluster_profile(cluster, view, table)
+        assert profile["entities"][0]["name"] == "张三"
+        assert "图谱距离1" in profile["entities"][0]["type"]
+        assert "part_of" in profile["entities"][0]["type"]
+
+    def test_caps_entities_keywords_tags(self, nav_index):
+        """聚合上限：实体 ≤5 / 关键词 ≤8 / 标签 ≤3。"""
+        st, db, _ = nav_index
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        cluster = db.insert_corpus_tree_node(root, "簇", "", 1, kind="cluster")
+        db.add_corpus_membership(d1, cluster, 1.0)
+        db.upsert_node_profiles(d1, [
+            {"node_id": "n1", "entities": [],
+             "keywords": [f"关键词{i}" for i in range(10)], "tags": []},
+        ])
+        for i in range(6):
+            db.insert_entity_mention(db.insert_entity("c", f"实体{i}"), d1, confidence=0.9)
+        db.insert_closet_tags(
+            d1, [(d1, f"标签{i}", f"标签{i}", 0.9, "llm") for i in range(5)],
+        )
+        view = st._load_corpus_tree()
+        profile = st._aggregate_cluster_profile(cluster, view, {})
+        assert len(profile["entities"]) == 5
+        assert len(profile["keywords"]) == 8
+        assert len(profile["tags"]) == 3
+
+    def test_doc_sampling_cap(self, nav_index):
+        """子树成本守卫：只采样排序前 _CLUSTER_PROFILE_MAX_DOCS 篇成员文档。"""
+        st, db, _ = nav_index
+        st._CLUSTER_PROFILE_MAX_DOCS = 2
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        cluster = db.insert_corpus_tree_node(root, "簇", "", 1, kind="cluster")
+        for i in range(3):
+            d = db.insert_document(f"d{i}.pdf", f"/tmp/{i}.pdf")
+            db.add_corpus_membership(d, cluster, 1.0)
+            db.upsert_node_profiles(d, [
+                {"node_id": "n1", "entities": [], "keywords": [f"kw{i}"], "tags": []},
+            ])
+        view = st._load_corpus_tree()
+        profile = st._aggregate_cluster_profile(cluster, view, {})
+        # 成员文档按 id 排序取前 2 篇 → 第 3 篇的 kw2 不被采样
+        assert "kw2" not in profile["keywords"]
+        assert len(profile["keywords"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_profile_cache_avoids_recomputation(self, nav_index):
+        """run-scoped 缓存：同一簇二次 _navigate_level 不重复聚合查询。"""
+        st, db, _ = nav_index
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        c1 = db.insert_corpus_tree_node(root, "簇甲", "", 1, kind="cluster")
+        db.add_corpus_membership(d1, c1, 1.0)
+
+        calls = {"n": 0}
+        real_mentions = db.get_entity_mentions_by_doc
+
+        def spy(doc_id):
+            calls["n"] += 1
+            return real_mentions(doc_id)
+
+        db.get_entity_mentions_by_doc = spy
+        view = st._load_corpus_tree()
+        enhancer = _enhance_module().UnifiedNodeEnhancement("m")
+        cache = {}
+        siblings = view.children_of(root)
+        with patch.object(_enhance_module(), "llm_completion",
+                          side_effect=lambda m, p, **k: _enh_response([])):
+            await st._navigate_level("q", siblings, view, {}, enhancer, [], cache)
+            first = calls["n"]
+            await st._navigate_level("q", siblings, view, {}, enhancer, [], cache)
+            second = calls["n"]
+        assert first >= 1          # 首次惰性聚合
+        assert second == first     # 第二次全命中缓存，无新聚合查询
+
+    @pytest.mark.asyncio
+    async def test_profile_evidence_drives_layer_selection_end_to_end(self, nav_index):
+        """聚合签名驱动逐层精挑：实体证据接地进 prompt，LLM 依证据选分支。"""
+        st, db, _ = nav_index
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        d2 = db.insert_document("b.pdf", "/tmp/b.pdf")
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        ca = db.insert_corpus_tree_node(root, "人物档案", "", 1, kind="cluster")
+        cb = db.insert_corpus_tree_node(root, "财务报表", "", 1, kind="cluster")
+        db.add_corpus_membership(d1, ca, 1.0)
+        db.add_corpus_membership(d2, cb, 1.0)
+        eid = db.insert_entity("person", "张三")
+        db.insert_entity_mention(eid, d1, confidence=0.9)
+        prompts = []
+
+        def fake(model, prompt, **kw):
+            if M_ENH in prompt:
+                prompts.append(prompt)
+                if "实体匹配：张三" in prompt:
+                    titles = _candidates_in_enhance_prompt(prompt)
+                    return _enh_response([titles["人物档案"]])
+            return _enh_response([])
+
+        with patch.object(_enhance_module(), "llm_completion", side_effect=fake):
+            docs = await st.navigate_tree("张三的档案")
+        assert docs == {d1: 1.0}
+        assert "实体匹配：张三" in prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# T6.4/[3.2.1] 延迟池 + pool_concern 层重试（cap×2，只重跑本层）
+# ---------------------------------------------------------------------------
+
+
+class TestLayerDeferredAndRetry:
+    """收窄纪律：超限候选进延迟池（暴露可回捞）；pool_concern + deferred →
+    本层放宽 cap×2 重跑 enhance 一次（不回溯上层）。"""
+
+    def _four_tagged_clusters(self, db):
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        for i in range(1, 5):
+            d = db.insert_document(f"d{i}.pdf", f"/tmp/{i}.pdf")
+            c = db.insert_corpus_tree_node(root, f"风控簇{i}", "", 1, kind="cluster")
+            db.add_corpus_membership(d, c, 1.0)
+            db.insert_closet_tags(d, [(d, "风控", "风控", 0.9, "llm")])
+        return root
+
+    @pytest.mark.asyncio
+    async def test_overflow_deferred_surfaced_and_retry_relaxes_cap(self, nav_index):
+        from pageindex_mutil.agentic.enhance import POOL_CONCERN_RETRY_CAP_MULTIPLIER
+        st, db, _ = nav_index
+        self._four_tagged_clusters(db)
+
+        UnifiedNodeEnhancement = _enhance_module().UnifiedNodeEnhancement
+        calls, results = [], []
+
+        class SpyEnhancer(UnifiedNodeEnhancement):
+            def __init__(self, model, retrieve_model=None):
+                super().__init__(model, retrieve_model=retrieve_model)
+                self.union_max_candidates = 2  # union=4 > cap=2 → deferred 2
+
+            async def enhance_and_select(self, query, candidates, profiles,
+                                         query_entities=None, node_budget=None,
+                                         token_budget=None, max_candidates=None):
+                calls.append(max_candidates)
+                result = await super().enhance_and_select(
+                    query, candidates, profiles, query_entities=query_entities,
+                    node_budget=node_budget, token_budget=token_budget,
+                    max_candidates=max_candidates,
+                )
+                results.append(result)
+                return result
+
+        def fake(model, prompt, **kw):
+            if M_ENH in prompt:
+                titles = _candidates_in_enhance_prompt(prompt)
+                return _enh_response(list(titles.values()), pool_concern=True,
+                                     concern_reason="疑似漏掉分支")
+            return ""
+
+        with patch.object(_enhance_module(), "UnifiedNodeEnhancement", SpyEnhancer), \
+                patch.object(_enhance_module(), "llm_completion", side_effect=fake):
+            docs = await st.navigate_tree("风控")
+
+        # union=4 > cap=2 → 被截 2 个进延迟池（暴露可回捞，不硬丢）
+        assert len(results[0]["deferred"]) == 2
+        # pool_concern + deferred → 重跑本层一次：cap ×POOL_CONCERN_RETRY_CAP_MULTIPLIER
+        assert calls[0] is None
+        assert calls[1] == 2 * POOL_CONCERN_RETRY_CAP_MULTIPLIER
+        assert len(calls) == 2  # 只重跑一次
+        # 重跑后 union 全量 4 簇进精挑并被选中展开
+        assert len(docs) == 4
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_union_fits(self, nav_index):
+        """union 未超限（deferred 为空）→ 仅 pool_concern 不触发层重试。"""
+        st, db, _ = nav_index
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        d = db.insert_document("d.pdf", "/tmp/d.pdf")
+        c = db.insert_corpus_tree_node(root, "风控簇", "", 1, kind="cluster")
+        db.add_corpus_membership(d, c, 1.0)
+        db.insert_closet_tags(d, [(d, "风控", "风控", 0.9, "llm")])
+
+        UnifiedNodeEnhancement = _enhance_module().UnifiedNodeEnhancement
+        calls = []
+
+        class SpyEnhancer(UnifiedNodeEnhancement):
+            async def enhance_and_select(self, query, candidates, profiles,
+                                         query_entities=None, node_budget=None,
+                                         token_budget=None, max_candidates=None):
+                calls.append(max_candidates)
+                return await super().enhance_and_select(
+                    query, candidates, profiles, query_entities=query_entities,
+                    node_budget=node_budget, token_budget=token_budget,
+                    max_candidates=max_candidates,
+                )
+
+        def fake(model, prompt, **kw):
+            if M_ENH in prompt:
+                titles = _candidates_in_enhance_prompt(prompt)
+                return _enh_response(list(titles.values()), pool_concern=True,
+                                     concern_reason="证据偏弱")
+            return ""
+
+        with patch.object(_enhance_module(), "UnifiedNodeEnhancement", SpyEnhancer), \
+                patch.object(_enhance_module(), "llm_completion", side_effect=fake):
+            docs = await st.navigate_tree("风控")
+        assert calls == [None]  # 无被截候选 → 不重跑
+        assert len(docs) == 1

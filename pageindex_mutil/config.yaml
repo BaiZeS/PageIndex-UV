@@ -57,8 +57,7 @@ hierarchy_boost_weight: 1.0
 # P2 量级自适应 + 语义树导航参数（[S5]/[S6]，阈值为标定目标，可调整）
 scale_small_max_docs: 50    # 文档数 < 该值 → 小语料直连（跳过层级）
 scale_massive_min_docs: 500 # 文档数 >= 该值 → 海量层级树导航
-node_prefilter_topk: 20     # 宽层语义预筛 top-k
-narrow_layer_max: 16        # 兄弟数 <= 该值视为窄层，跳过预筛直接给 LLM
+narrow_layer_max: 16        # 兄弟数 <= 该值视为窄层，跳过信号排序直接进精挑
 entity_boost_weight: 1.0    # 图谱实体命中加权强度
 node_keyword_topk: 5        # 节点签名显著词个数（TF-IDF top-K，[2.1] keywords）
 # P2 统一检索增强（UnifiedNodeEnhancement，[3.2]/[1.2]/[7.4]）

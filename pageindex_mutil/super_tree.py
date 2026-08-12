@@ -128,8 +128,8 @@ class KBIdentity:
 
 
 import asyncio
-from collections import defaultdict
-from typing import Set, Dict, List, Optional
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional
 
 from .utils import llm_acompletion, count_tokens, extract_json
 
@@ -196,9 +196,15 @@ class SuperTreeIndex:
     _SMALL_MAX_DOCS = 50     # 文档数 < 该值 → 小语料直连（跳过层级遍历）
     _MASSIVE_MIN_DOCS = 500  # 文档数 >= 该值 → 海量层级树导航
     # P2 语义树导航（[S6]）
-    _NODE_PREFILTER_TOPK = 20   # 宽层语义预筛 top-k
-    _NARROW_LAYER_MAX = 16      # 兄弟数 <= 该值视为窄层：跳过预筛直接给 LLM
+    _NARROW_LAYER_MAX = 16      # 兄弟数 <= 该值视为窄层：跳过信号排序直接进精挑
     _ENTITY_BOOST_WEIGHT = 1.0  # 实体命中加权强度（图谱信号，[S6]②）
+    # P2.9/T6.4 簇聚合签名（query-time，[3.2.1] unit=层分支节点）：
+    # 语料树簇节点无自身 node_profiles 行，导航期从子树惰性聚合一次，
+    # 经 navigate_tree 的 run-scoped 缓存按层复用（树导航期树静态）。
+    _CLUSTER_PROFILE_MAX_DOCS = 20       # 每簇采样子树成员文档数上限（成本守卫，取排序前缀，确定性）
+    _CLUSTER_PROFILE_MAX_ENTITIES = 5    # 聚合实体上限（entity_mentions canonical 名）
+    _CLUSTER_PROFILE_MAX_KEYWORDS = 8    # 聚合关键词上限（成员文档 node_profiles）
+    _CLUSTER_PROFILE_MAX_TAGS = 3        # 聚合标签上限（closet_tags source='llm'）
 
     def __init__(self, db, model: str, client, retrieve_model: str = None):
         self.db = db
@@ -228,7 +234,6 @@ class SuperTreeIndex:
             self._HIERARCHY_BOOST_WEIGHT = getattr(cfg, "hierarchy_boost_weight", self._HIERARCHY_BOOST_WEIGHT)
             self._SMALL_MAX_DOCS = getattr(cfg, "scale_small_max_docs", self._SMALL_MAX_DOCS)
             self._MASSIVE_MIN_DOCS = getattr(cfg, "scale_massive_min_docs", self._MASSIVE_MIN_DOCS)
-            self._NODE_PREFILTER_TOPK = getattr(cfg, "node_prefilter_topk", self._NODE_PREFILTER_TOPK)
             self._NARROW_LAYER_MAX = getattr(cfg, "narrow_layer_max", self._NARROW_LAYER_MAX)
             self._ENTITY_BOOST_WEIGHT = getattr(cfg, "entity_boost_weight", self._ENTITY_BOOST_WEIGHT)
         except Exception:
@@ -761,21 +766,23 @@ class SuperTreeIndex:
     def _prefilter_nodes(self, query: str, nodes: List[dict],
                          view: _CorpusTreeView = None,
                          entity_table: Dict[int, Dict] = None) -> List[dict]:
-        """[S6]① 宽层语义预筛：四通道打分，筛到 top-k。
+        """[S6]① 宽层候选排序：四通道信号强度降序（P2.9：不丢弃任何节点）。
 
-        保召回：无任何匹配信号时原样全量返回（绝不硬过滤，由 LLM 精挑裁决）。
+        旧 `_NODE_PREFILTER_TOPK` 硬截断已废除——收窄统一由 enhance_and_select
+        承担（union cap + 延迟池），本方法只把信号节点排在零信号节点之前。
+        零信号层原样全量返回（稳定排序保序）；超限候选的唯一去处是 enhance 的
+        deferred 池（[3.2.1] 收窄纪律：任何一层不得"分数硬截后直接丢弃"）。
         """
         if not nodes:
             return []
         scores = self._score_nodes(query, nodes, view, entity_table)
-        # 零信号保召回：四个通道全部无命中时不截断，全量交给 LLM 精挑
+        # 零信号保召回：四个通道全部无命中时原样返回（稳定保序）
         if not any(s["total_score"] > 0 for s in scores.values()):
             return list(nodes)
-        # Sort by total_score descending
-        ranked = sorted(nodes,
-                       key=lambda n: scores.get(n["id"], {}).get("total_score", 0.0),
-                       reverse=True)
-        return ranked[: self._NODE_PREFILTER_TOPK]
+        # 信号强度降序（稳定排序：平分保持输入序）
+        return sorted(nodes,
+                      key=lambda n: scores.get(n["id"], {}).get("total_score", 0.0),
+                      reverse=True)
 
     # ------------------------------------------------------------------
     # Entity distance precomputation (L0, one BFS, level-by-level lookup)
@@ -898,94 +905,99 @@ class SuperTreeIndex:
 
         return best_boost, best_entity
 
-    async def _select_nodes(self, query: str, nodes: List[dict],
-                            node_scores: Dict[int, Dict] = None) -> List[int]:
-        """[S6]③ LLM 推理精挑：读节点摘要 + 四通道分数 + 图谱加权证据，可变数量挑选、宁缺毋滥。
+    # ------------------------------------------------------------------
+    # 簇聚合签名（[3.2.1] unit=层分支节点；query-time，run-scoped 缓存）
+    # ------------------------------------------------------------------
+    def _aggregate_cluster_profile(self, node_id: int, view: _CorpusTreeView,
+                                   entity_table: Dict[int, Dict]) -> Dict:
+        """簇节点查询时聚合签名：子树 top 实体 + top 关键词 + top 标签。
 
-        T9 推理挑选（H02 修复）泛化到树分支；返回选中的节点 id 列表。
+        语料树簇节点没有自己的 node_profiles 行，从子树成员文档聚合：
+        ①实体——entity_mentions canonical 名（JOIN entities 的规范名），按
+          (doc, entity) 计数取 top，命中 L0 实体距离表者在 type 注释
+          "图谱距离d·relation_type"（[3.3] distance/type 显式呈现为证据）；
+        ②关键词——成员文档 node_profiles.keywords 并集计数 top；
+        ③标签——成员文档级 closet_tags（source='llm' 才进语义漏斗，[7.2]）。
+        成员文档取排序前 _CLUSTER_PROFILE_MAX_DOCS 篇（子树查询成本守卫）。
+        调用方按 navigate_tree run 缓存（树导航期树静态，算一次逐层复用）。
+        永不抛出：任何 DB 异常退化为空签名（enhance 对空证据优雅降级，[7.7]）。
         """
-        if not nodes:
-            return []
-        if len(nodes) == 1:
-            return [nodes[0]["id"]]
+        profile: Dict = {"entities": [], "keywords": [], "tags": []}
+        try:
+            doc_ids = sorted(view.subtree_doc_ids(node_id))[: self._CLUSTER_PROFILE_MAX_DOCS]
+        except Exception:
+            return profile
+        if not doc_ids:
+            return profile
 
-        # Build node info with evidence
-        node_list = []
-        for n in nodes:
-            info = {
-                "node_id": n["id"],
-                "title": n.get("title", ""),
-                "summary": (n.get("summary") or "")[: self._SUMMARY_MAX_LEN]
-            }
+        ent_counts: Counter = Counter()
+        ent_meta: Dict[str, Dict] = {}
+        kw_counts: Counter = Counter()
+        tag_counts: Counter = Counter()
 
-            # Add channel scores if available
-            if node_scores and n["id"] in node_scores:
-                scores = node_scores[n["id"]]
-                if scores.get("tag_score", 0) > 0:
-                    info["tag_score"] = round(scores["tag_score"], 2)
-                if scores.get("bm25_score", 0) > 0:
-                    info["bm25_score"] = round(scores["bm25_score"], 2)
-                if scores.get("vector_score", 0) > 0:
-                    info["vector_score"] = round(scores["vector_score"], 2)
-
-                # Add entity boost evidence if available
-                if scores.get("entity_boost", 0) > 0:
-                    info["entity_boost"] = round(scores["entity_boost"], 2)
-                    if scores.get("entity_info"):
-                        entity = scores["entity_info"]
-                        info["entity_relation"] = {
-                            "name": entity.get("name", ""),
-                            "type": entity.get("relation_type", ""),
-                            "distance": entity.get("distance", -1)
-                        }
-
-            node_list.append(info)
-
-        prompt = f"""你是一个知识库树导航精挑专家（语义树导航·逐层精挑）。给定用户问题与当前层的候选分支节点（含标题、摘要和四通道分数），请挑选出可能包含答案的分支（可变数量）。
-
-[用户问题]
-{query}
-
-[候选分支节点]
-{json.dumps(node_list, ensure_ascii=False)}
-
-要求：
-1. 只挑真正可能包含答案的分支；若没有足够相关的，可以少选甚至不选。
-2. 宁缺毋滥：不要为凑数而挑选不相关的分支。
-3. 基于分支标题与摘要判断相关性。
-4. 综合考虑四通道分数：
-   - tag_score: 标签匹配（语义相关性）
-   - bm25_score: 关键词匹配（词面匹配）
-   - vector_score: 向量相似度（语义相似）
-   - entity_relation: 实体关系（图谱加权）
-     - distance=0: 直接包含查询实体
-     - distance=1: 包含与查询实体有直接关系的实体
-     - relation_type: causal(因果) > part_of(组成) > related_to(相关)
-
-返回JSON格式：{{"node_ids": [1, 2]}}
-直接返回JSON，不要其他内容。"""
-        response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
-        if not response:
-            return []
-        data = extract_json(response)
-        if not isinstance(data, dict):
-            return []
-        picked = data.get("node_ids", [])
-        if not isinstance(picked, list):
-            return []
-        valid = {n["id"] for n in nodes}
-        selected = []
-        for nid in picked:
+        for doc_id in doc_ids:
             try:
-                nid = int(nid)
-            except (TypeError, ValueError):
-                continue
-            if nid in valid and nid not in selected:
-                selected.append(nid)
-        return selected
+                mentions = self.db.get_entity_mentions_by_doc(doc_id)
+            except Exception:
+                mentions = []
+            seen_ent = set()
+            for m in mentions or []:
+                if not isinstance(m, dict):
+                    continue
+                eid, name = m.get("entity_id"), m.get("entity_name")
+                if not eid or not isinstance(name, str) or not name.strip():
+                    continue
+                key = name.strip()
+                if key in seen_ent:
+                    continue  # 同文档只计一次，防高频重复提及拉偏
+                seen_ent.add(key)
+                ent_counts[key] += 1
+                ent_meta.setdefault(key, {
+                    "entity_id": eid, "entity_type": m.get("entity_type") or "",
+                })
+
+            try:
+                rows = self.db.get_node_profiles(doc_id)
+            except Exception:
+                rows = []
+            for p in rows or []:
+                for kw in (p.get("keywords") if isinstance(p, dict) else None) or []:
+                    if isinstance(kw, str) and kw.strip():
+                        kw_counts[kw.strip()] += 1
+
+            try:
+                tags = self.db.get_doc_tags(doc_id, source="llm")
+            except Exception:
+                tags = []
+            seen_tag = set()
+            for t in tags or []:
+                text = t.get("tag_text", "").strip() if isinstance(t, dict) else ""
+                if not text:
+                    continue
+                key = text.casefold()
+                if key in seen_tag:
+                    continue
+                seen_tag.add(key)
+                tag_counts[text] += 1
+
+        profile["keywords"] = [kw for kw, _ in kw_counts.most_common(self._CLUSTER_PROFILE_MAX_KEYWORDS)]
+        profile["tags"] = [tag for tag, _ in tag_counts.most_common(self._CLUSTER_PROFILE_MAX_TAGS)]
+
+        entities = []
+        for name, _cnt in ent_counts.most_common(self._CLUSTER_PROFILE_MAX_ENTITIES):
+            meta = ent_meta.get(name, {})
+            etype = meta.get("entity_type") or ""
+            info = (entity_table or {}).get(meta.get("entity_id"))
+            if info:
+                # [3.3] 实体距离/关系类型作证据呈现（不参与排序裁剪）
+                suffix = f"图谱距离{info.get('distance', -1)}·{info.get('relation_type', '')}"
+                etype = f"{etype}·{suffix}" if etype else suffix
+            entities.append({"name": name, "type": etype})
+        profile["entities"] = entities
+        return profile
 
     async def navigate_tree(self, query: str) -> Optional[Dict[int, float]]:
-        """[S6] 层级树导航：逐层预筛→加权→精挑，渐进披露，分支并行展开。
+        """[S6] 层级树导航：逐层 enhance_and_select 精挑（[3.2.1]），渐进披露，分支并行展开。
 
         返回 doc_id→weight（软归属按 doc_id 去重、保留最大权重）；
         语料树未建返回 None（调用方降级扁平管线）；树存在但无命中返回 {}。
@@ -998,29 +1010,77 @@ class SuperTreeIndex:
             return {}
 
         # L0: Precompute entity distances (one BFS, level-by-level lookup)
+        # [3.3] 实体距离保留为证据源：排序加权 + 簇签名 distance/type 注释。
         entity_table = self._precompute_entity_distances(query)
 
-        return await self._navigate_level(query, top_nodes, view, entity_table)
+        from .agentic.enhance import UnifiedNodeEnhancement, resolve_query_entities
+        query_entities = resolve_query_entities(self.db, query, limit=5)
+        # NFR4: 层精挑 LLM 经 enhance_and_select 用 retrieve_model（model 兜底）
+        enhancer = UnifiedNodeEnhancement(self.model, retrieve_model=self.retrieve_model)
+        # run-scoped 签名缓存：树导航期树静态，簇聚合签名算一次逐层复用
+        profile_cache: Dict[int, Dict] = {}
+
+        return await self._navigate_level(
+            query, top_nodes, view, entity_table, enhancer, query_entities, profile_cache
+        )
 
     async def _navigate_level(self, query: str, siblings: List[dict],
-                              view: _CorpusTreeView, entity_table: Dict[int, Dict]) -> Dict[int, float]:
-        """单层导航：四通道初筛→图谱加权(查表)→LLM精挑→只展开选中分支。"""
+                              view: _CorpusTreeView, entity_table: Dict[int, Dict],
+                              enhancer, query_entities: list,
+                              profile_cache: Dict[int, Dict]) -> Dict[int, float]:
+        """单层导航：enhance_and_select 是唯一收窄入口（[3.2.1] unit=该层分支节点）。
+
+        P2.9：宽层不再有 top-k 硬截断——_prefilter_nodes 只排序不丢弃，
+        超限候选统一进 enhance 的延迟池（deferred，唯一溢出去处，可经
+        pool_concern 回捞）；零信号层全量进精挑。pool_concern 且有被截候选 →
+        本层放宽 cap 重跑 enhance 一次（不回溯上层，不重走已选分支）。
+        """
         if not siblings:
             return {}
 
-        # ① 四通道初筛（缩小当前层候选节点范围）
+        # ① 候选排序：宽层按四通道信号强度排序（不丢弃）；窄层原样直达
         if len(siblings) > self._NARROW_LAYER_MAX:
-            candidates = self._prefilter_nodes(query, siblings, view, entity_table)
+            ordered = self._prefilter_nodes(query, siblings, view, entity_table)
         else:
-            candidates = list(siblings)
+            ordered = list(siblings)
 
-        # ② 图谱加权（查表，不重新 BFS）- 已集成到 _score_nodes
-        # 获取节点分数信息用于 LLM
-        node_scores = self._score_nodes(query, candidates, view, entity_table)
+        # ② unit = 该层分支节点：候选 + 簇聚合签名（run 缓存）
+        candidates = [
+            {
+                "node_id": n["id"],
+                "title": n.get("title") or "",
+                "summary": (n.get("summary") or "")[: self._SUMMARY_MAX_LEN],
+            }
+            for n in ordered
+        ]
+        profiles: Dict = {}
+        for n in ordered:
+            prof = profile_cache.get(n["id"])
+            if prof is None:
+                prof = self._aggregate_cluster_profile(n["id"], view, entity_table)
+                profile_cache[n["id"]] = prof
+            profiles[n["id"]] = prof
 
-        # ③ LLM精挑（看到完整证据做决策）
-        picked_ids = set(await self._select_nodes(query, candidates, node_scores))
-        picked = [n for n in candidates if n["id"] in picked_ids]
+        # ③ 高召回 union + 证据接地 + LLM 精挑（唯一裁剪者）
+        result = await enhancer.enhance_and_select(
+            query, candidates, profiles, query_entities=query_entities,
+        )
+        # [3.2.1] pool_concern 且有被截候选 → 放宽 union 上限重跑本层一次
+        if result["pool_concern"] and result["deferred"]:
+            from .agentic.enhance import POOL_CONCERN_RETRY_CAP_MULTIPLIER
+            result = await enhancer.enhance_and_select(
+                query, candidates, profiles, query_entities=query_entities,
+                max_candidates=max(1, int(enhancer.union_max_candidates))
+                * POOL_CONCERN_RETRY_CAP_MULTIPLIER,
+            )
+
+        picked_ids = set()
+        for nid in result["selected_ids"]:
+            try:
+                picked_ids.add(int(nid))
+            except (TypeError, ValueError):
+                continue
+        picked = [n for n in siblings if n["id"] in picked_ids]
 
         docs: Dict[int, float] = {}
         subtasks = []
@@ -1029,7 +1089,10 @@ class SuperTreeIndex:
                 docs[doc_id] = max(docs.get(doc_id, 0.0), float(weight))
             children = view.children_of(node["id"])
             if children:
-                subtasks.append(self._navigate_level(query, children, view, entity_table))
+                subtasks.append(self._navigate_level(
+                    query, children, view, entity_table, enhancer,
+                    query_entities, profile_cache,
+                ))
         if subtasks:
             # 延迟纪律（[S6]）：一层选中多个分支后，下一层导航并行展开
             results = await asyncio.gather(*subtasks, return_exceptions=True)

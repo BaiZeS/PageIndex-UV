@@ -200,15 +200,21 @@ class TestSearchSuperTree:
             queries=["test query"], weights={}, query_type="factual"
         ))
 
-        # Mock _act_tree_search to return context
-        router._act_tree_search = AsyncMock(return_value=(
-            "some context",           # ctx
-            [{"node_id": "n1", "title": "Section 1"}],  # nodes
-            1,                        # src_docs
-            1,                        # cov_nodes
-            {"uuid-1": [1, 2]},       # doc_pages_map
-            [{"doc_id": "uuid-1", "page": 1}],  # pages_with_text
-        ))
+        # Mock _act_tree_search to return context（T6.4：回填证据派生分数）
+        async def fake_act(query, docs, node_matches=None, doc_scores_out=None):
+            if doc_scores_out is not None:
+                # 节点召回覆盖度（evidence-derived，(0,1]）
+                doc_scores_out["uuid-1"] = 1.0
+            return (
+                "some context",           # ctx
+                [{"node_id": "n1", "title": "Section 1"}],  # nodes
+                1,                        # src_docs
+                1,                        # cov_nodes
+                {"uuid-1": [1, 2]},       # doc_pages_map
+                [{"doc_id": "uuid-1", "page": 1}],  # pages_with_text
+            )
+
+        router._act_tree_search = AsyncMock(side_effect=fake_act)
 
         # Mock verifier
         mock_verify_result = MagicMock()
@@ -223,6 +229,7 @@ class TestSearchSuperTree:
 
         assert result["answer"] == "test answer"
         assert result["confidence"] == "high"
+        # matched_docs score = 召回覆盖度（evidence-derived），不再硬编码
         assert result["matched_docs"] == [{"doc_id": "uuid-1", "score": 1.0}]
         assert len(result["selected_nodes"]) == 1
         assert result["selected_nodes"][0]["node_id"] == "n1"
@@ -242,7 +249,8 @@ class TestSearchSuperTree:
         result = await router._search_super_tree("test query", top_k=3)
         assert "Failed to retrieve content" in result["answer"]
         assert result["confidence"] == "unknown"
-        assert result["matched_docs"] == [{"doc_id": "uuid-1", "score": 1.0}]
+        # T6.4 score 语义统一：Act 失败无节点级证据接地 → 不虚报匹配
+        assert result["matched_docs"] == []
 
     @pytest.mark.asyncio
     async def test_verifier_refuse(self, router):

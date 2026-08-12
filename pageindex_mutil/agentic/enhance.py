@@ -36,6 +36,12 @@ SUMMARY_MAX_CHARS = 200
 _DEFAULT_UNION_MAX_CANDIDATES = 80
 _DEFAULT_EVIDENCE_MAX_CHARS = 6000
 
+# [3.2.1] pool_concern 重选：union 上限放宽倍数。候选/签名不变，被截候选经
+# union 自然回池，该参数只抬高上限让延迟池节点重新可被 LLM 精挑。
+# 三个接入点（单文档 _search_single / 多文档 _recall_nodes_for_doc /
+# 语料树逐层 _navigate_level）共用同一倍数约定。
+POOL_CONCERN_RETRY_CAP_MULTIPLIER = 2
+
 
 def _coerce_cap(value):
     """cap 强制：合法值钳到 ≥1；非数值/无效值 → None（调用方回退下一级，绝不抛出）。"""
@@ -477,3 +483,48 @@ def resolve_query_entities(db, query, limit=5) -> list:
             for alias in aliases:
                 _add(alias)
     return names
+
+
+def resolve_node_profiles(db, db_doc_id, mapping) -> dict:
+    """逐节点证据签名解析（共享助手，[3.4]/[3.2.1]）。
+
+    解析序：DB node_profiles 表优先（索引期权威签名；db_doc_id 必须是 documents
+    表的整数 id——调用方经 _id_mapper.to_db 转换）；DB 无行时回退 structure 节点
+    字典自带的 entities/keywords/tags 键（异步索引路径 / workspace JSON）；两者
+    皆无 → 空 dict（enhance_and_select 对缺失签名优雅退化，[7.7]）。
+
+    db: PageIndexDB 实例（None → 回退路径）
+    db_doc_id: 文档整数 id（None → 回退路径）
+    mapping: {node_id: node_dict}——create_node_mapping 的扁平结构映射
+
+    防御性：get_node_profiles 异常不抛出——记日志并走回退路径。
+    """
+    if db is not None and db_doc_id is not None:
+        rows = None
+        try:
+            rows = db.get_node_profiles(db_doc_id)
+        except Exception as e:
+            logging.warning(
+                "resolve_node_profiles: get_node_profiles(%s) failed: %s", db_doc_id, e
+            )
+        if rows:
+            return {
+                p["node_id"]: {
+                    "entities": p.get("entities") or [],
+                    "keywords": p.get("keywords") or [],
+                    "tags": p.get("tags") or [],
+                }
+                for p in rows if isinstance(p, dict) and p.get("node_id")
+            }
+    profiles = {}
+    for nid, node in (mapping or {}).items():
+        if not isinstance(node, dict):
+            continue
+        prof = {
+            key: node.get(key)
+            for key in ("entities", "keywords", "tags")
+            if node.get(key)
+        }
+        if prof:
+            profiles[nid] = prof
+    return profiles
