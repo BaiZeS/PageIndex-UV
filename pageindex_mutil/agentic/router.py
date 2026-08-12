@@ -487,7 +487,13 @@ class AgenticRouter:
     # Super-Tree search
     # ------------------------------------------------------------------
     async def _search_super_tree(self, query: str, top_k: int = 3) -> Dict:
-        """L0 prefilter → L1 Super-Tree selection → L2/L3 Act → Verify."""
+        """L0 prefilter → L1 Super-Tree selection → L2/L3 Act → Verify.
+
+        Note (T6.3): 超树路径未接入 AgenticRecallLoop——expand 判定在此仅回退为
+        medium 置信响应。原因：本路径无策略融合池（候选来自 prefilter+LLM 选择，
+        非 _run_strategies/_weighted_rrf），循环的"逐轮放宽融合切窗"无对称语义。
+        v2 路径的 expand 委派见 _search_v2（spec [3.5]）。
+        """
         logging.info("[SuperTree] query=%r top_k=%d", query, top_k)
 
         # HyDE: generate hypothetical answer for query expansion
@@ -797,45 +803,30 @@ class AgenticRouter:
                 ],
             }
 
-        # Expand on medium confidence
+        # Expand on medium confidence → Agentic 多轮召回循环（spec [3.5]）。
+        # 替换旧的单次 expand 分支（pages_with_text2.items() AttributeError）：
+        # 逐轮放宽召回 + verifier 判停 + 延迟/预算保护。轮 1（本次）的融合序与
+        # 已召回文档作为排除种子传入，循环从轮 2 继续并返回最终响应。
+        # fused 池已被轮 1 吃满（无更多文档可扩召）时保持原 medium 响应。
         if v.action == "expand" and len(fused) > top_k:
-            expanded = [doc_id for doc_id, _ in fused[: top_k * 2]]
             try:
-                ctx2, nodes2, src2, cov2, doc_pages_map2, pages_with_text2 = await self._act_tree_search(
-                    query, expanded
+                from .recall_loop import AgenticRecallLoop
+                loop = AgenticRecallLoop(self, self.model, retrieve_model=self.retrieve_model)
+                return await loop.retrieve(
+                    query,
+                    top_k=top_k,
+                    first_round_fused=fused,
+                    first_round_ctx_state={
+                        "ctx": ctx,
+                        "nodes": nodes,
+                        "src_docs": src_docs,
+                        "cov_nodes": cov_nodes,
+                        "doc_pages_map": doc_pages_map,
+                        "pages_with_text": pages_with_text,
+                    },
                 )
-                if ctx2:
-                    ans2 = generate_answer(query, ctx2)
-                    v2 = await asyncio.to_thread(
-                        self.verifier.verify, ans2, ctx2, query, src2, cov2
-                    )
-                    conf = "high" if v2.action == "answer" else "medium"
-                    return {
-                        "query": query,
-                        "mode": "multi",
-                        "answer": ans2,
-                        "confidence": conf,
-                        "matched_docs": [
-                            {"doc_id": d, "score": round(s, 4)}
-                            for d, s in fused[: top_k * 2]
-                        ],
-                        "selected_nodes": [
-                            {
-                    "node_id": n.get("node_id"),
-                    "title": n.get("title"),
-                    "summary": n.get("summary", ""),
-                    "text": n.get("text", ""),
-                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
-                }
-                            for n in nodes2
-                        ],
-                        "pages": [
-                            {"doc_id": d, "pages": p}
-                            for d, p in pages_with_text2.items()
-                        ],
-                    }
             except Exception as e:
-                logging.warning("Expand search failed: %s", e)
+                logging.warning("Agentic recall loop failed: %s", e)
 
         conf = "high" if v.action == "answer" else "medium"
         return {

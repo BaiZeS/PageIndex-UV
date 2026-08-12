@@ -11,7 +11,9 @@ class VerifyResult:
 
 
 class CRAGVerifier:
-    TAU_HIGH = 0.7
+    # 偏严取向（[7.5]a）：tau_high 收紧，更难判 answer，倾向触发 expand 补充召回。
+    # config.yaml 的 tau_high/tau_low 可覆盖（见 _init_from_config）。
+    TAU_HIGH = 0.75
     TAU_LOW = 0.4
 
     # Retrieval scoring constants
@@ -68,7 +70,9 @@ class CRAGVerifier:
     ) -> VerifyResult:
         s_ret = self._score_retrieval(context, source_docs, covered_nodes)
 
-        prompt = f"""你是一个答案质量评估专家。基于以下信息判断答案的置信度。
+        # [7.5]a 偏严取向：判据是"上下文是否支撑答案"，不做答案自评。
+        # 要求从上下文逐字引用支撑证据（evidence_quote）；引用不出实锤视同未接地。
+        prompt = f"""你是一个证据充分性评审专家。你的任务不是评价答案写得好不好，而是判断"上下文是否支撑答案"：答案中的关键论断必须能在上下文中找到依据。
 
 问题: {query}
 
@@ -78,12 +82,15 @@ class CRAGVerifier:
 生成的答案:
 {answer}
 
-请评估:
-1. 答案是否基于上下文中的事实？（是/否/部分）
-2. 上下文是否充分回答了问题？（充分/不充分）
-3. 整体置信度（0.0-1.0）
+请严格评估:
+1. based_on_context: 答案的关键论断是否都能在上下文中找到依据？（true/false）
+2. sufficient: 上下文是否足以准确回答该问题？（true/false）
+3. evidence_quote: 从上下文中逐字引用一段支撑答案关键论断的证据片段；找不到可引用的实锤则返回空字符串 ""
+4. confidence: 上下文对答案的支撑度（0.0-1.0）
 
-返回JSON格式: {{"based_on_context": true, "sufficient": true, "confidence": 0.85}}
+判据从严：答案若引用不出上下文实锤（evidence_quote 为空），based_on_context 应为 false，且 confidence 应相应降低。宁可触发补充召回，也不放行没有上下文支撑的答案。
+
+返回JSON格式: {{"based_on_context": true, "sufficient": true, "evidence_quote": "上下文中的原文片段", "confidence": 0.85}}
 直接返回JSON，不要其他内容。
 """
         try:
@@ -92,12 +99,19 @@ class CRAGVerifier:
                 return VerifyResult(confidence=s_ret, action="answer")
 
             data = extract_json(response)
-            if not isinstance(data, dict):
+            # LLM 失败/空/坏 JSON → 纯启发式 s_ret 回退（保留既有行为）
+            if not isinstance(data, dict) or not any(
+                k in data for k in ("based_on_context", "sufficient", "confidence")
+            ):
                 return VerifyResult(confidence=s_ret, action="answer")
 
             s_cov = float(data.get("confidence", s_ret))
             based = self._to_bool(data.get("based_on_context", True))
             sufficient = self._to_bool(data.get("sufficient", True))
+            evidence_quote = str(data.get("evidence_quote") or "").strip()
+            # 高置信判 answer 的必要条件：能引用出上下文实锤；引用不出视同未接地。
+            if not evidence_quote:
+                based = False
 
             combined = s_ret * 0.3 + s_cov * 0.7
             if not based or not sufficient:
