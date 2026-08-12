@@ -31,6 +31,7 @@
 
 import asyncio
 import logging
+import math
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -64,36 +65,39 @@ class AgenticRecallLoop:
     DEFAULT_ROUND_TIMEOUT_S = 30.0
     DEFAULT_MAX_TOTAL_TOKENS = 120000
 
-    def __init__(self, router, model, retrieve_model: str = None):
+    def __init__(self, router):
         self.router = router
-        self.model = model
-        self.retrieve_model = retrieve_model
         self._node_matches: Dict[str, List[dict]] = {}
         self._load_settings()
 
     def _load_settings(self):
-        """从 config.yaml 读取 guard 参数；缺省回退类默认值。测试可直接覆写实例属性。"""
+        """从 config.yaml 读取 guard 参数；缺省/非法值逐字段回退类默认值。测试可直接覆写实例属性。"""
         cfg = None
         try:
             from ..utils import ConfigLoader
             cfg = ConfigLoader().load(None)
         except Exception as e:
             logging.warning("[AgenticLoop] config load failed, using defaults: %s", e)
-        self.round_topks = list(
-            getattr(cfg, "agentic_round_topks", None) or self.DEFAULT_ROUND_TOPKS
-        )
-        self.max_rounds = int(
-            getattr(cfg, "agentic_max_rounds", None) or self.DEFAULT_MAX_ROUNDS
-        )
-        self.max_latency_ms = float(
-            getattr(cfg, "agentic_max_latency_ms", None) or self.DEFAULT_MAX_LATENCY_MS
-        )
-        self.round_timeout_s = float(
-            getattr(cfg, "agentic_round_timeout_s", None) or self.DEFAULT_ROUND_TIMEOUT_S
-        )
-        self.max_total_tokens = int(
-            getattr(cfg, "agentic_max_total_tokens", None) or self.DEFAULT_MAX_TOTAL_TOKENS
-        )
+
+        def _field(name, default, cast):
+            raw = getattr(cfg, name, None)
+            if raw is None:
+                return default
+            try:
+                value = cast(raw)
+            except (TypeError, ValueError):
+                logging.warning(
+                    "[AgenticLoop] invalid config %s=%r, fallback to default %r",
+                    name, raw, default,
+                )
+                return default
+            return value if value else default
+
+        self.round_topks = list(_field("agentic_round_topks", self.DEFAULT_ROUND_TOPKS, list))
+        self.max_rounds = _field("agentic_max_rounds", self.DEFAULT_MAX_ROUNDS, int)
+        self.max_latency_ms = _field("agentic_max_latency_ms", self.DEFAULT_MAX_LATENCY_MS, float)
+        self.round_timeout_s = _field("agentic_round_timeout_s", self.DEFAULT_ROUND_TIMEOUT_S, float)
+        self.max_total_tokens = _field("agentic_max_total_tokens", self.DEFAULT_MAX_TOTAL_TOKENS, int)
 
     # ------------------------------------------------------------------
     # 主循环
@@ -104,6 +108,7 @@ class AgenticRecallLoop:
         top_k: int = 3,
         first_round_fused: Optional[List[Tuple[str, float]]] = None,
         first_round_ctx_state: Optional[Dict] = None,
+        first_round_node_matches: Optional[Dict[str, List[dict]]] = None,
         max_rounds: int = None,
         pool_concern: bool = False,
     ) -> Dict:
@@ -114,10 +119,14 @@ class AgenticRecallLoop:
         - first_round_ctx_state: 调用方轮 1 的 Act 产出（同轮产出形状）；与
           first_round_fused 同时给出 ⇒ 轮 1 视为已完成，以其 fused[:top_k] 为
           排除种子，从轮 2 继续。
+        - first_round_node_matches: 调用方 Route 阶段的内容策略节点命中信息
+          （_run_strategies 的 node_matches）；给出时承接为本循环的节点匹配，
+          供续接轮（≥2）的树搜索复用——否则续接轮以空 node_matches 召回，
+          节点召回弱化。默认 None ⇒ 维持独立调用方行为（自行 Route 或空）。
         - pool_concern: ④a 显式池质疑信号（T6.4 接入前恒 False）。
         """
         total_rounds = max(1, int(max_rounds or self.max_rounds))
-        self._node_matches = {}
+        self._node_matches = first_round_node_matches if first_round_node_matches is not None else {}
 
         if first_round_fused is not None:
             fused = self._normalize_fused(first_round_fused)
@@ -162,7 +171,9 @@ class AgenticRecallLoop:
                 fused, retrieved, deferred, width_topk, relax=(r >= 3)
             )
             if not candidates:
-                stop_reason = "pool_exhausted"
+                # 滑窗与延迟池回捞都取不到新候选（零宽窗口同样落空）——
+                # 不一定整个融合池耗尽，故名 candidates_exhausted。
+                stop_reason = "candidates_exhausted"
                 break
 
             round_start = time.monotonic()
@@ -203,7 +214,12 @@ class AgenticRecallLoop:
                 pool_concern_live = False
                 continue
 
-            answer = await self._generate(query, ctx)
+            try:
+                answer = await self._generate(query, ctx)
+            except Exception as e:
+                logging.warning("[AgenticLoop] generate failed: %s", e)
+                stop_reason = "generator_error"
+                break
             if answer is None:
                 stop_reason = "no_answer_generator"
                 break
@@ -397,7 +413,11 @@ class AgenticRecallLoop:
                         "rounds_used": rounds_used,
                     }
 
-        answer = await self._generate(query, outcome["ctx"])
+        try:
+            answer = await self._generate(query, outcome["ctx"])
+        except Exception as e:
+            logging.warning("[AgenticLoop] best-effort generate failed: %s", e)
+            answer = None
         if answer is None:
             answer = ""
         grounded_docs = list(outcome.get("doc_pages_map", {}).keys()) or list(accumulated)
@@ -467,9 +487,12 @@ class AgenticRecallLoop:
         for item in first_round_fused or []:
             try:
                 doc_id, score = item
-                out.append((doc_id, float(score)))
+                score = float(score)
             except (TypeError, ValueError):
                 continue
+            if not math.isfinite(score):
+                continue
+            out.append((doc_id, score))
         return out
 
     @staticmethod

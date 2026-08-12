@@ -3,6 +3,7 @@ import logging
 from typing import List, Tuple, Dict
 
 from .planner import RetrievalPlanner
+from .recall_loop import _node_payload
 from .strategies import MetadataStrategy, SemanticsStrategy, ContentStrategy, DescriptionStrategy
 from .verifier import CRAGVerifier
 from .multi_hop import MultiHopReasoner
@@ -656,16 +657,7 @@ class AgenticRouter:
                 "answer": "I don't know.",
                 "confidence": "low",
                 "matched_docs": matched,
-                "selected_nodes": [
-                    {
-                    "node_id": n.get("node_id"),
-                    "title": n.get("title"),
-                    "summary": n.get("summary", ""),
-                    "text": n.get("text", ""),
-                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
-                }
-                    for n in nodes
-                ],
+                "selected_nodes": _node_payload(nodes),
                 "pages": [
                     {"doc_id": d, "pages": p}
                     for d, p in doc_pages_map.items()
@@ -679,16 +671,7 @@ class AgenticRouter:
             "answer": answer,
             "confidence": conf,
             "matched_docs": matched,
-            "selected_nodes": [
-                {
-                    "node_id": n.get("node_id"),
-                    "title": n.get("title"),
-                    "summary": n.get("summary", ""),
-                    "text": n.get("text", ""),
-                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
-                }
-                for n in nodes
-            ],
+            "selected_nodes": _node_payload(nodes),
             "pages": pages_with_text,
         }
 
@@ -815,16 +798,7 @@ class AgenticRouter:
                 "answer": "I don't know.",
                 "confidence": "low",
                 "matched_docs": matched,
-                "selected_nodes": [
-                    {
-                    "node_id": n.get("node_id"),
-                    "title": n.get("title"),
-                    "summary": n.get("summary", ""),
-                    "text": n.get("text", ""),
-                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
-                }
-                    for n in nodes
-                ],
+                "selected_nodes": _node_payload(nodes),
                 "pages": [
                     {"doc_id": d, "pages": p}
                     for d, p in doc_pages_map.items()
@@ -839,7 +813,7 @@ class AgenticRouter:
         if v.action == "expand" and len(fused) > top_k:
             try:
                 from .recall_loop import AgenticRecallLoop
-                loop = AgenticRecallLoop(self, self.model, retrieve_model=self.retrieve_model)
+                loop = AgenticRecallLoop(self)
                 return await loop.retrieve(
                     query,
                     top_k=top_k,
@@ -852,6 +826,7 @@ class AgenticRouter:
                         "doc_pages_map": doc_pages_map,
                         "pages_with_text": pages_with_text,
                     },
+                    first_round_node_matches=node_matches,
                 )
             except Exception as e:
                 logging.warning("Agentic recall loop failed: %s", e)
@@ -863,16 +838,7 @@ class AgenticRouter:
             "answer": answer,
             "confidence": conf,
             "matched_docs": matched,
-            "selected_nodes": [
-                {
-                    "node_id": n.get("node_id"),
-                    "title": n.get("title"),
-                    "summary": n.get("summary", ""),
-                    "text": n.get("text", ""),
-                    "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
-                }
-                for n in nodes
-            ],
+            "selected_nodes": _node_payload(nodes),
             "pages": pages_with_text,
         }
 
