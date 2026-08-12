@@ -1009,3 +1009,234 @@ class TestUnhashableNodeId:
             profiles=profiles,
         )
         assert result["selected_ids"] == ["n0"]
+
+
+# ===========================================================================
+# 12. P2.6 union 正文内容通道：直接内容接地（不依赖存储签名）
+# ===========================================================================
+
+
+class TestContentTextChannel:
+    """候选可选携带 `text` 字段：query token 命中正文 → 进 union，命中词记入
+    关键词证据（LLM 视为关键词命中，WEIGHT_KEYWORD 计分）。无 `text` 字段的
+    候选（如语料树簇节点）通道关闭，行为与之前完全一致。"""
+
+    def test_content_hit_admits_node_without_profile(self):
+        """无存储签名但正文含查询词的节点进 union；匹配词以关键词命中呈现。"""
+        candidates = [
+            {"node_id": "n_body", "title": "数值", "summary": "数值",
+             "text": "浴血值可以通过日常任务获得。"},
+            _cand("n_miss"),
+        ]
+        enh = _enhancer()
+        result, mock_llm = _select_call(
+            enh,
+            return_value=_resp(["n_body"]),
+            query="浴血值怎么获得",
+            candidates=candidates,
+            profiles={},
+        )
+        assert result["selected_ids"] == ["n_body"]
+        ev = _evidence_section(_prompt_of(mock_llm))
+        assert "候选节点 n_body" in ev
+        assert "候选节点 n_miss" not in ev  # 无任何信号 → 不进 union
+        kw_lines = [l for l in ev.splitlines() if l.startswith("关键词命中：")]
+        assert kw_lines and "浴血" in kw_lines[0]  # 正文命中词进关键词证据
+
+    def test_content_channel_rescues_node_drowned_by_junk_signature(self):
+        """P2 评测回归：存储 keywords 被引用垃圾（08/2015/官网/引用/日期）淹没、
+        查询概念不在 top-K → 正文通道按节点正文直接接地，节点重新进 union。"""
+        junk = ["08", "2015", "官网", "引用", "日期"]
+        candidates = [
+            {"node_id": "n_junk", "title": "参考资料", "summary": "参考资料",
+             "text": "浴血值可以通过日常任务获得。引用 日期 官网 08 2015"},
+            {"node_id": "n_sig", "title": "其他", "summary": "其他",
+             "text": "完全无关的内容。"},
+        ]
+        profiles = {
+            "n_junk": {"entities": [], "keywords": junk, "tags": []},
+            "n_sig": {"entities": [], "keywords": ["获得"], "tags": []},  # 保 union 非空
+        }
+        enh = _enhancer()
+        result, mock_llm = _select_call(
+            enh,
+            return_value=_resp(["n_junk"]),
+            query="浴血值怎么获得",
+            candidates=candidates,
+            profiles=profiles,
+        )
+        assert result["selected_ids"] == ["n_junk"]
+        ev = _evidence_section(_prompt_of(mock_llm))
+        assert "候选节点 n_junk" in ev
+        # 正文命中词与签名词并列呈现；浴血 必须可见
+        kw_block = ev.split("候选节点 n_junk：", 1)[1].split("候选节点", 1)[0]
+        assert "浴血" in kw_block
+        # 垃圾词不作为命中证据呈现（签名通道本就未命中）
+        assert "关键词命中：08" not in ev
+
+    def test_no_text_field_content_channel_inactive(self):
+        """后向兼容：无 `text` 字段的候选行为不变——即使标题/摘要含查询词，
+        也不经内容通道进 union（另一候选有信号，零信号兜底不触发）。"""
+        candidates = [
+            _cand("n_sig"),
+            _cand("n_title_only", title="声望值获取", summary="声望值获取方式"),
+        ]
+        profiles = {"n_sig": {"entities": [], "keywords": ["声望"], "tags": []}}
+        enh = _enhancer()
+        result, mock_llm = _select_call(
+            enh,
+            return_value=_resp(["n_sig", "n_title_only"]),
+            query="声望值怎么获得",
+            candidates=candidates,
+            profiles=profiles,
+        )
+        assert result["selected_ids"] == ["n_sig"]  # n_title_only 不在 union
+        ev = _evidence_section(_prompt_of(mock_llm))
+        assert "候选节点 n_sig" in ev
+        assert "候选节点 n_title_only" not in ev
+
+    def test_non_str_text_defensive_no_raise(self):
+        """防御性：`text` 为非字符串（None/数字等脏数据）时内容通道关闭，绝不抛出。"""
+        enh = _enhancer()
+        assert UnifiedNodeEnhancement._content_hits(["浴血"], None) == []
+        assert UnifiedNodeEnhancement._content_hits(["浴血"], 123) == []
+        assert UnifiedNodeEnhancement._content_hits(["浴血"], {"a": 1}) == []
+        candidates = [
+            {"node_id": "n_sig"},
+            {"node_id": "n_bad", "title": "t", "summary": "s", "text": 42},
+        ]
+        profiles = {"n_sig": {"entities": [], "keywords": ["浴血"], "tags": []}}
+        result, mock_llm = _select_call(
+            enh, return_value=_resp(["n_sig"]),
+            query="浴血值", candidates=candidates, profiles=profiles,
+        )
+        assert result["selected_ids"] == ["n_sig"]  # 坏 text 节点走零信号路径、不抛错
+
+    def test_content_hit_dedups_with_stored_keyword_hit(self):
+        """同一词的签名命中与正文命中合并呈现一次（casefold 去重，不重复计分）。"""
+        candidates = [
+            {"node_id": "n1", "title": "t", "summary": "s",
+             "text": "浴血值是游戏内的一种货币。"},
+        ]
+        profiles = {"n1": {"entities": [], "keywords": ["浴血"], "tags": []}}
+        enh = _enhancer()
+        result, mock_llm = _select_call(
+            enh,
+            return_value=_resp(["n1"]),
+            query="浴血值怎么获得",
+            candidates=candidates,
+            profiles=profiles,
+        )
+        ev = _evidence_section(_prompt_of(mock_llm))
+        kw_lines = [l for l in ev.splitlines() if l.startswith("关键词命中：")]
+        assert kw_lines == ["关键词命中：浴血"]  # 单条，无重复词
+
+    def test_content_hit_casefold_ascii(self):
+        """ASCII 正文/查询大小写不敏感。"""
+        candidates = [
+            {"node_id": "n1", "title": "t", "summary": "s",
+             "text": "支持 CUDA 加速计算。"},
+            _cand("n2"),
+        ]
+        enh = _enhancer()
+        result, mock_llm = _select_call(
+            enh,
+            return_value=_resp(["n1"]),
+            query="cuda加速吗",
+            candidates=candidates,
+            profiles={"n2": {"entities": [], "keywords": ["天气"], "tags": []}},
+        )
+        assert result["selected_ids"] == ["n1"]
+        ev = _evidence_section(_prompt_of(mock_llm))
+        kw_lines = [l for l in ev.splitlines() if l.startswith("关键词命中：")]
+        assert kw_lines and "cuda" in kw_lines[0]
+
+    def test_content_hits_count_toward_keyword_weight_in_cap_ordering(self):
+        """正文命中按关键词权重计分：cap 截断时 签名+正文 多信号节点优先保留。"""
+        candidates = [
+            {"node_id": "n_body_only", "title": "t", "summary": "s",
+             "text": "浴血值在这里。"},
+            {"node_id": "n_both", "title": "t", "summary": "s",
+             "text": "浴血值也在这里。"},
+        ]
+        # n_both：标签信号(2) + 正文命中关键词信号(1) = 3 > n_body_only 正文单命中(1)
+        profiles = {"n_both": {"entities": [], "keywords": [], "tags": ["浴血值"]}}
+        enh = _enhancer(cap=1)
+        result, _ = _select_call(
+            enh,
+            return_value=_resp(["n_both"]),
+            query="浴血值",
+            candidates=candidates,
+            profiles=profiles,
+        )
+        assert result["selected_ids"] == ["n_both"]
+        assert result["deferred"] == ["n_body_only"]
+
+
+# ===========================================================================
+# 13. P2.6 force_all_candidates：pool_concern 空池全量重选（零信号直通）
+# ===========================================================================
+
+
+class TestForceAllCandidates:
+    """force_all_candidates=True → union 视为全量候选准入（含零信号节点），
+    供 pool_concern 且无被截候选时的全池重选（[3.2.1]）；默认 False 行为不变。"""
+
+    def test_force_all_admits_zero_signal_nodes_when_union_nonempty(self):
+        candidates = [
+            _cand("n_sig"),
+            _cand("n_weak", title="弱候选标题", summary="弱候选摘要"),
+        ]
+        profiles = {"n_sig": {"entities": [], "keywords": ["声望"], "tags": []}}
+        enh = _enhancer()
+        result, mock_llm = _select_call(
+            enh,
+            return_value=_resp(["n_sig", "n_weak"]),
+            query="声望值怎么获得",
+            candidates=candidates,
+            profiles=profiles,
+            force_all_candidates=True,
+        )
+        ev = _evidence_section(_prompt_of(mock_llm))
+        assert "候选节点 n_sig" in ev
+        assert "候选节点 n_weak" in ev  # 零信号节点也进 union
+        assert "弱候选标题" in ev  # 标题+摘要可见
+        assert result["selected_ids"] == ["n_sig", "n_weak"]
+
+    def test_default_false_keeps_union_admission_rules(self):
+        candidates = [
+            _cand("n_sig"),
+            _cand("n_weak", title="弱候选标题", summary="弱候选摘要"),
+        ]
+        profiles = {"n_sig": {"entities": [], "keywords": ["声望"], "tags": []}}
+        enh = _enhancer()
+        result, mock_llm = _select_call(
+            enh,
+            return_value=_resp(["n_sig", "n_weak"]),
+            query="声望值怎么获得",
+            candidates=candidates,
+            profiles=profiles,
+        )
+        ev = _evidence_section(_prompt_of(mock_llm))
+        assert "候选节点 n_sig" in ev
+        assert "候选节点 n_weak" not in ev
+        assert result["selected_ids"] == ["n_sig"]  # 不在 union → 被过滤
+
+    def test_force_all_still_respects_cap_and_defers_overflow(self):
+        """全量准入仍受 union cap 约束：超限按信号分截断进延迟池。"""
+        candidates = [
+            _cand("n_sig"),
+            _cand("n_weak"),
+        ]
+        profiles = {"n_sig": {"entities": [], "keywords": ["声望"], "tags": []}}
+        enh = _enhancer(cap=1)
+        result, _ = _select_call(
+            enh,
+            return_value=_resp(["n_sig"]),
+            query="声望值怎么获得",
+            candidates=candidates,
+            profiles=profiles,
+            force_all_candidates=True,
+        )
+        assert result["selected_ids"] == ["n_sig"]
+        assert result["deferred"] == ["n_weak"]

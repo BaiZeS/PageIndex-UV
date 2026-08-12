@@ -202,6 +202,42 @@ class TestRecallNodesForDoc:
         assert "关键词命中：帮会战" in captured[0]
         assert [n["node_id"] for n in result["selected"]] == ["n1"]
 
+    def test_content_text_channel_rescues_unprofiled_node(self):
+        """P2.6 正文内容通道：节点存储签名缺失/被垃圾词淹没时，正文含查询词
+        即进 union；命中词以关键词命中呈现于 prompt，精挑选中后 text 可组装上下文。
+
+        n_sig 经 matched_info 命中词保持 union 非空（排除零信号兜底解释）；
+        n_zero 无任何信号也不含查询词 → 不得进 union。
+        """
+        router, _ = _router_with_doc([
+            _md_node("n_rel", title="玩法", text="浴血值可以通过日常任务获得。"),
+            _md_node("n_sig", title="任务", text="任务系统说明。"),
+            _md_node("n_zero", title="无关", text="完全无关的内容。"),
+        ])
+
+        captured = []
+
+        def fake_llm(model, prompt, **kwargs):
+            captured.append(prompt)
+            # 模拟 LLM：只有看到 浴血 正文证据才选 n_rel
+            return _select_json(["n_rel"]) if "浴血" in prompt else _select_json([])
+
+        with _patch_enhance_llm(side_effect=fake_llm):
+            result = asyncio.run(router._recall_nodes_for_doc(
+                "浴血值怎么获得", "doc1",
+                matched_info=[{"node_id": "n_sig", "keyword": "获得"}],
+            ))
+
+        assert len(captured) == 1
+        assert "候选节点 n_rel" in captured[0]
+        assert "候选节点 n_sig" in captured[0]
+        assert "候选节点 n_zero" not in captured[0]  # 无信号不进 union
+        kw_block = captured[0].split("候选节点 n_rel：", 1)[1].split("候选节点", 1)[0]
+        assert "关键词命中" in kw_block and "浴血" in kw_block
+        assert result is not None
+        assert [n["node_id"] for n in result["selected"]] == ["n_rel"]
+        assert result["selected"][0]["text"] == "浴血值可以通过日常任务获得。"
+
     def test_keyword_fallback_removed_llm_sole_pruner(self):
         """旧启发式关键词兜底已移除：LLM 精挑为空即无召回。
 
@@ -256,10 +292,12 @@ def _instrumented_enhancer(select_results, model="m-model", retrieve_model="r-mo
     calls = []
 
     async def fake_select(query, candidates, profiles, query_entities=None,
-                          node_budget=None, token_budget=None, max_candidates=None):
+                          node_budget=None, token_budget=None, max_candidates=None,
+                          force_all_candidates=False):
         calls.append({
             "query": query, "candidates": candidates, "profiles": profiles,
             "query_entities": query_entities, "max_candidates": max_candidates,
+            "force_all_candidates": force_all_candidates,
         })
         return select_results[len(calls) - 1]
 
@@ -293,18 +331,49 @@ class TestRecallPoolConcernRetry:
         assert calls[1]["profiles"] == calls[0]["profiles"]
         assert [n["node_id"] for n in result["selected"]] == ["n0", "n2"]
 
-    def test_no_retry_when_pool_concern_without_deferred(self):
+    def test_full_pool_retry_when_pool_concern_and_deferred_empty(self):
+        """P2.6：pool_concern 且 deferred 为空（判据①关键概念无命中）→
+        force_all_candidates=True 全量重选一次；第二次结果生效；至多重试一次。"""
+        router, _ = _router_with_doc([_node("n0"), _node("n1")])
+        results = [
+            {"selected_ids": [], "pool_concern": True,
+             "concern_reason": "关键概念无命中", "deferred": []},
+            {"selected_ids": ["n1"], "pool_concern": False,
+             "concern_reason": "", "deferred": []},
+            # 第三次结果永远不该被消费（无循环）
+            {"selected_ids": ["n0", "n1"], "pool_concern": False,
+             "concern_reason": "", "deferred": []},
+        ]
+        enh, calls = _instrumented_enhancer(results)
+        with patch.object(_enhance_mod(), "UnifiedNodeEnhancement",
+                          lambda model, retrieve_model=None: enh):
+            result = asyncio.run(router._recall_nodes_for_doc("浴血值怎么获得", "doc1"))
+
+        assert len(calls) == 2  # 至多一次重试，无循环
+        assert calls[0]["force_all_candidates"] is False
+        assert calls[1]["force_all_candidates"] is True
+        assert calls[1]["max_candidates"] is None  # 全池重选不抬 cap，走全量直通
+        assert calls[1]["candidates"] is calls[0]["candidates"]
+        assert calls[1]["profiles"] == calls[0]["profiles"]
+        assert result is not None
+        assert [n["node_id"] for n in result["selected"]] == ["n1"]
+
+    def test_full_pool_retry_not_repeated_when_still_concerned(self):
+        """全池重选后仍 pool_concern → 接受结果（medium 语义由调用方决定），不再重试。"""
         router, _ = _router_with_doc([_node("n0")])
         results = [
+            {"selected_ids": [], "pool_concern": True,
+             "concern_reason": "关键概念无命中", "deferred": []},
             {"selected_ids": ["n0"], "pool_concern": True,
-             "concern_reason": "证据偏弱", "deferred": []},
+             "concern_reason": "仍偏弱", "deferred": []},
         ]
         enh, calls = _instrumented_enhancer(results)
         with patch.object(_enhance_mod(), "UnifiedNodeEnhancement",
                           lambda model, retrieve_model=None: enh):
             result = asyncio.run(router._recall_nodes_for_doc("q", "doc1"))
-        assert len(calls) == 1  # 无被截候选 → 不重选
+        assert len(calls) == 2
         assert result is not None
+        assert [n["node_id"] for n in result["selected"]] == ["n0"]
 
 
 # ---------------------------------------------------------------------------

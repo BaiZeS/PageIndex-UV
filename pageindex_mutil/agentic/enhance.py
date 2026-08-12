@@ -2,6 +2,9 @@
 
 给定 (query, candidate_nodes)，对单文档节点与语料树分支一视同仁：
 ① 高召回 union 收窄（宁多勿漏）——四通道各自给出命中的节点，取并集；仍过宽才做保召回上限。
+   P2.6 起另设正文内容通道：候选可选携带 `text` 字段，query token 命中正文即准入
+   （存储签名被垃圾词淹没/缺失时的直接内容接地，[1.1] 召回优先）；无 `text` 字段的
+   候选（如语料树簇节点）通道关闭，行为与之前完全一致。
 ② 证据组装——为每个候选节点打包接地证据（实体/关键词/标签命中 + 标题/摘要）。
 ③ LLM 精挑（唯一裁剪者；可变数量、宁缺毋滥）+ 候选池质疑信号
    → {"selected_ids": [...], "pool_concern": bool, "concern_reason": str}。
@@ -117,6 +120,27 @@ class UnifiedNodeEnhancement:
                 if qt == tl or (len(qt) >= 2 and len(tl) >= 2 and (qt in tl or tl in qt)):
                     hits.append(t)
                     break
+        return hits
+
+    @staticmethod
+    def _content_hits(query_tokens: list, text) -> list:
+        """正文内容通道（P2.6，[1.1] 召回优先）：多字 query token 子串命中候选正文。
+
+        确定性、无 LLM、无需对正文重新分词（query token 已是 _tokenize 的
+        len≥2 归一 token；正文按 casefold 子串匹配，兼容 CJK 与 ASCII 大小写）。
+        存储签名被引用垃圾淹没/缺失时，正文是唯一可靠接地——命中即准入 union，
+        命中词记入关键词证据。返回命中的 query token（保序去重）。
+        防御性：text 非字符串/为空 → 空命中（通道关闭，绝不抛出）。
+        """
+        if not isinstance(text, str) or not text or not query_tokens:
+            return []
+        t = text.casefold()
+        hits = []
+        seen = set()
+        for qt in query_tokens:
+            if len(qt) >= 2 and qt in t and qt not in seen:
+                seen.add(qt)
+                hits.append(qt)
         return hits
 
     @staticmethod
@@ -309,15 +333,21 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         node_budget=None,
         token_budget=None,
         max_candidates=None,
+        force_all_candidates: bool = False,
     ) -> dict:
         """四通道高召回 union → 证据组装 → LLM 精挑。
 
-        candidates: [{"node_id", "title", "summary"}]
+        candidates: [{"node_id", "title", "summary", ("text")}]——`text` 为可选
+                    正文内容通道字段（P2.6）：query token 命中正文即准入 union，
+                    命中词记入关键词证据；缺省该字段的候选行为不变（如语料树簇节点）
         profiles:   {node_id: {"entities": [{"name","type"}], "keywords": [...], "tags": [...]}}
                     （缺失节点 → 空证据，仍可被选中，[7.7] 签名缺失退化）
         query_entities: 实体名字符串列表（由调用方解析，含别名）
         max_candidates: 本次调用的 union 上限覆盖（None → 实例配置的
                     union_max_candidates）；pool_concern 放宽重选时用 ([3.2.1])
+        force_all_candidates: True → union 步骤全量候选准入（零信号直通），
+                    pool_concern 且无被截候选时的全池重选用 ([3.2.1])；
+                    弱候选由证据跨节点预算自然退化为一行标题+摘要 ([7.4])
         返回: {"selected_ids": [...], "pool_concern": bool,
                "concern_reason": str, "deferred": [node_ids]}
         """
@@ -361,6 +391,12 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
             ents = self._entity_hits(query_entities, prof.get("entities"))
             kws = self._keyword_hits(query_tokens, prof.get("keywords"))
             tags = self._tag_hits(query_tokens, query_cf, prof.get("tags"))
+            # 正文内容通道（P2.6）：命中词并入关键词证据（casefold 去重，
+            # 与存储签名命中不重复计分/呈现）；候选无 `text` 字段则通道关闭。
+            body_hits = self._content_hits(query_tokens, cand.get("text") or "")
+            if body_hits:
+                seen_kw = {str(k).casefold() for k in kws}
+                kws = kws + [h for h in body_hits if str(h).casefold() not in seen_kw]
             score = (
                 WEIGHT_ENTITY * len(ents)
                 + WEIGHT_TAG * len(tags)
@@ -373,8 +409,10 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
             if ents or kws or tags:
                 union.append(nid)
 
-        # 零信号：全量送 LLM（收窄纪律——保召回优先，[1.1]）
-        if not union:
+        # 零信号：全量送 LLM（收窄纪律——保召回优先，[1.1]）。
+        # force_all_candidates（pool_concern 空池全量重选）等价于同样的全量直通，
+        # 弱候选由证据跨节点预算退化为一行标题+摘要，不重复实现裁剪逻辑 ([7.4])。
+        if force_all_candidates or not union:
             union = [nid for _, nid in norm]
 
         # ①b union 防爆炸（[1.2]）

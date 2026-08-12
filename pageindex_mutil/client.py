@@ -61,17 +61,35 @@ def _iter_structure_nodes(structure):
             yield from _iter_structure_nodes(children)
 
 
+# P2.6 关键词签名去噪：引用模板垃圾 token（纯数字/日期形/引用词）不得霸占
+# top-K——eval 实证存储签名被 08/2015/官网/引用/日期 淹没，查询概念词落选。
+_JUNK_KEYWORD_TOKENS = frozenset({"官网", "引用", "日期"})
+_JUNK_KEYWORD_CHARS = frozenset("0123456789-/:.年月日")
+
+
+def _is_junk_keyword_token(tok: str) -> bool:
+    """纯数字/日期形/引用模板词 → True（无信息量，不进关键词签名）。"""
+    if not any(c.isalnum() for c in tok):
+        return True  # 纯标点/符号
+    if any(c.isdigit() for c in tok) and all(c in _JUNK_KEYWORD_CHARS for c in tok):
+        return True  # 纯数字或日期形：08、2015、2015-08-01、2015年8月1日
+    return tok in _JUNK_KEYWORD_TOKENS
+
+
 def _compute_node_keywords(structure, topk):
     """Per-node salient keywords via within-document TF-IDF (P1.4, no LLM).
 
     Tokenizes each node's title + (text or summary) with the shared jieba
     tokenizer (min length 2, stopwords dropped — same convention as
-    entity→node attribution). tf = normalized count within the node;
-    idf = smoothed log over the document's N nodes: log((N+1)/(df+1)) + 1,
-    so a term in every node gets the minimum weight 1.0 while a term unique
-    to one node is boosted. Returns {node_id: [<= topk tokens]} ordered by
-    score desc (ties broken by token for determinism). Nodes without usable
-    text map to []. Complexity is O(total tokens) per document.
+    entity→node attribution), then drops junk tokens (pure digits, date-like
+    strings, citation-template words) so citation boilerplate cannot drown the
+    informative top-K (P2.6 signature hygiene). tf = normalized count within
+    the node; idf = smoothed log over the document's N nodes:
+    log((N+1)/(df+1)) + 1, so a term in every node gets the minimum weight
+    1.0 while a term unique to one node is boosted. Returns
+    {node_id: [<= topk tokens]} ordered by score desc (ties broken by token
+    for determinism). Nodes without usable text map to []. Complexity is
+    O(total tokens) per document.
     """
     node_tokens = []
     for node in _iter_structure_nodes(structure):
@@ -82,7 +100,11 @@ def _compute_node_keywords(structure, topk):
                f"{node.get('text') or node.get('summary') or ''}"
         # KeywordIndex._tokenize does not use `self`; reuse the canonical
         # jieba + _STOPWORDS filtering without constructing an index.
-        node_tokens.append((node_id, KeywordIndex._tokenize(None, text)))
+        node_tokens.append((
+            node_id,
+            [t for t in KeywordIndex._tokenize(None, text)
+             if not _is_junk_keyword_token(t)],
+        ))
 
     if not node_tokens or topk <= 0:
         return {node_id: [] for node_id, _ in node_tokens}
@@ -1083,11 +1105,14 @@ class PageIndexClient:
 
         [3.4][3.2.1]: the LLM remains the node-selection decision maker via
         enhance_and_select, with keyword/entity signatures injected as
-        grounding evidence. No len(summary) re-rank and no hardcoded scores:
-        node order preserves the LLM's selection order, matched_docs score is
-        the "selection coverage" (selected nodes / all candidate nodes), and
-        confidence is "high" unless a pool_concern signal survived the
-        optional retry (then "medium").
+        grounding evidence. Candidates carry each node's text (P2.6 content
+        channel: a query token present in the node body admits the node to the
+        union even when its stored signature is junk-drowned or missing). No
+        len(summary) re-rank and no hardcoded scores: node order preserves the
+        LLM's selection order, matched_docs score is the "selection coverage"
+        (selected nodes / all candidate nodes), and confidence is "high"
+        unless a pool_concern signal survived the optional retry (then
+        "medium").
         """
         if self.workspace:
             self._ensure_doc_loaded(doc_id)
@@ -1154,6 +1179,8 @@ class PageIndexClient:
                 "node_id": nid,
                 "title": node.get("title") or "",
                 "summary": node.get("summary") or "",
+                # 正文内容通道（P2.6）：直接内容接地，存储签名淹没/缺失时保召回
+                "text": node.get("text") or "",
             }
             for nid, node in mapping.items()
         ]
@@ -1169,14 +1196,22 @@ class PageIndexClient:
             query, candidates, profiles, query_entities=query_entities,
         )
 
-        # [3.2.1] pool_concern 且存在被截候选 → 放宽 union 上限重选一次。
-        # 候选/签名不变，被截候选经 union 自然回池；上限放宽只抬高 cap。
-        if result["pool_concern"] and result["deferred"]:
-            result = await enhancer.enhance_and_select(
-                query, candidates, profiles, query_entities=query_entities,
-                max_candidates=max(1, int(enhancer.union_max_candidates))
-                * POOL_CONCERN_RETRY_CAP_MULTIPLIER,
-            )
+        # [3.2.1] pool_concern 重选（至多一次，二选一分支，杜绝重试循环）：
+        # ① 存在被截候选 → 放宽 union 上限重选（被截候选经 union 自然回池）。
+        # ② 无被截候选（候选池本就完整）→ 判据①"关键概念无命中"意味着 union
+        #    准入逻辑漏掉了相关节点 → force_all_candidates 全池直通重选一次。
+        if result["pool_concern"]:
+            if result["deferred"]:
+                result = await enhancer.enhance_and_select(
+                    query, candidates, profiles, query_entities=query_entities,
+                    max_candidates=max(1, int(enhancer.union_max_candidates))
+                    * POOL_CONCERN_RETRY_CAP_MULTIPLIER,
+                )
+            else:
+                result = await enhancer.enhance_and_select(
+                    query, candidates, profiles, query_entities=query_entities,
+                    force_all_candidates=True,
+                )
 
         selected_ids = result["selected_ids"]
         if not selected_ids:

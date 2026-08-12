@@ -198,8 +198,10 @@ class AgenticRouter:
         [3.2.1] unit = 节点：enhance_and_select 统一接入——四通道 union 宽召回 +
         证据接地 + LLM 精挑（唯一裁剪者）。node_profiles 签名（DB 优先）与
         查询实体作为证据注入；内容策略命中词并入关键词证据（只喂证据，不替代
-        精挑）。LLM 失效时不做启发式兜底裁剪（[7.7] 放行 union）——不再有
-        get_relevant_nodes 旧路，也不再有启发式关键词兜底。
+        精挑）。候选携带节点正文（P2.6 正文内容通道：query token 命中正文即准入
+        union——存储签名被垃圾词淹没/缺失时的直接内容接地）。LLM 失效时不做
+        启发式兜底裁剪（[7.7] 放行 union）——不再有 get_relevant_nodes 旧路，
+        也不再有启发式关键词兜底。
         """
         funcs = self._load_main_funcs()
         pages_from_nodes = funcs.get("pages_from_nodes")
@@ -229,6 +231,8 @@ class AgenticRouter:
                 "node_id": nid,
                 "title": node.get("title") or "",
                 "summary": node.get("summary") or "",
+                # 正文内容通道（P2.6）：直接内容接地，存储签名淹没/缺失时保召回
+                "text": node.get("text") or "",
             }
             for nid, node in mapping.items()
         ]
@@ -266,14 +270,23 @@ class AgenticRouter:
             query, candidates, profiles, query_entities=query_entities,
         )
 
-        # [3.2.1] pool_concern 且存在被截候选 → 放宽 union 上限重选一次。
-        # 候选/签名不变，被截候选经 union 自然回池；上限放宽只抬高 cap。
-        if result["pool_concern"] and result["deferred"]:
-            result = await enhancer.enhance_and_select(
-                query, candidates, profiles, query_entities=query_entities,
-                max_candidates=max(1, int(enhancer.union_max_candidates))
-                * POOL_CONCERN_RETRY_CAP_MULTIPLIER,
-            )
+        # [3.2.1] pool_concern 重选（至多一次，二选一分支，杜绝重试循环）：
+        # ① 存在被截候选 → 放宽 union 上限重选（候选/签名不变，被截候选经 union
+        #    自然回池，上限放宽只抬高 cap）。
+        # ② 无被截候选（候选池本就完整）→ 判据①"关键概念无命中"意味着 union
+        #    准入逻辑漏掉了相关节点 → force_all_candidates 全池直通重选一次。
+        if result["pool_concern"]:
+            if result["deferred"]:
+                result = await enhancer.enhance_and_select(
+                    query, candidates, profiles, query_entities=query_entities,
+                    max_candidates=max(1, int(enhancer.union_max_candidates))
+                    * POOL_CONCERN_RETRY_CAP_MULTIPLIER,
+                )
+            else:
+                result = await enhancer.enhance_and_select(
+                    query, candidates, profiles, query_entities=query_entities,
+                    force_all_candidates=True,
+                )
 
         selected_ids = result["selected_ids"]
         if not selected_ids:

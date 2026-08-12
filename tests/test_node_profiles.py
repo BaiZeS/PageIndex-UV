@@ -558,6 +558,25 @@ class TestKeywordComputation:
         st = _two_node_structure()
         assert _kw_helper(st) == _kw_helper(st)
 
+    def test_digit_date_citation_junk_not_in_topk(self):
+        """P2.6 关键词签名去噪：引用模板垃圾（纯数字/日期/引用词）tf 再高也
+        不得淹没真正有信息量的词（eval 根因：08/2015/官网/引用/日期 占据 top-K）。"""
+        junk = " 2015 08 01 引用 日期 官网 2015-08-01 2015年8月1日 08/01"
+        st = [{"node_id": "n1", "title": "浴血值",
+               "text": f"浴血值可以通过日常任务获得。{junk * 6}"}]
+        kw = _kw_helper(st, topk=5)["n1"]
+        assert kw  # 去噪后仍有可用关键词
+        assert "浴血" in kw  # 信息量词存活
+        for tok in kw:
+            assert not tok.isdigit(), tok  # 纯数字（2015/08/01）
+            assert tok not in ("引用", "日期", "官网"), tok
+
+    def test_pure_digit_date_tokens_never_surface(self):
+        """整篇只有垃圾词 → 宁缺毋滥返回空列表，不放行任何垃圾 token。"""
+        st = [{"node_id": "n1", "title": "引用",
+               "text": "2015 08 01 2015-08-01 引用 日期 官网 " * 4}]
+        assert _kw_helper(st, topk=5)["n1"] == []
+
 
 class TestSingleDocKeywords:
     """Single-doc index flow: keywords in node_profiles table + structure JSON."""

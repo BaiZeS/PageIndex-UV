@@ -233,6 +233,63 @@ class TestEvidenceGrounding:
         assert "今天天气不错。" not in ctx
         assert result["answer"] == "答案：日常任务"
 
+    def test_content_channel_rescues_node_without_signature(self):
+        """P2.6 正文内容通道：节点无任何签名（关键词被垃圾词淹没/缺失）但正文含
+        查询词 → 进 union，命中词作为关键词命中进 prompt，LLM 选中后正文进答案。"""
+        client = _client()
+        assert client.db is None
+        # nodeA 无 keywords/entities/tags——签名完全缺失，正文是唯一接地
+        _add_doc(client, [
+            _node("nodeA", title="获取方式", summary="获取方式",
+                  text="浴血值可以通过完成日常任务获得。"),
+            _node("nodeB", title="天气", summary="天气", text="今天天气不错。"),
+        ])
+
+        captured_prompts = []
+
+        def fake_llm(model, prompt, **kwargs):
+            captured_prompts.append(prompt)
+            return _select_json(["nodeA"]) if "浴血" in prompt else _select_json([])
+
+        with _patch_enhance_llm(side_effect=fake_llm), \
+                _patch_generate_answer("答案：日常任务") as mock_answer:
+            result = _run_search_single(client, query="浴血值怎么获得")
+
+        assert len(captured_prompts) == 1
+        assert "候选节点 nodeA" in captured_prompts[0]
+        assert "候选节点 nodeB" not in captured_prompts[0]  # 无命中不进 union
+        kw_block = captured_prompts[0].split("候选节点 nodeA：", 1)[1].split("候选节点", 1)[0]
+        assert "关键词命中" in kw_block and "浴血" in kw_block
+        assert [n["node_id"] for n in result["selected_nodes"]] == ["nodeA"]
+        ctx = mock_answer.call_args[0][1]
+        assert "浴血值可以通过完成日常任务获得。" in ctx
+        assert result["answer"] == "答案：日常任务"
+
+    def test_candidates_without_text_unchanged(self):
+        """后向兼容：节点无 text 字段时内容通道不生效，行为与之前一致。"""
+        client = _client()
+        # nodeA 无 text（PDF 风格节点），仅标题/摘要提到查询词；无签名 → 无命中通道
+        _add_doc(client, [
+            _node("nodeA", title="声望值获取", summary="声望值获取方式", text=""),
+            _node("nodeB", title="声望", summary="声望", text="", keywords=["声望"]),
+        ])
+
+        captured_prompts = []
+
+        def fake_llm(model, prompt, **kwargs):
+            captured_prompts.append(prompt)
+            return _select_json(["nodeA", "nodeB"])
+
+        with _patch_enhance_llm(side_effect=fake_llm), \
+                _patch_generate_answer():
+            result = _run_search_single(client, query="声望值")
+
+        # nodeB 经关键词通道进 union；nodeA 无 text 无签名 → 不进 union
+        # （nodeB 已使 union 非空，零信号兜底不触发）
+        assert "候选节点 nodeB" in captured_prompts[0]
+        assert "候选节点 nodeA" not in captured_prompts[0]
+        assert [n["node_id"] for n in result["selected_nodes"]] == ["nodeB"]
+
 
 # ---------------------------------------------------------------------------
 # 4. 多范围取数不丢段（[3.4.1]①③：跨段融合）
@@ -289,10 +346,12 @@ def _instrumented_enhancer(select_results):
     calls = []
 
     async def fake_select(query, candidates, profiles, query_entities=None,
-                          node_budget=None, token_budget=None, max_candidates=None):
+                          node_budget=None, token_budget=None, max_candidates=None,
+                          force_all_candidates=False):
         calls.append({
             "query": query, "candidates": candidates, "profiles": profiles,
             "query_entities": query_entities, "max_candidates": max_candidates,
+            "force_all_candidates": force_all_candidates,
         })
         return select_results[len(calls) - 1]
 
@@ -330,20 +389,51 @@ class TestPoolConcernRetry:
         assert [n["node_id"] for n in result["selected_nodes"]] == ["n0", "n2"]
         assert result["confidence"] == "high"
 
-    def test_no_retry_when_pool_concern_without_deferred(self):
+    def test_full_pool_retry_when_pool_concern_and_deferred_empty(self):
+        """P2.6：pool_concern 且 deferred 为空 → force_all_candidates=True 全量
+        重选一次；第二次结果生效；至多重试一次（无循环）。"""
         client = _client()
-        _add_doc(client, [_node("n0")])
+        _add_doc(client, [_node("n0"), _node("n1")])
         results = [
-            {"selected_ids": ["n0"], "pool_concern": True,
-             "concern_reason": "证据偏弱", "deferred": []},
+            {"selected_ids": [], "pool_concern": True,
+             "concern_reason": "关键概念无命中", "deferred": []},
+            {"selected_ids": ["n1"], "pool_concern": False,
+             "concern_reason": "", "deferred": []},
+            # 第三次结果永远不该被消费（无循环）
+            {"selected_ids": ["n0", "n1"], "pool_concern": False,
+             "concern_reason": "", "deferred": []},
         ]
         enh, calls = _instrumented_enhancer(results)
         with patch.object(_enhance_mod(), "UnifiedNodeEnhancement",
                           lambda model, retrieve_model=None: enh), \
                 _patch_generate_answer():
             result = _run_search_single(client)
-        assert len(calls) == 1  # 无被截候选 → 不重选
-        assert result["confidence"] == "medium"  # pool_concern 留存
+        assert len(calls) == 2  # 至多一次重试，无循环
+        assert calls[0]["force_all_candidates"] is False
+        assert calls[1]["force_all_candidates"] is True
+        assert calls[1]["max_candidates"] is None  # 全池重选不抬 cap，走全量直通
+        assert calls[1]["candidates"] is calls[0]["candidates"]
+        assert calls[1]["profiles"] == calls[0]["profiles"]
+        assert [n["node_id"] for n in result["selected_nodes"]] == ["n1"]
+        assert result["confidence"] == "high"  # 重选后 pool_concern 解除
+
+    def test_full_pool_retry_not_repeated_when_still_concerned(self):
+        """全池重选后仍 pool_concern → 不再重试（至多一次）。"""
+        client = _client()
+        _add_doc(client, [_node("n0")])
+        results = [
+            {"selected_ids": [], "pool_concern": True,
+             "concern_reason": "关键概念无命中", "deferred": []},
+            {"selected_ids": ["n0"], "pool_concern": True,
+             "concern_reason": "仍偏弱", "deferred": []},
+        ]
+        enh, calls = _instrumented_enhancer(results)
+        with patch.object(_enhance_mod(), "UnifiedNodeEnhancement",
+                          lambda model, retrieve_model=None: enh), \
+                _patch_generate_answer():
+            result = _run_search_single(client)
+        assert len(calls) == 2
+        assert result["confidence"] == "medium"  # pool_concern 留存 → medium
 
     def test_retry_still_concerned_yields_medium(self):
         client = _client()
