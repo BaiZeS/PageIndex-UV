@@ -205,6 +205,11 @@ class SuperTreeIndex:
     _CLUSTER_PROFILE_MAX_ENTITIES = 5    # 聚合实体上限（entity_mentions canonical 名）
     _CLUSTER_PROFILE_MAX_KEYWORDS = 8    # 聚合关键词上限（成员文档 node_profiles）
     _CLUSTER_PROFILE_MAX_TAGS = 3        # 聚合标签上限（closet_tags source='llm'）
+    # L1 文档级证据接地（spec [3.2] enhance 抽象 unit=文档级候选）：
+    # _holistic_select 证据行每文档呈现上限（行小且有界，预算守卫）
+    _DOC_EVIDENCE_MAX_KEYWORDS = 4
+    _DOC_EVIDENCE_MAX_ENTITIES = 3
+    _DOC_EVIDENCE_MAX_TAGS = 2
 
     def __init__(self, db, model: str, client, retrieve_model: str = None):
         self.db = db
@@ -497,6 +502,107 @@ class SuperTreeIndex:
         # top_k 固定为配置值，不被 LLM 返回值控制，保证契约"取前 _SELECT_TOP_K"
         return result[: self._SELECT_TOP_K]
 
+    def _doc_evidence_lines(self, query: str, db_ids: List[int]) -> Dict[int, str]:
+        """L1 文档级证据接地：逐文档关键词/实体/标签命中（确定性、无 LLM）。
+
+        与节点级 enhance 同一套通道语义（spec [3.2]：enhance 抽象 unit 无关）：
+        关键词 = query token casefold 相等或多字双向子串；标签 = token 与标签文本
+        重叠；实体 = query token 对实体名（casefold、子串放行）。签名来源为
+        node_profiles（keywords/entities/tags）+ 文档级 closet_tags(source='llm')。
+        零命中的文档整体省略（不发"无命中"噪音）；任何签名缺失/坏行都优雅降级。
+        返回 {db_id: "doc <label>: ..."}，行序随输入 db_ids，稳定可复现。
+        """
+        try:
+            from .agentic.enhance import UnifiedNodeEnhancement
+        except Exception:
+            return {}
+
+        query_tokens = self.keyword_index._tokenize(query or "")
+        if not query_tokens:
+            return {}
+        query_cf = (query or "").casefold()
+
+        def _dedup(items, key):
+            seen = set()
+            out = []
+            for it in items:
+                k = key(it)
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(it)
+            return out
+
+        try:
+            db_to_uuid = self._get_db_to_uuid()
+        except Exception:
+            db_to_uuid = {}
+
+        lines: Dict[int, str] = {}
+        for db_id in db_ids:
+            keywords: List[str] = []
+            entities: List[dict] = []
+            tags: List[str] = []
+
+            # node_profiles 签名（keywords/entities/tags，跨该文档全部节点聚合）
+            try:
+                rows = self.db.get_node_profiles(db_id)
+            except Exception:
+                rows = []
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                for kw in (row.get("keywords") or []):
+                    if isinstance(kw, str) and kw.strip():
+                        keywords.append(kw.strip())
+                for ent in (row.get("entities") or []):
+                    if isinstance(ent, dict) and isinstance(ent.get("name"), str) and ent["name"].strip():
+                        entities.append({"name": ent["name"].strip(), "type": ent.get("type") or ""})
+                for tg in (row.get("tags") or []):
+                    if isinstance(tg, str) and tg.strip():
+                        tags.append(tg.strip())
+
+            # 文档级 closet 标签（LLM 语义标签）
+            try:
+                for trow in (self.db.get_doc_tags(db_id, source="llm") or []):
+                    if isinstance(trow, dict) and isinstance(trow.get("tag_text"), str) and trow["tag_text"].strip():
+                        tags.append(trow["tag_text"].strip())
+            except Exception:
+                pass
+
+            # 聚合签名去重（保序，确定性），再按 enhance 通道语义匹配
+            keywords = _dedup(keywords, lambda s: s.casefold())
+            tags = _dedup(tags, lambda s: s.casefold())
+            entities = _dedup(entities, lambda e: e["name"].casefold())
+
+            kw_hits = _dedup(UnifiedNodeEnhancement._keyword_hits(query_tokens, keywords),
+                             lambda s: s.casefold())[: self._DOC_EVIDENCE_MAX_KEYWORDS]
+            ent_hits = _dedup([e["name"] for e in UnifiedNodeEnhancement._entity_hits(query_tokens, entities)],
+                              lambda s: s.casefold())[: self._DOC_EVIDENCE_MAX_ENTITIES]
+            tag_hits = _dedup(UnifiedNodeEnhancement._tag_hits(query_tokens, query_cf, tags),
+                              lambda s: s.casefold())[: self._DOC_EVIDENCE_MAX_TAGS]
+
+            if not (kw_hits or ent_hits or tag_hits):
+                continue
+
+            parts = []
+            if kw_hits:
+                parts.append("关键词命中: " + ", ".join(kw_hits))
+            if ent_hits:
+                parts.append("实体命中: " + ", ".join(ent_hits))
+            if tag_hits:
+                parts.append("标签命中: " + ", ".join(tag_hits))
+
+            label = db_to_uuid.get(db_id)
+            if not label:
+                try:
+                    doc = self.db.get_document_by_id(db_id)
+                    label = (doc or {}).get("pdf_name") or str(db_id)
+                except Exception:
+                    label = str(db_id)
+            lines[db_id] = f"doc {label}: " + " | ".join(parts)
+        return lines
+
     async def _holistic_select(self, query: str, db_ids: list[int], keep: int = None) -> list[int]:
         """推理式整体挑选：LLM 从 db_ids 中挑选最相关的文档（可变数量，宁缺毋滥）。
 
@@ -520,6 +626,22 @@ class SuperTreeIndex:
             tree_json = json.dumps(super_tree, ensure_ascii=False)
             total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
 
+        # 证据块只针对预算裁剪后幸存的最终文档集计算（spec：pop 后再算）。
+        surviving_db_ids = [d.get("db_id") for d in super_tree["documents"] if d.get("db_id") is not None]
+        evidence_lines = self._doc_evidence_lines(query, surviving_db_ids)
+        if evidence_lines:
+            # 前置/后置换行内嵌于块中，无证据时块为空串 → prompt 与改造前逐字节一致
+            evidence_block = (
+                "\n[文档语料证据（关键词/实体/标签命中，供参考）]\n"
+                + "\n".join(evidence_lines[did] for did in surviving_db_ids if did in evidence_lines)
+                + "\n证据是语料事实，请优先依据证据与问题的语义关联程度判断，"
+                  "而非简单计数命中个数；无证据命中的文档仍可按标题/摘要判断。\n"
+            )
+            evidence_requirement = "4. 证据命中是强信号，但选档仍须宁缺毋滥，不因命中而硬选不相关文档。\n"
+        else:
+            evidence_block = ""
+            evidence_requirement = ""
+
         prompt = f"""你是一个文档检索专家。给定用户问题、知识库概览和候选文档结构，请挑选出最可能包含答案的文档（最多 {keep} 篇）。
 
 [知识库概览]
@@ -530,12 +652,12 @@ class SuperTreeIndex:
 
 [候选文档结构]
 {tree_json}
-
+{evidence_block}
 要求：
 1. 只挑真正可能包含答案的文档；若没有足够相关的，可以少选甚至不选。
 2. 宁缺毋滥：不要为凑数而挑选不相关的文档。
 3. 基于文档的章节标题和摘要判断相关性。
-
+{evidence_requirement}
 返回JSON格式：
 {{"doc_ids": ["uuid-1", "uuid-2"]}}
 直接返回JSON，不要其他内容。"""

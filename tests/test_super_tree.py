@@ -386,3 +386,213 @@ class TestSuperTreeIndex:
         prior = st._RANK_K
         st._RANK_K = 7
         assert st._RANK_K == 7
+
+
+# ---------------------------------------------------------------------------
+# L1 文档级证据接地（spec [3.2] enhance 抽象 unit=文档级候选）
+# ---------------------------------------------------------------------------
+
+# _doc_evidence_lines 经 super_tree 内惰性导入解析 `from .agentic.enhance import
+# ...`——与 test_tree_navigation.py 同款隔离：standalone 收集时 spec 加载 enhance
+# 预置 sys.modules；全量套件运行时复用已加载的模块对象。
+if "pageindex_mutil.agentic.enhance" not in sys.modules:
+    _enh_spec = importlib.util.spec_from_file_location(
+        "pageindex_mutil.agentic.enhance", super_tree_path / "agentic" / "enhance.py"
+    )
+    _enh_mod = importlib.util.module_from_spec(_enh_spec)
+    sys.modules["pageindex_mutil.agentic.enhance"] = _enh_mod
+    _enh_spec.loader.exec_module(_enh_mod)
+
+
+def _seed_matching_docs(st, db, client):
+    """doc1 三通道签名全部命中 "风控合规审查"；doc2 零命中。"""
+    client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2}
+    client.documents = {"uuid-a": {"id": "uuid-a"}, "uuid-b": {"id": "uuid-b"}}
+    d1 = db.insert_document("风控手册.pdf", "/tmp/a.pdf")
+    d2 = db.insert_document("财务报表.pdf", "/tmp/b.pdf")
+    db.upsert_node_profiles(d1, [
+        {"node_id": "n1",
+         "entities": [{"name": "风控系统", "type": "system"}],
+         "keywords": ["风控", "合规"],
+         "tags": ["合规管理"]},
+    ])
+    db.upsert_node_profiles(d2, [
+        {"node_id": "n2", "entities": [], "keywords": ["财报"], "tags": []},
+    ])
+    return d1, d2
+
+
+class TestDocEvidenceLines:
+    """_doc_evidence_lines：文档级关键词/实体/标签命中行（确定性、防御式、无 LLM）。"""
+
+    def test_matching_doc_gets_line_nonmatching_omitted(self, super_tree_index):
+        """签名命中文档出行（uuid 标签 + 三通道命中项）；零命中文档不出行。"""
+        st, db, client = super_tree_index
+        d1, d2 = _seed_matching_docs(st, db, client)
+        lines = st._doc_evidence_lines("风控合规审查", [d1, d2])
+        assert set(lines) == {d1}  # 零命中文档整体省略，不发"无命中"噪音
+        assert lines[d1] == ("doc uuid-a: 关键词命中: 风控, 合规 | "
+                             "实体命中: 风控系统 | 标签命中: 合规管理")
+
+    def test_doc_level_closet_tags_channel(self, super_tree_index):
+        """doc 级 closet_tags(source='llm') 进标签通道；fallback 源不进。"""
+        st, db, client = super_tree_index
+        client._uuid_to_db = {"uuid-a": 1}
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        db.insert_closet_tags(d1, [
+            (d1, "风险管理", "风控", 0.9, "llm"),
+            (d1, "fallback词", "风控", 0.5, "fallback"),
+        ])
+        lines = st._doc_evidence_lines("风险管理要求", [d1])
+        assert d1 in lines
+        assert "标签命中: 风险管理" in lines[d1]
+        assert "fallback词" not in lines[d1]
+
+    def test_caps_keywords_entities_tags(self, super_tree_index):
+        """呈现上限：每文档关键词 ≤4 / 实体 ≤3 / 标签 ≤2（按聚合序取前缀）。"""
+        st, db, client = super_tree_index
+        client._uuid_to_db = {"uuid-a": 1}
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        db.upsert_node_profiles(d1, [{
+            "node_id": "n1",
+            "entities": [{"name": f"风控{'ABCDE'[i]}", "type": "x"} for i in range(5)],
+            "keywords": [f"风控{'甲乙丙丁戊己'[i]}" for i in range(6)],
+            "tags": [f"合规{'甲乙丙丁'[i]}" for i in range(4)],
+        }])
+        lines = st._doc_evidence_lines("风控合规审查", [d1])
+        line = lines[d1]
+        kw_part = line.split("关键词命中: ")[1].split(" | ")[0]
+        ent_part = line.split("实体命中: ")[1].split(" | ")[0]
+        tag_part = line.split("标签命中: ")[1]
+        assert kw_part.split(", ") == ["风控甲", "风控乙", "风控丙", "风控丁"]
+        assert ent_part.split(", ") == ["风控A", "风控B", "风控C"]
+        assert tag_part.split(", ") == ["合规甲", "合规乙"]
+
+    def test_malformed_profiles_degrade_gracefully(self, super_tree_index):
+        """坏行（非 dict 实体/非字符串关键词标签/缺名实体）跳过不抛。"""
+        st, db, client = super_tree_index
+        client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2}
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        d2 = db.insert_document("b.pdf", "/tmp/b.pdf")  # 无 profile 行
+        db.upsert_node_profiles(d1, [{
+            "node_id": "n1",
+            "entities": ["notadict", None, 123, {"noname": 1}, {"name": "风控系统"}],
+            "keywords": ["风控", 123, None, {"x": 1}],
+            "tags": [None, 42, "合规管理"],
+        }])
+        lines = st._doc_evidence_lines("风控合规审查", [d1, d2])
+        assert set(lines) == {d1}
+        assert "关键词命中: 风控" in lines[d1]
+        assert "实体命中: 风控系统" in lines[d1]
+        assert "标签命中: 合规管理" in lines[d1]
+
+    def test_db_errors_degrade_gracefully(self, super_tree_index):
+        """db 访问异常 → 该文档空证据，绝不抛出（证据只作参考，不挡选档）。"""
+        st, db, client = super_tree_index
+        client._uuid_to_db = {"uuid-a": 1}
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        with patch.object(db, "get_node_profiles", side_effect=RuntimeError("boom")), \
+             patch.object(db, "get_doc_tags", side_effect=RuntimeError("boom")):
+            lines = st._doc_evidence_lines("风控", [d1])
+        assert lines == {}
+
+    def test_empty_query_or_tokens_no_lines(self, super_tree_index):
+        """空查询/全停用词查询（无 token）→ 无证据行。"""
+        st, db, client = super_tree_index
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        db.upsert_node_profiles(d1, [{
+            "node_id": "n1", "entities": [], "keywords": ["风控"], "tags": [],
+        }])
+        assert st._doc_evidence_lines("", [d1]) == {}
+
+    def test_deterministic_across_calls(self, super_tree_index):
+        """相同输入两次调用 → 相同证据行（内容与顺序都稳定）。"""
+        st, db, client = super_tree_index
+        d1, d2 = _seed_matching_docs(st, db, client)
+        db.insert_closet_tags(d1, [(d1, "风险管理", "风控", 0.9, "llm")])
+        first = st._doc_evidence_lines("风控合规审查", [d1, d2])
+        second = st._doc_evidence_lines("风控合规审查", [d1, d2])
+        assert first == second
+        assert list(first) == list(second)
+
+
+class TestHolisticSelectPromptEvidence:
+    """_holistic_select：证据块注入 prompt（有命中才出现，零命中完全不变）。"""
+
+    @pytest.mark.asyncio
+    async def test_evidence_block_in_prompt(self, super_tree_index):
+        """命中文档证据行 + 指引 + 要求进 prompt；零命中文档不出行。"""
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = json.dumps({"doc_ids": ["uuid-a"]})
+            st, db, client = super_tree_index
+            d1, d2 = _seed_matching_docs(st, db, client)
+            result = await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
+        assert result == ["uuid-a"]
+        prompt = mock_llm.call_args[0][1]
+        assert "[文档语料证据（关键词/实体/标签命中，供参考）]" in prompt
+        assert ("doc uuid-a: 关键词命中: 风控, 合规 | 实体命中: 风控系统 | "
+                "标签命中: 合规管理") in prompt
+        assert "doc uuid-b" not in prompt  # 零命中文档不出行
+        assert "证据是语料事实，请优先依据证据与问题的语义关联程度判断" in prompt
+        assert "无证据命中的文档仍可按标题/摘要判断" in prompt
+        assert "证据命中是强信号" in prompt  # 新增要求行
+        # 位置契约：证据段在 [候选文档结构] 之后、要求 之前
+        assert (prompt.index("[候选文档结构]")
+                < prompt.index("[文档语料证据")
+                < prompt.index("要求："))
+
+    @pytest.mark.asyncio
+    async def test_no_hits_evidence_section_absent(self, super_tree_index):
+        """全无命中 → 证据段/指引/新要求行整体省略（prompt 与改造前一致）。"""
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = json.dumps({"doc_ids": ["uuid-a"]})
+            st, db, client = super_tree_index
+            client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2}
+            client.documents = {"uuid-a": {"id": "uuid-a"}, "uuid-b": {"id": "uuid-b"}}
+            d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+            d2 = db.insert_document("b.pdf", "/tmp/b.pdf")
+            db.upsert_node_profiles(d2, [{
+                "node_id": "n1", "entities": [], "keywords": ["财报"], "tags": [],
+            }])
+            await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
+        prompt = mock_llm.call_args[0][1]
+        assert "文档语料证据" not in prompt
+        assert "证据是语料事实" not in prompt
+        assert "证据命中是强信号" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_malformed_profiles_no_crash_in_select(self, super_tree_index):
+        """选档路径遇坏签名行：不抛异常，prompt 照常生成（坏行跳过）。"""
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = json.dumps({"doc_ids": ["uuid-a"]})
+            st, db, client = super_tree_index
+            client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2}
+            client.documents = {"uuid-a": {"id": "uuid-a"}, "uuid-b": {"id": "uuid-b"}}
+            d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+            d2 = db.insert_document("b.pdf", "/tmp/b.pdf")
+            db.upsert_node_profiles(d1, [{
+                "node_id": "n1",
+                "entities": [None, "bad", {"name": 123}, {"name": "风控系统"}],
+                "keywords": [None, 9, "风控"],
+                "tags": {"not": "a list"},
+            }])
+            result = await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
+        assert result == ["uuid-a"]
+        prompt = mock_llm.call_args[0][1]
+        assert "关键词命中: 风控" in prompt
+        assert "实体命中: 风控系统" in prompt
+
+    @pytest.mark.asyncio
+    async def test_evidence_prompt_deterministic(self, super_tree_index):
+        """两次相同选档 → 注入 prompt 的证据段逐字节一致。"""
+        st, db, client = super_tree_index
+        d1, d2 = _seed_matching_docs(st, db, client)
+        prompts = []
+        for _ in range(2):
+            with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+                mock_llm.return_value = json.dumps({"doc_ids": ["uuid-a"]})
+                await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
+            prompts.append(mock_llm.call_args[0][1])
+        ev0 = prompts[0].split("[文档语料证据")[1]
+        ev1 = prompts[1].split("[文档语料证据")[1]
+        assert ev0 == ev1
