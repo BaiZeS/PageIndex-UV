@@ -255,7 +255,7 @@ class SuperTreeIndex:
     # ------------------------------------------------------------------
     # Lifecycle hooks
     # ------------------------------------------------------------------
-    def on_document_added(self, db_doc_id: int) -> None:
+    def on_document_added(self, db_doc_id: int, content: str = None) -> None:
         doc = self.db.get_document_by_id(db_doc_id)
         if doc:
             # Collect node titles from DB for keyword indexing
@@ -265,15 +265,19 @@ class SuperTreeIndex:
                 node_titles = [n.get("title", "") for n in top_nodes if n.get("title")]
             except Exception:
                 pass
-            # Collect full document body for content-level keyword indexing
-            content = ""
-            try:
-                content = self.db.get_document_content(db_doc_id)
-            except Exception:
-                pass
+            # Collect full document body for content-level keyword indexing.
+            # Prefer caller-provided content (in-memory structure text): MD docs
+            # indexed via client.index_batch never populate the pages table, so
+            # get_document_content() returns empty for them (body-blind BM25).
+            body = content if content else ""
+            if not body:
+                try:
+                    body = self.db.get_document_content(db_doc_id)
+                except Exception:
+                    body = ""
             self.keyword_index.add_document(
                 db_doc_id, doc.get("pdf_name", ""),
-                doc.get("doc_description", ""), node_titles, content=content
+                doc.get("doc_description", ""), node_titles, content=body
             )
         self.kb_identity.invalidate()
 

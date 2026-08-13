@@ -60,6 +60,22 @@ def _iter_structure_nodes(structure):
             yield from _iter_structure_nodes(children)
 
 
+def _extract_structure_text(structure) -> str:
+    """Concatenate every node's text from a nested TOC structure (depth-first).
+
+    Used to feed full document body into the doc-level keyword index. Needed
+    because MD documents indexed via client.index_batch do NOT populate the
+    pages table, so get_document_content() returns empty for them and the
+    doc-level BM25 channel would otherwise see only titles/description.
+    """
+    parts = []
+    for node in _iter_structure_nodes(structure):
+        text = node.get("text")
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
 # P2.6 关键词签名去噪：引用模板垃圾 token（纯数字/日期形/引用词）不得霸占
 # top-K——eval 实证存储签名被 08/2015/官网/引用/日期 淹没，查询概念词落选。
 _JUNK_KEYWORD_TOKENS = frozenset({"官网", "引用", "日期"})
@@ -551,7 +567,8 @@ class PageIndexClient:
                     )
                 # Index Super-Tree keywords
                 if hasattr(self, 'super_tree_index') and self.super_tree_index:
-                    self.super_tree_index.on_document_added(db_doc_id)
+                    self.super_tree_index.on_document_added(
+                        db_doc_id, content=_extract_structure_text(doc.get('structure')))
 
                 # Phase 2: corpus tree, search backend, entity extraction.
                 # By default (sync=True) this runs inline.
@@ -876,7 +893,8 @@ class PageIndexClient:
         for doc_id, db_doc_id, doc in phase1_results:
             try:
                 if hasattr(self, 'super_tree_index') and self.super_tree_index:
-                    self.super_tree_index.on_document_added(db_doc_id)
+                    self.super_tree_index.on_document_added(
+                        db_doc_id, content=_extract_structure_text(doc.get('structure')))
                 if self.search_backend and doc.get('structure'):
                     self.search_backend.index_document(
                         db_doc_id, doc['structure'], doc.get('pages'))
