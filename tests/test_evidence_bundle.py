@@ -2,7 +2,11 @@
 
 import pytest
 
-from pageindex_mutil.agentic.evidence import build_evidence_bundle, derive_evidence_score
+from pageindex_mutil.agentic.evidence import (
+    build_evidence_bundle,
+    derive_evidence_score,
+    render_doc_evidence,
+)
 
 
 def _make_client(tmp_path, docs, keywords, tags):
@@ -37,3 +41,66 @@ def test_bundle_keyword_field_provenance(tmp_path):
 def test_evidence_score_multi_signal(tmp_path):
     entry = {"channels": {"keyword": [{"token": "x"}], "tag": [{"text": "y"}], "entity": [{"name": "z"}]}, "graph": {}}
     assert derive_evidence_score(entry) == 3 * 1 + 2 * 1 + 1 * 1
+
+
+def _graph_client(tmp_path):
+    from pageindex_mutil.client import PageIndexClient
+    from db import PageIndexDB
+    db = PageIndexDB(str(tmp_path / "t.db"))
+    client = PageIndexClient(db_path=str(tmp_path / "t.db"), search_backend="keyword")
+    client.db = db
+    client.closet_index = None
+    client.search_backend = None
+    return client, db
+
+
+def test_graph_channel_links_neighbor_entities(tmp_path):
+    # 图谱通道语义：CTE 邻居实体（非 query 实体）→ 提及它们的文档。
+    # query 实体走 entity 通道不变；graph 通道只挂邻居实体的 doc_entity_links。
+    client, db = _graph_client(tmp_path)
+    doc_a = db.insert_document(pdf_name="A", pdf_path="", doc_description="")
+    doc_b = db.insert_document(pdf_name="B", pdf_path="", doc_description="")
+    e1 = db.insert_entity("concept", "浴血", [])
+    e2 = db.insert_entity("section", "门派介绍", [])
+    db.insert_entity_relation(e1, "related_to", e2)
+    db.insert_entity_mention(e1, doc_a)
+    db.insert_entity_mention(e2, doc_b)
+
+    bundle = build_evidence_bundle(client, db, "浴血", topk=30)
+
+    # entity 通道：query 实体 浴血 → doc A
+    assert any(x["name"] == "浴血" for x in bundle[doc_a]["channels"]["entity"])
+    # graph 通道：邻居实体 门派介绍（距离1·related_to·0.42）→ doc B
+    assert bundle[doc_b]["graph"]["doc_entity_links"] == [
+        {"entity": "门派介绍", "distance": 1, "relation_type": "related_to", "weight": 0.42}
+    ]
+
+
+def test_render_shows_field_and_missing_docs(tmp_path):
+    client, db = _make_client(
+        tmp_path,
+        [("A", "文档A", "", [("浴血", "content", 3)])],
+        None,
+        None,
+    )
+    bundle = build_evidence_bundle(client, db, "浴血", topk=30)
+    text = render_doc_evidence(bundle, [1])
+    assert "浴血(content)" in text
+
+    # 缺席 db_id（不在 bundle 中）须显式注记，而非静默跳过
+    missing = render_doc_evidence({}, [999])
+    assert "doc 999: 无通道命中" in missing
+
+
+def test_tag_text_populated(tmp_path):
+    client, db = _graph_client(tmp_path)
+    did = db.insert_document(pdf_name="A", pdf_path="", doc_description="")
+    db.insert_closet_tags(did, [(did, "帮会活动", "帮会 活动", 0.9, "llm")])
+
+    class _StubCloset:
+        def search(self, query, top_k=10):
+            return [(did, 0.9)]
+
+    client.closet_index = _StubCloset()
+    bundle = build_evidence_bundle(client, db, "帮会活动", topk=30)
+    assert bundle[did]["channels"]["tag"] == [{"text": "帮会活动", "confidence": 0.9}]

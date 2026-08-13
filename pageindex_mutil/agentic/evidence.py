@@ -32,7 +32,8 @@ def build_evidence_bundle(client, db, query, topk=30) -> dict:
             "graph": {"doc_entity_links": []},
         })
 
-    # keyword 通道：先 BM25 打分，再查 doc_keywords 取 (token, field) 来源（spec [S5] 来源契约）
+    # keyword 通道：先 BM25 打分，再查 doc_keywords 取 (token, field) 来源（spec [S5] 来源契约）。
+    # 注：bm25_score 为文档级 BM25 分（同一文档的各 token 复读同一值，仅用于排序，非 token 级分）。
     from ..super_tree import KeywordIndex
     tokens = KeywordIndex._tokenize(None, query)
     if tokens:
@@ -56,13 +57,33 @@ def build_evidence_bundle(client, db, query, topk=30) -> dict:
             except Exception as e:
                 logging.warning("evidence keyword provenance failed: %s", e)
 
-    # tag 通道（closet 语义标签，source=llm）
+    # tag 通道（closet 语义标签，source=llm）：closet_index 命中 doc 后，回填真实标签文本
+    # （仅保留与 query token 子串匹配的标签，复用 UnifiedNodeEnhancement._tag_hits 语义）。
     if getattr(client, "closet_index", None):
         try:
-            for doc_id, score in client.closet_index.search(query, top_k=topk):
-                entry(doc_id)["channels"]["tag"].append({"text": "", "confidence": float(score)})
+            matched_docs = list(client.closet_index.search(query, top_k=topk))
         except Exception as e:
             logging.warning("evidence tag channel failed: %s", e)
+            matched_docs = []
+        for doc_id, score in matched_docs:
+            texts = []
+            try:
+                tags = db.get_doc_tags(doc_id, source="llm")
+                from .enhance import UnifiedNodeEnhancement
+                hits = UnifiedNodeEnhancement._tag_hits(
+                    tokens, query.casefold(), [t["tag_text"] for t in tags])
+                hit_set = {h.casefold() for h in hits}
+                texts = [(t["tag_text"], t["confidence"])
+                         for t in tags if t["tag_text"].casefold() in hit_set]
+            except Exception as e:
+                logging.warning("evidence tag label lookup failed for doc %s: %s", doc_id, e)
+            if texts:
+                for tag_text, tag_conf in texts:
+                    entry(doc_id)["channels"]["tag"].append(
+                        {"text": tag_text, "confidence": float(tag_conf)})
+            else:
+                entry(doc_id)["channels"]["tag"].append(
+                    {"text": "", "confidence": float(score)})
 
     # vector 通道：仅真向量后端（hybrid/chroma，is_vector=True）；keyword no-op 后端不进（防重复计分）
     backend = getattr(client, "search_backend", None)
@@ -73,13 +94,18 @@ def build_evidence_bundle(client, db, query, topk=30) -> dict:
         except Exception as e:
             logging.warning("evidence vector channel failed: %s", e)
 
-    # entity 通道 + 图谱关联（CTE）
+    # entity 通道（query 实体 → 提及它们的文档）+ 图谱关联（CTE）
     try:
         entities = db.search_entities(query, limit=topk)
-    except Exception:
+    except Exception as e:
+        logging.warning("evidence entity search failed: %s", e)
         entities = []
     query_ids = [e["id"] for e in entities if e.get("id")]
-    dist_table = db.get_entity_distances_cte(query_ids, max_hop=3) if query_ids else {}
+    try:
+        dist_table = db.get_entity_distances_cte(query_ids, max_hop=3) if query_ids else {}
+    except Exception as e:
+        logging.warning("evidence entity distance CTE failed: %s", e)
+        dist_table = {}
     try:
         if query_ids:
             placeholders = ",".join("?" for _ in query_ids)
@@ -90,13 +116,25 @@ def build_evidence_bundle(client, db, query, topk=30) -> dict:
             for r in rows:
                 entry(r["doc_id"])["channels"]["entity"].append(
                     {"name": r["name"], "type": r["entity_type"], "confidence": r["confidence"]})
-                info = dist_table.get(r["entity_id"])
-                if info:
-                    entry(r["doc_id"])["graph"]["doc_entity_links"].append(
-                        {"entity": r["name"], "distance": info["distance"],
-                         "relation_type": info["relation_type"], "weight": info["weight"]})
     except Exception as e:
         logging.warning("evidence entity channel failed: %s", e)
+
+    # graph 通道：CTE 邻居实体 → 提及它们的文档（邻居 id 来自 dist_table 的 key）
+    if dist_table:
+        try:
+            neighbor_ids = list(dist_table.keys())
+            placeholders = ",".join("?" for _ in neighbor_ids)
+            rows = db._connect().execute(
+                f"SELECT em.entity_id, em.doc_id, e.name "
+                f"FROM entity_mentions em JOIN entities e ON e.id = em.entity_id "
+                f"WHERE em.entity_id IN ({placeholders})", neighbor_ids).fetchall()
+            for r in rows:
+                info = dist_table[r["entity_id"]]
+                entry(r["doc_id"])["graph"]["doc_entity_links"].append(
+                    {"entity": r["name"], "distance": info["distance"],
+                     "relation_type": info["relation_type"], "weight": info["weight"]})
+        except Exception as e:
+            logging.warning("evidence graph channel failed: %s", e)
 
     for db_id, e in bundle.items():
         e["channels"]["keyword"] = _dedup(e["channels"]["keyword"], lambda k: (k["token"], k["field"]))
@@ -111,11 +149,12 @@ def render_doc_evidence(bundle, db_ids) -> str:
     for db_id in db_ids:
         e = bundle.get(int(db_id))
         if not e:
+            lines.append(f"doc {db_id}: 无通道命中")
             continue
         ch = e["channels"]
         parts = []
         if ch["keyword"]:
-            parts.append("关键词命中: " + ", ".join(k["token"] or f"content:{k['bm25_score']:.2f}" for k in ch["keyword"]))
+            parts.append("关键词命中: " + ", ".join(f"{k['token']}({k['field']})" for k in ch["keyword"]))
         if ch["entity"]:
             parts.append("实体命中: " + ", ".join(f"{x['name']}（{x['type']}）" for x in ch["entity"]))
         if ch["tag"]:
