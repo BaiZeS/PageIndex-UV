@@ -163,3 +163,86 @@ class TestHybridSearchBackend:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# BM25 keyword channel tests (P2-Fix1)
+# ---------------------------------------------------------------------------
+
+class TestBM25KeywordChannel:
+    """Tests for BM25 scoring in match_doc_keywords (P2-Fix1)."""
+
+    def setup_method(self):
+        import tempfile
+        self.tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        self.tmp.close()
+        from db import PageIndexDB
+        self.db = PageIndexDB(self.tmp.name)
+        self.db.ensure_schema()
+
+    def teardown_method(self):
+        import os
+        self.db._connect().close()
+        os.unlink(self.tmp.name)
+
+    def _add_doc(self, doc_id, name="test"):
+        """Insert a document with a specific id. Returns the doc_id."""
+        with self.db._connect() as conn:
+            conn.execute("INSERT INTO documents (id, pdf_name, pdf_path) VALUES (?, ?, ?)",
+                         (doc_id, name, "/tmp/test.pdf"))
+        return doc_id
+
+    def _add_keywords(self, doc_id, keywords):
+        """Add keywords with tf counts. keywords: {token: tf}"""
+        records = [(doc_id, tok, "content", tf) for tok, tf in keywords.items()]
+        self.db.insert_doc_keywords(doc_id, records)
+
+    def test_bm25_higher_tf_ranks_higher(self):
+        """BM25: document with higher TF for the same token ranks higher."""
+        self._add_doc(1, "doc1")
+        self._add_doc(2, "doc2")
+        self._add_keywords(1, {"python": 5})
+        self._add_keywords(2, {"python": 1})
+
+        results = self.db.match_doc_keywords(["python"], top_k=10)
+        assert len(results) == 2
+        assert results[0][0] == 1  # higher TF ranks first
+
+    def test_bm25_shorter_doc_with_density_ranks_higher(self):
+        """BM25: shorter document with higher TF density ranks higher (doc-length normalization)."""
+        self._add_doc(1, "doc1")
+        self._add_doc(2, "doc2")
+        # doc1: 1 python out of 1 → 100% density
+        self._add_keywords(1, {"python": 1})
+        # doc2: 1 python out of 1000 → 0.1% density
+        long_kw = {"python": 1, **{f"word{i}": 1 for i in range(999)}}
+        self._add_keywords(2, long_kw)
+
+        results = self.db.match_doc_keywords(["python"], top_k=10)
+        assert results[0][0] == 1  # shorter doc with higher density wins
+
+    def test_bm25_score_positive_for_exact_match(self):
+        """BM25: score > 0 for exact token match."""
+        self._add_doc(1, "doc1")
+        self._add_keywords(1, {"machine": 3, "learning": 2})
+
+        results = self.db.match_doc_keywords(["machine", "learning"], top_k=10)
+        assert len(results) == 1
+        assert results[0][1] > 0
+
+    def test_bm25_single_token_backward_compat(self):
+        """BM25: single-token queries still return results (backward compat)."""
+        self._add_doc(1, "doc1")
+        self._add_keywords(1, {"test": 1})
+
+        results = self.db.match_doc_keywords(["test"], top_k=10)
+        assert len(results) == 1
+        assert results[0][0] == 1
+
+    def test_bm25_no_match(self):
+        """BM25: no match returns empty list."""
+        self._add_doc(1, "doc1")
+        self._add_keywords(1, {"test": 1})
+
+        results = self.db.match_doc_keywords(["nonexistent"], top_k=10)
+        assert results == []

@@ -279,6 +279,12 @@ class PageIndexDB:
                 "WHERE source = 'llm' AND abs(confidence - 0.3) < 1e-9"
             )
 
+            # Migrate: add tf column for BM25 scoring (idempotent)
+            try:
+                conn.execute("SELECT tf FROM doc_keywords LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE doc_keywords ADD COLUMN tf INTEGER DEFAULT 1")
+
     def insert_document(self, pdf_name, pdf_path, doc_description=None):
         with self._connect() as conn:
             cur = conn.execute(
@@ -602,9 +608,11 @@ class PageIndexDB:
             conn.execute("DELETE FROM doc_keywords WHERE doc_id = ?", (doc_id,))
             for i in range(0, len(records), 100):
                 chunk = records[i:i + 100]
+                # Backward compat: 3-element tuples (doc_id, keyword, field) → tf=1
+                normalized = [r if len(r) == 4 else (*r, 1) for r in chunk]
                 conn.executemany(
-                    "INSERT INTO doc_keywords (doc_id, keyword, field) VALUES (?, ?, ?)",
-                    chunk,
+                    "INSERT INTO doc_keywords (doc_id, keyword, field, tf) VALUES (?, ?, ?, ?)",
+                    normalized,
                 )
 
     def delete_doc_keywords(self, doc_id):
@@ -616,34 +624,58 @@ class PageIndexDB:
             return []
         conn = self._connect()
         if len(tokens) <= SQLITE_MAX_VARIABLE_NUMBER:
-            placeholders = ",".join("?" for _ in tokens)
-            sql = f"""
-                SELECT doc_id, COUNT(*) AS score
-                FROM doc_keywords
-                WHERE keyword IN ({placeholders})
-                GROUP BY doc_id
-                ORDER BY score DESC
-                LIMIT ?
-            """
-            rows = conn.execute(sql, (*tokens, top_k)).fetchall()
-            return [(r["doc_id"], r["score"]) for r in rows]
-        results = []
+            return self._bm25_query(conn, tokens, top_k)
+        # Chunked path: compute BM25 per chunk, merge scores by summation
+        merged = {}
         for i in range(0, len(tokens), SQLITE_MAX_VARIABLE_NUMBER):
             chunk = tokens[i:i + SQLITE_MAX_VARIABLE_NUMBER]
-            placeholders = ",".join("?" for _ in chunk)
-            sql = f"""
-                SELECT doc_id, COUNT(*) AS score
-                FROM doc_keywords
-                WHERE keyword IN ({placeholders})
-                GROUP BY doc_id
-            """
-            rows = conn.execute(sql, chunk).fetchall()
-            results.extend(rows)
-        merged = {}
-        for r in results:
-            merged[r["doc_id"]] = merged.get(r["doc_id"], 0) + r["score"]
+            for doc_id, score in self._bm25_query(conn, chunk, top_k=None):
+                merged[doc_id] = merged.get(doc_id, 0.0) + score
         sorted_docs = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:top_k]
         return sorted_docs
+
+    def _bm25_query(self, conn, tokens, top_k):
+        """BM25 scoring: k1=1.5, b=0.75, proper IDF, TF, doc-length normalization."""
+        placeholders = ",".join("?" for _ in tokens)
+        limit_clause = f"LIMIT ?" if top_k is not None else ""
+        sql = f"""
+            WITH doc_lens AS (
+                SELECT doc_id, SUM(tf) AS doc_len FROM doc_keywords GROUP BY doc_id
+            ),
+            avgdl_val AS (
+                SELECT AVG(doc_len) AS avgdl FROM doc_lens
+            ),
+            N_val AS (
+                SELECT COUNT(DISTINCT id) AS N FROM documents
+            ),
+            tok_df AS (
+                SELECT keyword, COUNT(DISTINCT doc_id) AS df
+                FROM doc_keywords WHERE keyword IN ({placeholders}) GROUP BY keyword
+            ),
+            per_tok AS (
+                SELECT doc_id, keyword, SUM(tf) AS tf_sum
+                FROM doc_keywords WHERE keyword IN ({placeholders})
+                GROUP BY doc_id, keyword
+            )
+            SELECT pt.doc_id,
+                   SUM(
+                     (pt.tf_sum * 2.5) / (pt.tf_sum + 1.5 * (1.0 - 0.75 + 0.75 * (dl.doc_len / av.avgdl)))
+                     * LN(1.0 + (n.N - tdf.df + 0.5) / (tdf.df + 0.5))
+                   ) AS score
+            FROM per_tok pt
+            JOIN doc_lens dl ON dl.doc_id = pt.doc_id
+            CROSS JOIN avgdl_val av
+            CROSS JOIN N_val n
+            JOIN tok_df tdf ON tdf.keyword = pt.keyword
+            GROUP BY pt.doc_id
+            ORDER BY score DESC
+            {limit_clause}
+        """
+        params = (*tokens, *tokens)
+        if top_k is not None:
+            params = (*params, top_k)
+        rows = conn.execute(sql, params).fetchall()
+        return [(r["doc_id"], r["score"]) for r in rows]
 
     def set_kb_identity(self, identity_text, doc_count):
         with self._connect() as conn:

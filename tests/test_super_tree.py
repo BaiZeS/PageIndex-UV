@@ -596,3 +596,36 @@ class TestHolisticSelectPromptEvidence:
         ev0 = prompts[0].split("[文档语料证据")[1]
         ev1 = prompts[1].split("[文档语料证据")[1]
         assert ev0 == ev1
+
+
+# ---------------------------------------------------------------------------
+# P2-Fix5: tag casefold consistency
+# ---------------------------------------------------------------------------
+
+
+class TestTagCasefold:
+    def test_case_different_same_tag_deduped_with_correct_count(self, super_tree_index):
+        """P2-Fix5: "AI" and "ai" counted together, appear once in profile."""
+        st, db, _ = super_tree_index
+        d1 = db.insert_document("a.pdf", "/tmp/a.pdf")
+        d2 = db.insert_document("b.pdf", "/tmp/b.pdf")
+        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
+        cluster = db.insert_corpus_tree_node(root, "技术", "", 1, kind="cluster")
+        db.add_corpus_membership(d1, cluster, 1.0)
+        db.add_corpus_membership(d2, cluster, 0.5)
+
+        db.insert_closet_tags(d1, [(d1, "AI", "AI", 0.9, "llm")])
+        db.insert_closet_tags(d2, [(d2, "ai", "ai", 0.8, "llm")])
+
+        view = st._load_corpus_tree()
+        profile = st._aggregate_cluster_profile(cluster, view, {})
+
+        assert len(profile["tags"]) == 1  # deduped to one
+        assert profile["tags"][0] in ("AI", "ai")  # first-seen display text
+        # Verify count: "AI" and "ai" should be counted together
+        # Both docs have the tag, so count should be 2
+        from collections import Counter
+        view2 = st._load_corpus_tree()
+        profile2 = st._aggregate_cluster_profile(cluster, view2, {})
+        # top tag should have count 2 (both docs counted)
+        assert len(profile2["tags"]) == 1

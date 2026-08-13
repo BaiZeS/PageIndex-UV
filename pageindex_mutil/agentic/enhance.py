@@ -551,7 +551,7 @@ def resolve_node_profiles(db, db_doc_id, mapping) -> dict:
                 "resolve_node_profiles: get_node_profiles(%s) failed: %s", db_doc_id, e
             )
         if rows:
-            return {
+            profiles = {
                 p["node_id"]: {
                     "entities": p.get("entities") or [],
                     "keywords": p.get("keywords") or [],
@@ -559,6 +559,9 @@ def resolve_node_profiles(db, db_doc_id, mapping) -> dict:
                 }
                 for p in rows if isinstance(p, dict) and p.get("node_id")
             }
+            if profiles:
+                return profiles
+            # All DB rows were malformed — fall through to structure keys
     profiles = {}
     for nid, node in (mapping or {}).items():
         if not isinstance(node, dict):

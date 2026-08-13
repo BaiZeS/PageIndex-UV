@@ -1,5 +1,6 @@
 import logging
-from typing import List, Tuple
+from collections import Counter
+from typing import Dict, List, Tuple
 
 try:
     import jieba
@@ -30,19 +31,18 @@ class KeywordIndex:
     def add_document(self, doc_id: int, doc_name: str, doc_description: str,
                      node_titles: List[str] = None, content: str = None) -> None:
         records = []
-        for token in self._tokenize(doc_name):
-            records.append((doc_id, token, "name"))
-        for token in self._tokenize(doc_description or ""):
-            records.append((doc_id, token, "description"))
+        for token, count in Counter(self._tokenize(doc_name)).items():
+            records.append((doc_id, token, "name", count))
+        for token, count in Counter(self._tokenize(doc_description or "")).items():
+            records.append((doc_id, token, "description", count))
         if node_titles:
             for title in node_titles:
-                for token in self._tokenize(title):
-                    records.append((doc_id, token, "node_title"))
-        # Index full document body (unique tokens) so keyword search covers content,
-        # not just titles/descriptions — critical for short-passage retrieval.
+                for token, count in Counter(self._tokenize(title)).items():
+                    records.append((doc_id, token, "node_title", count))
+        # Index full document body with term frequencies for BM25 scoring.
         if content:
-            for token in set(self._tokenize(content)):
-                records.append((doc_id, token, "content"))
+            for token, count in Counter(self._tokenize(content)).items():
+                records.append((doc_id, token, "content", count))
         self.db.insert_doc_keywords(doc_id, records)
 
     def remove_document(self, doc_id: int) -> None:
@@ -1056,6 +1056,7 @@ class SuperTreeIndex:
         ent_meta: Dict[str, Dict] = {}
         kw_counts: Counter = Counter()
         tag_counts: Counter = Counter()
+        tag_texts: Dict[str, str] = {}  # casefold key → first-seen display text
 
         for doc_id in doc_ids:
             try:
@@ -1100,10 +1101,12 @@ class SuperTreeIndex:
                 if key in seen_tag:
                     continue
                 seen_tag.add(key)
-                tag_counts[text] += 1
+                if key not in tag_texts:
+                    tag_texts[key] = text
+                tag_counts[key] += 1
 
         profile["keywords"] = [kw for kw, _ in kw_counts.most_common(self._CLUSTER_PROFILE_MAX_KEYWORDS)]
-        profile["tags"] = [tag for tag, _ in tag_counts.most_common(self._CLUSTER_PROFILE_MAX_TAGS)]
+        profile["tags"] = [tag_texts.get(tag, tag) for tag, _ in tag_counts.most_common(self._CLUSTER_PROFILE_MAX_TAGS)]
 
         entities = []
         for name, _cnt in ent_counts.most_common(self._CLUSTER_PROFILE_MAX_ENTITIES):

@@ -47,6 +47,9 @@ META_INDEX = "_meta.json"
 # attribution can fan out on repetitive docs; keep the table bounded.
 _MAX_NODE_MENTIONS_PER_ENTITY = 20
 
+# P2: max nodes to feed to context assembly when LLM degrades to union passthrough
+_MAX_DEGRADE_NODES = 20
+
 
 def _iter_structure_nodes(structure):
     """Yield every node dict in a nested TOC structure, depth-first."""
@@ -1231,7 +1234,10 @@ class PageIndexClient:
         pages = pages_from_nodes(selected)
 
         # Context assembly covers ALL selected nodes ([3.4.1]① multi-span)
-        context = build_context_for_doc(doc, selected, pages)
+        ctx_selected = selected
+        if result.get("concern_reason") == "llm_unavailable" and len(ctx_selected) > _MAX_DEGRADE_NODES:
+            ctx_selected = ctx_selected[:_MAX_DEGRADE_NODES]
+        context = build_context_for_doc(doc, ctx_selected, pages)
         answer = generate_answer(query, context)
 
         page_map = {p["page"]: p["content"] for p in doc.get("pages", [])}
@@ -1240,13 +1246,19 @@ class PageIndexClient:
         # evidence-derived in (0,1]; replaces the legacy hardcoded 1.0.
         score = min(round(len(selected) / max(len(candidates), 1), 4), 1.0)
 
+        # confidence: high = 无 pool_concern（候选池完整，精挑可信）；
+        # medium = pool_concern 留存（候选或被截，答案仅供参考）；
+        # low = LLM 不可用（降级为 union 放行，[7.7]）
+        if result.get("concern_reason") == "llm_unavailable":
+            confidence = "low"
+        else:
+            confidence = "medium" if result["pool_concern"] else "high"
+
         return {
             "query": query,
             "mode": "single",
             "answer": answer,
-            # confidence: high = 无 pool_concern（候选池完整，精挑可信）；
-            # medium = pool_concern 留存（候选或被截，答案仅供参考）
-            "confidence": "medium" if result["pool_concern"] else "high",
+            "confidence": confidence,
             "matched_docs": [{"doc_id": doc_id, "score": score}],
             "selected_nodes": [
                 {

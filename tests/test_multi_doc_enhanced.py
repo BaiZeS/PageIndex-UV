@@ -736,3 +736,42 @@ class TestMdNodeRecallNoPagesGate:
         # 传给答案 LLM 的上下文确实含节点 text（证据接地闭环）
         assert len(gen_calls) == 1
         assert "浴血值可以通过日常任务获得。" in gen_calls[0][1]
+
+
+# ---------------------------------------------------------------------------
+# P2-Fix4: NFR4 router-site retrieve_model test
+# ---------------------------------------------------------------------------
+
+
+class TestNFR4RouterSite:
+    def test_router_enhance_uses_retrieve_model(self):
+        """NFR4：router 构造时传入 retrieve_model，enhance 内 llm_completion 用 retrieve_model。"""
+        import asyncio
+        from pageindex_mutil.agentic.router import AgenticRouter
+
+        models = []
+
+        mock_client = MagicMock()
+        mock_client._ensure_doc_loaded = MagicMock()
+        mock_client.documents = {
+            "doc1": {
+                "doc_name": "test", "type": "md",
+                "structure": [_md_node("n0")], "pages": [],
+            }
+        }
+        mock_client._id_mapper = MagicMock()
+        mock_client._id_mapper.to_db = MagicMock(return_value=1)
+        mock_client.db = None
+
+        router = AgenticRouter(mock_client, model="m", retrieve_model="r-model")
+
+        def fake_llm(model, prompt, **kw):
+            models.append(model)
+            return _select_json(["n0"], False, "")
+
+        async def call_recall():
+            with patch.object(_enhance_mod(), "llm_completion", side_effect=fake_llm):
+                return await router._recall_nodes_for_doc("test", "doc1")
+
+        asyncio.run(call_recall())
+        assert models and all(m == "r-model" for m in models)

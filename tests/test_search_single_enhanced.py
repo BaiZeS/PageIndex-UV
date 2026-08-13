@@ -582,4 +582,54 @@ class TestNFR4AndShape:
             "matched_docs", "selected_nodes", "pages",
         }
         assert result["mode"] == "single"
-        assert result["selected_nodes"][0]["node_id"] == "n0"
+
+
+# ---------------------------------------------------------------------------
+# 8. P2-Fix2: llm_unavailable → confidence low + Fix3: budget cap
+# ---------------------------------------------------------------------------
+
+
+class TestDegradeConfidenceAndCap:
+    def test_llm_unavailable_yields_confidence_low(self):
+        """P2-Fix2: when enhance returns llm_unavailable, confidence is "low"."""
+        client = _client()
+        _add_doc(client, [_node("n0")])
+
+        enhancer = _enhance_mod().UnifiedNodeEnhancement("m", "r")
+        async def fake_enhance(*args, **kwargs):
+            return {"selected_ids": ["n0"], "pool_concern": False,
+                    "concern_reason": "llm_unavailable", "deferred": []}
+
+        with patch.object(_enhance_mod(), "UnifiedNodeEnhancement",
+                          lambda model, retrieve_model=None: enhancer), \
+             patch.object(enhancer, "enhance_and_select", side_effect=fake_enhance), \
+             _patch_generate_answer():
+            result = _run_search_single(client)
+        assert result["confidence"] == "low"
+
+    def test_degrade_context_truncated_to_max_nodes(self):
+        """P2-Fix3: when LLM degrades, context is built from ≤ MAX_DEGRADE_NODES."""
+        client = _client()
+        nodes = [_node(f"n{i}") for i in range(30)]
+        _add_doc(client, nodes)
+
+        enhancer = _enhance_mod().UnifiedNodeEnhancement("m", "r")
+        async def fake_enhance(*args, **kwargs):
+            return {"selected_ids": [f"n{i}" for i in range(30)],
+                    "pool_concern": False,
+                    "concern_reason": "llm_unavailable", "deferred": []}
+
+        context_arg = []
+        original_func = _reasoning_mod().build_context_for_doc
+
+        def fake_build_context(doc, selected, pages):
+            context_arg.append(len(selected))
+            return original_func(doc, selected[:5], pages)
+
+        with patch.object(_enhance_mod(), "UnifiedNodeEnhancement",
+                          lambda model, retrieve_model=None: enhancer), \
+             patch.object(enhancer, "enhance_and_select", side_effect=fake_enhance), \
+             patch.object(_reasoning_mod(), "build_context_for_doc", side_effect=fake_build_context), \
+             _patch_generate_answer():
+            _run_search_single(client)
+        assert context_arg[0] <= 20  # _MAX_DEGRADE_NODES

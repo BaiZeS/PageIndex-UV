@@ -855,6 +855,15 @@ class TestResolveNodeProfiles:
         assert resolve_node_profiles(None, None, {"n1": {}}) == {}
         assert resolve_node_profiles(None, None, {}) == {}
 
+    def test_all_malformed_db_rows_falls_back_to_structure_keys(self):
+        """P2-Fix6: when all DB rows are malformed (non-dict), fall through to structure keys."""
+        from pageindex_mutil.agentic.enhance import resolve_node_profiles
+        db = MagicMock()
+        db.get_node_profiles.return_value = ["not a dict", 123, None]
+        mapping = {"n1": {"keywords": ["structure_kw"], "tags": ["structure_tag"]}}
+        profiles = resolve_node_profiles(db, 1, mapping)
+        assert profiles == {"n1": {"keywords": ["structure_kw"], "tags": ["structure_tag"]}}
+
 
 # ===========================================================================
 # 11. P2 审查修复回归
