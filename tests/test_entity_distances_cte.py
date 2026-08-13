@@ -71,7 +71,9 @@ def test_cte_matches_bfs_implementation(graph_db):
 
 
 def test_cte_tiebreak_same_hop_max_weight(graph_db):
-    # 两个并行的 1-hop 边：causal(1.0) 与 related_to(0.6)——同 hop 取最大权重
+    """不同实体各自的 1-hop 权重：2 走 related_to(0.6)，5 走 causal(1.0)。
+    仅验证 per-entity hop-1 权重语义（0.7×关系权重），并非同实体并行边 tie-break。
+    """
     with graph_db._connect() as conn:
         conn.execute("INSERT INTO entities (id, name, entity_type, doc_count) VALUES (5,'甲','concept',1)")
         conn.execute("INSERT INTO entity_relations (subject_id, predicate, object_id, doc_id, confidence) VALUES (1,'causal',5,NULL,0.9)")
@@ -80,6 +82,16 @@ def test_cte_tiebreak_same_hop_max_weight(graph_db):
     assert abs(got[2]["weight"] - 0.42) < 1e-6  # 0.7×related_to 0.6
     assert got[5]["distance"] == 1
     assert abs(got[5]["weight"] - 0.7) < 1e-6   # 0.7×causal 1.0
+
+
+def test_cte_same_entity_parallel_path_takes_max_weight(graph_db):
+    # 同一实体 2 经两条 1-hop 边（causal 与 related_to）——同 hop 取最大权重，causal 胜出
+    with graph_db._connect() as conn:
+        conn.execute("INSERT INTO entity_relations (subject_id, predicate, object_id, doc_id, confidence) VALUES (1,'causal',2,NULL,0.9)")
+    got = graph_db.get_entity_distances_cte([1], max_hop=3)
+    assert got[2]["distance"] == 1
+    assert got[2]["relation_type"] == "causal"
+    assert abs(got[2]["weight"] - 0.7) < 1e-6  # 0.7×1.0 胜过 related_to 的 0.42
 
 
 def test_cte_covers_all_predicates_and_defaults(graph_db):
