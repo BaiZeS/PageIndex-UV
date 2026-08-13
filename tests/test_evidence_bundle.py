@@ -1,5 +1,8 @@
 """P1 [S5] 证据束构建原语测试 —— 四通道原始命中带来源 + 图谱 CTE 关联。"""
 
+import asyncio
+import sys
+
 import pytest
 
 from pageindex_mutil.agentic.evidence import (
@@ -107,7 +110,7 @@ def test_tag_text_populated(tmp_path):
 
 
 def test_holistic_select_uses_evidence_bundle(tmp_path, monkeypatch):
-    """evidence_bundle 传入时 prompt 证据块来自证据束（field 来源可见）；不传时行为不变。"""
+    """evidence_bundle 传入时 prompt 证据块来自证据束（field 来源可见）。"""
     client, db = _make_client(
         tmp_path,
         [("A", "文档A", "", [("浴血", "content", 3)]),
@@ -125,10 +128,13 @@ def test_holistic_select_uses_evidence_bundle(tmp_path, monkeypatch):
         captured["p"] = prompt
         return '{"doc_ids": []}'
 
-    monkeypatch.setattr("pageindex_mutil.super_tree.llm_acompletion", fake_llm)
+    # 打补丁必须落在类真实所在的模块对象上：test_super_tree.py 导入期会用 stub
+    # 模块 clobber sys.modules["pageindex_mutil.super_tree"]，字符串路径经
+    # monkeypatch.resolve 走的是 pageindex_mutil 包属性（可能是另一个模块对象），
+    # 合并运行时会打空导致 fake_llm 不被调用。故按 __module__ 反查 sys.modules。
+    st_module = sys.modules[SuperTreeIndex.__module__]
+    monkeypatch.setattr(st_module, "llm_acompletion", fake_llm)
     # KBIdentity 会同步调 llm_completion；屏蔽以隔离本用例（只验证证据源切换）。
-    monkeypatch.setattr("pageindex_mutil.super_tree.llm_completion",
-                        lambda *a, **k: "测试知识库")
-    import asyncio
+    monkeypatch.setattr(st_module, "llm_completion", lambda *a, **k: "测试知识库")
     asyncio.run(st._holistic_select("浴血", [1, 2], evidence_bundle=bundle))
     assert "浴血(content)" in captured["p"]
