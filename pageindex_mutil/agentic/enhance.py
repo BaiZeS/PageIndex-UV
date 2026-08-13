@@ -41,8 +41,11 @@ _DEFAULT_EVIDENCE_MAX_CHARS = 6000
 
 # [3.2.1] pool_concern 重选：union 上限放宽倍数。候选/签名不变，被截候选经
 # union 自然回池，该参数只抬高上限让延迟池节点重新可被 LLM 精挑。
-# 三个接入点（单文档 _search_single / 多文档 _recall_nodes_for_doc /
-# 语料树逐层 _navigate_level）共用同一倍数约定。
+# 延迟分支与 force-all 全池分支共用该倍数：force-all 不放宽 cap 时，零信号候选
+# 会在全量准入后按分降序垫底、再次被截——全池重选退化为 pass-1，判据①救不到
+# 任何节点。单文档 _search_single / 多文档 _recall_nodes_for_doc 经
+# retry_on_pool_concern 共享；语料树逐层 _navigate_level 只用延迟分支
+# （簇节点无正文通道）。
 POOL_CONCERN_RETRY_CAP_MULTIPLIER = 2
 
 
@@ -131,6 +134,8 @@ class UnifiedNodeEnhancement:
         存储签名被引用垃圾淹没/缺失时，正文是唯一可靠接地——命中即准入 union，
         命中词记入关键词证据。返回命中的 query token（保序去重）。
         防御性：text 非字符串/为空 → 空命中（通道关闭，绝不抛出）。
+        已知取舍：子串匹配对嵌在更长词内部的短 token 可能误命中（如 "ai" 命中
+        "retain"），召回优先 [1.1] 下接受该误报——准入宽于漏召。
         """
         if not isinstance(text, str) or not text or not query_tokens:
             return []
@@ -566,3 +571,37 @@ def resolve_node_profiles(db, db_doc_id, mapping) -> dict:
         if prof:
             profiles[nid] = prof
     return profiles
+
+
+async def retry_on_pool_concern(enhancer, result, query, candidates, profiles,
+                                query_entities=None) -> dict:
+    """[3.2.1] pool_concern 重选共享助手：至多一次重试，二选一互斥分支，杜绝循环。
+
+    ① 存在被截候选 → 放宽 union 上限重选（候选/签名不变，被截候选经 union
+       自然回池，上限放宽只抬高 cap）。
+    ② 无被截候选（候选池本就完整）→ 判据①"关键概念无命中"意味着 union 准入
+       逻辑漏掉了相关节点 → force_all_candidates 全池直通重选一次，并同样放宽
+       cap：不放宽则零信号候选在全量准入后按分降序垫底、再次被截，全池重选退化
+       为 pass-1，救不到判据①要救的节点。
+
+    无 pool_concern → 原样返回（零额外 LLM 调用）。重选后仍 pool_concern 也直接
+    返回（接受结果，medium 语义由调用方决定）。候选/签名对象不做拷贝，与首选调用
+    保持同一引用。语料树逐层 _navigate_level 只用延迟分支（簇节点无正文通道），
+    不经本助手。
+    """
+    if not result["pool_concern"]:
+        return result
+    widened_cap = (
+        max(1, int(enhancer.union_max_candidates))
+        * POOL_CONCERN_RETRY_CAP_MULTIPLIER
+    )
+    if result["deferred"]:
+        return await enhancer.enhance_and_select(
+            query, candidates, profiles, query_entities=query_entities,
+            max_candidates=widened_cap,
+        )
+    return await enhancer.enhance_and_select(
+        query, candidates, profiles, query_entities=query_entities,
+        max_candidates=widened_cap,
+        force_all_candidates=True,
+    )

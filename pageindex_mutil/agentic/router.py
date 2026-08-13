@@ -222,7 +222,7 @@ class AgenticRouter:
             UnifiedNodeEnhancement,
             resolve_query_entities,
             resolve_node_profiles,
-            POOL_CONCERN_RETRY_CAP_MULTIPLIER,
+            retry_on_pool_concern,
         )
 
         mapping = create_node_mapping(structure)
@@ -270,23 +270,13 @@ class AgenticRouter:
             query, candidates, profiles, query_entities=query_entities,
         )
 
-        # [3.2.1] pool_concern 重选（至多一次，二选一分支，杜绝重试循环）：
-        # ① 存在被截候选 → 放宽 union 上限重选（候选/签名不变，被截候选经 union
-        #    自然回池，上限放宽只抬高 cap）。
-        # ② 无被截候选（候选池本就完整）→ 判据①"关键概念无命中"意味着 union
-        #    准入逻辑漏掉了相关节点 → force_all_candidates 全池直通重选一次。
-        if result["pool_concern"]:
-            if result["deferred"]:
-                result = await enhancer.enhance_and_select(
-                    query, candidates, profiles, query_entities=query_entities,
-                    max_candidates=max(1, int(enhancer.union_max_candidates))
-                    * POOL_CONCERN_RETRY_CAP_MULTIPLIER,
-                )
-            else:
-                result = await enhancer.enhance_and_select(
-                    query, candidates, profiles, query_entities=query_entities,
-                    force_all_candidates=True,
-                )
+        # [3.2.1] pool_concern 重选（至多一次，二选一分支）走共享助手：
+        # ① 有被截候选 → 放宽 union 上限重选；② 无被截候选 → force-all 全池
+        # 直通重选（同样放宽 cap，防零信号候选垫底再截）。详见 retry_on_pool_concern。
+        result = await retry_on_pool_concern(
+            enhancer, result, query, candidates, profiles,
+            query_entities=query_entities,
+        )
 
         selected_ids = result["selected_ids"]
         if not selected_ids:

@@ -5,7 +5,8 @@
    证据接地进 prompt（浴血值式断言）、DB node_profiles 优先/structure 键兜底、
    matched_info 内容命中词并入关键词证据；
 2. 启发式关键词兜底已移除：LLM 精挑为空即无召回（LLM 唯一裁剪者，[7.7]）；
-3. pool_concern + deferred → 放宽 union 上限重选一次（×2 约定）；
+3. pool_concern 重选（至多一次）：有 deferred → 放宽 union 上限；
+   无 deferred → force-all 全池（同步放宽 cap；×2 约定）；
 4. matched_docs score 语义统一：_search_super_tree 用节点召回覆盖度
    （evidence-derived，确定性 (0,1]），无召回证据的文档不进 matched；
    Act 失败 → matched 为空（不虚报）；响应形状键不变；
@@ -333,7 +334,10 @@ class TestRecallPoolConcernRetry:
 
     def test_full_pool_retry_when_pool_concern_and_deferred_empty(self):
         """P2.6：pool_concern 且 deferred 为空（判据①关键概念无命中）→
-        force_all_candidates=True 全量重选一次；第二次结果生效；至多重试一次。"""
+        force_all_candidates=True 全量重选一次；第二次结果生效；至多重试一次。
+        审查加固：全池重选同步放宽 cap——候选数超 cap 时零信号候选才不会
+        按分降序垫底被再次截掉（否则全池重选退化为 pass-1）。"""
+        from pageindex_mutil.agentic.enhance import POOL_CONCERN_RETRY_CAP_MULTIPLIER
         router, _ = _router_with_doc([_node("n0"), _node("n1")])
         results = [
             {"selected_ids": [], "pool_concern": True,
@@ -352,7 +356,10 @@ class TestRecallPoolConcernRetry:
         assert len(calls) == 2  # 至多一次重试，无循环
         assert calls[0]["force_all_candidates"] is False
         assert calls[1]["force_all_candidates"] is True
-        assert calls[1]["max_candidates"] is None  # 全池重选不抬 cap，走全量直通
+        # 全池重选同样放宽 cap ×倍数（候选/签名不变，准入面真正扩大）
+        assert calls[1]["max_candidates"] == (
+            enh.union_max_candidates * POOL_CONCERN_RETRY_CAP_MULTIPLIER
+        )
         assert calls[1]["candidates"] is calls[0]["candidates"]
         assert calls[1]["profiles"] == calls[0]["profiles"]
         assert result is not None

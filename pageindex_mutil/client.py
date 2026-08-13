@@ -47,10 +47,6 @@ META_INDEX = "_meta.json"
 # attribution can fan out on repetitive docs; keep the table bounded.
 _MAX_NODE_MENTIONS_PER_ENTITY = 20
 
-# [3.2.1] pool_concern 重选：union 上限放宽倍数。规范定义在 agentic.enhance
-# （T6.4 起单文档/多文档/语料树逐层三个接入点共用），此处保留同名再导出。
-from .agentic.enhance import POOL_CONCERN_RETRY_CAP_MULTIPLIER  # noqa: E402
-
 
 def _iter_structure_nodes(structure):
     """Yield every node dict in a nested TOC structure, depth-first."""
@@ -1160,6 +1156,7 @@ class PageIndexClient:
         try:
             from .agentic.enhance import (
                 UnifiedNodeEnhancement, resolve_query_entities,
+                retry_on_pool_concern,
             )
         except ImportError:
             return {
@@ -1196,22 +1193,15 @@ class PageIndexClient:
             query, candidates, profiles, query_entities=query_entities,
         )
 
-        # [3.2.1] pool_concern 重选（至多一次，二选一分支，杜绝重试循环）：
-        # ① 存在被截候选 → 放宽 union 上限重选（被截候选经 union 自然回池）。
-        # ② 无被截候选（候选池本就完整）→ 判据①"关键概念无命中"意味着 union
-        #    准入逻辑漏掉了相关节点 → force_all_candidates 全池直通重选一次。
-        if result["pool_concern"]:
-            if result["deferred"]:
-                result = await enhancer.enhance_and_select(
-                    query, candidates, profiles, query_entities=query_entities,
-                    max_candidates=max(1, int(enhancer.union_max_candidates))
-                    * POOL_CONCERN_RETRY_CAP_MULTIPLIER,
-                )
-            else:
-                result = await enhancer.enhance_and_select(
-                    query, candidates, profiles, query_entities=query_entities,
-                    force_all_candidates=True,
-                )
+        # [3.2.1] pool_concern re-selection (at most once, exclusive branches)
+        # via the shared helper: ① deferred pool nonempty → relax union cap and
+        # re-select; ② no deferred → force-all full pool (cap widened too, so
+        # zero-signal candidates are not bottom-sorted and re-truncated). See
+        # retry_on_pool_concern.
+        result = await retry_on_pool_concern(
+            enhancer, result, query, candidates, profiles,
+            query_entities=query_entities,
+        )
 
         selected_ids = result["selected_ids"]
         if not selected_ids:

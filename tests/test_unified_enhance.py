@@ -18,6 +18,9 @@
     注记文本节点 id 无重复）；cap 钳位 ≥1 且非法配置逐级回退（永不抛出）；
     平分确定性裁决；顶层 list JSON 降级；query_entities=[] ≡ None；
     非正预算视为未给；不可哈希 node_id 不抛出。
+14. retry_on_pool_concern（[3.2.1] 共享重选助手）：无 concern 透传；deferred/force-all
+    两个互斥分支都放宽 cap×2；回归——候选 > cap 时 force-all 重试零信号节点保持可见
+    （不全被再次截入延迟池）；至多一次重试。
 
 全部 LLM 调用均 mock —— 无真实 LLM。
 """
@@ -1240,3 +1243,139 @@ class TestForceAllCandidates:
         )
         assert result["selected_ids"] == ["n_sig"]
         assert result["deferred"] == ["n_weak"]
+
+
+# ===========================================================================
+# 14. retry_on_pool_concern：pool_concern 重选共享助手（审查加固）
+#     ——单文档 _search_single / 多文档 _recall_nodes_for_doc 共用；
+#     force-all 分支同样放宽 cap（否则零信号候选按分截断垫底再次被截，
+#     全池重选退化为 pass-1，判据①救不到任何节点）。
+# ===========================================================================
+
+
+class TestRetryOnPoolConcern:
+    """至多一次重试、二选一互斥分支、两分支均放宽 cap×POOL_CONCERN_RETRY_CAP_MULTIPLIER。"""
+
+    @staticmethod
+    def _recording_enhancer(cap=80, results=None):
+        """真实实例 + 记录式 enhance_and_select 替身（观察重试调用参数）。"""
+        from pageindex_mutil.agentic.enhance import (
+            UnifiedNodeEnhancement, POOL_CONCERN_RETRY_CAP_MULTIPLIER,
+        )
+        enh = UnifiedNodeEnhancement("m", retrieve_model="r-model")
+        enh.union_max_candidates = cap
+        calls = []
+        canned = list(results or [])
+
+        async def fake_select(query, candidates, profiles, query_entities=None,
+                              node_budget=None, token_budget=None, max_candidates=None,
+                              force_all_candidates=False):
+            calls.append({
+                "query": query, "candidates": candidates, "profiles": profiles,
+                "query_entities": query_entities, "max_candidates": max_candidates,
+                "force_all_candidates": force_all_candidates,
+            })
+            return canned[len(calls) - 1]
+
+        enh.enhance_and_select = fake_select
+        return enh, calls, POOL_CONCERN_RETRY_CAP_MULTIPLIER
+
+    def test_no_concern_returns_same_result_without_retry(self):
+        from pageindex_mutil.agentic.enhance import retry_on_pool_concern
+        enh, calls, _ = self._recording_enhancer()
+        result = {"selected_ids": ["n0"], "pool_concern": False,
+                  "concern_reason": "", "deferred": []}
+        with patch.object(enhance_mod, "llm_completion",
+                          side_effect=AssertionError("no retry expected")):
+            out = asyncio.run(retry_on_pool_concern(
+                enh, result, "q", [_cand("n0")], {}))
+        assert out is result  # 无 concern → 原样透传，零额外 LLM 调用
+        assert calls == []
+
+    def test_deferred_branch_relaxes_cap_without_force_all(self):
+        from pageindex_mutil.agentic.enhance import retry_on_pool_concern
+        enh, calls, mult = self._recording_enhancer(cap=5, results=[
+            {"selected_ids": ["n0", "n2"], "pool_concern": False,
+             "concern_reason": "", "deferred": []},
+        ])
+        pass1 = {"selected_ids": ["n0"], "pool_concern": True,
+                 "concern_reason": "疑似漏掉分支", "deferred": ["n2"]}
+        out = asyncio.run(retry_on_pool_concern(
+            enh, pass1, "q", [_cand("n0"), _cand("n2")], {}))
+        assert len(calls) == 1  # 至多一次重试
+        assert calls[0]["max_candidates"] == 5 * mult
+        assert calls[0]["force_all_candidates"] is False
+        assert out["selected_ids"] == ["n0", "n2"]
+
+    def test_force_all_branch_also_relaxes_cap(self):
+        """审查加固：force-all 分支同步放宽 cap（防零信号候选垫底再截）。"""
+        from pageindex_mutil.agentic.enhance import retry_on_pool_concern
+        enh, calls, mult = self._recording_enhancer(cap=5, results=[
+            {"selected_ids": ["n1"], "pool_concern": False,
+             "concern_reason": "", "deferred": []},
+        ])
+        pass1 = {"selected_ids": [], "pool_concern": True,
+                 "concern_reason": "关键概念无命中", "deferred": []}
+        out = asyncio.run(retry_on_pool_concern(
+            enh, pass1, "q", [_cand("n0"), _cand("n1")], {}))
+        assert len(calls) == 1  # 至多一次重试
+        assert calls[0]["max_candidates"] == 5 * mult  # 放宽 cap，不再 None
+        assert calls[0]["force_all_candidates"] is True
+        assert out["selected_ids"] == ["n1"]
+
+    def test_retry_at_most_once_when_still_concerned(self):
+        from pageindex_mutil.agentic.enhance import retry_on_pool_concern
+        enh, calls, _ = self._recording_enhancer(results=[
+            {"selected_ids": ["n0"], "pool_concern": True,
+             "concern_reason": "仍偏弱", "deferred": []},
+        ])
+        pass1 = {"selected_ids": [], "pool_concern": True,
+                 "concern_reason": "关键概念无命中", "deferred": []}
+        out = asyncio.run(retry_on_pool_concern(
+            enh, pass1, "q", [_cand("n0")], {}))
+        assert len(calls) == 1  # 重选仍 concern 也接受，绝无第二次重试
+        assert out["pool_concern"] is True
+
+    def test_force_all_retry_keeps_zero_signal_nodes_visible(self):
+        """Important#1 回归：候选数 > cap 时 force-all 重试必须同步放宽 cap。
+
+        cap=3、6 候选（2 有信号 + 4 零信号）：pass-1 仅 2 信号节点准入且未被截
+        （deferred 空）→ pool_concern 走 force-all 分支。若重试不放宽 cap，全量
+        准入后按分降序截断，零信号节点垫底全部/大部再次被截——等价 pass-1，判据①
+        救不到任何节点。放宽后（3×2=6 ≥ 6）零信号节点全部留在 LLM 证据池。
+        """
+        from pageindex_mutil.agentic.enhance import retry_on_pool_concern
+        enh = _enhancer(cap=3)
+        candidates = [
+            _cand("n_sig1"), _cand("n_sig2"),
+            _cand("n_z1"), _cand("n_z2"), _cand("n_z3"), _cand("n_z4"),
+        ]
+        profiles = {
+            "n_sig1": {"entities": [], "keywords": ["浴血"], "tags": []},
+            "n_sig2": {"entities": [], "keywords": ["声望"], "tags": []},
+        }
+        query = "浴血声望怎么获得"
+        pass1_resp = _resp([], pool_concern=True, concern_reason="关键概念命中偏弱")
+        retry_resp = _resp(["n_sig1", "n_z3"])
+        with patch.object(enhance_mod, "llm_completion",
+                          side_effect=[pass1_resp, retry_resp]) as mock_llm:
+            result1 = asyncio.run(
+                enh.enhance_and_select(query, candidates, profiles))
+            result2 = asyncio.run(retry_on_pool_concern(
+                enh, result1, query, candidates, profiles))
+        assert mock_llm.call_count == 2
+
+        # pass-1：仅信号节点可见；union 未超限 → deferred 空（走 force-all 分支）
+        assert result1["deferred"] == []
+        ev1 = _evidence_section(mock_llm.call_args_list[0][0][1])
+        assert "候选节点 n_sig1" in ev1 and "候选节点 n_sig2" in ev1
+        for zid in ("n_z1", "n_z2", "n_z3", "n_z4"):
+            assert f"候选节点 {zid}" not in ev1
+
+        # 重试：cap 放宽至 3×2=6 → 6 候选全量可见，零信号节点未被再次截掉
+        ev2 = _evidence_section(mock_llm.call_args_list[1][0][1])
+        for nid in ("n_sig1", "n_sig2", "n_z1", "n_z2", "n_z3", "n_z4"):
+            assert f"候选节点 {nid}" in ev2
+        assert result2["deferred"] == []
+        # 零信号节点不仅可见，且可被 LLM 选中
+        assert result2["selected_ids"] == ["n_sig1", "n_z3"]

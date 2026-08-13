@@ -1188,6 +1188,7 @@ class SuperTreeIndex:
             query, candidates, profiles, query_entities=query_entities,
         )
         # [3.2.1] pool_concern 且有被截候选 → 放宽 union 上限重跑本层一次
+        # （单分支 cap×2：簇节点无正文通道，force-all 全量直通在此无新证据；文档级 force-all 语义由 L1 证据接地承担）
         if result["pool_concern"] and result["deferred"]:
             from .agentic.enhance import POOL_CONCERN_RETRY_CAP_MULTIPLIER
             result = await enhancer.enhance_and_select(

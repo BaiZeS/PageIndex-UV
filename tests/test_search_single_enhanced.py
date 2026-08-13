@@ -8,7 +8,8 @@
    答案上下文取自该节点正文（真实 enhance 管线 + mocked LLM）；
 4. 多范围取数不丢段：LLM 选两节点 → 上下文含两段正文（[3.4.1]①③）；
 5. pool_concern + deferred → 放宽 max_candidates 重选（断言第二次调用参数）；
-   pool_concern 但无 deferred → 不重选，confidence medium；
+   pool_concern 但无 deferred → force_all_candidates 全池重选（同步放宽 cap），
+   至多一次重试；仍 concern → confidence medium；
 6. profiles 解析序：DB node_profiles 优先（经 _id_mapper 的 db 整数 id）；
    无 db → structure 节点字典键兜底；全无 → 空证据仍可端到端工作；
 7. NFR4：enhancer 以 (self.model, retrieve_model=self.retrieve_model) 构造；
@@ -361,7 +362,7 @@ def _instrumented_enhancer(select_results):
 
 class TestPoolConcernRetry:
     def test_retry_relaxes_max_candidates_keeps_candidates(self):
-        from pageindex_mutil.client import POOL_CONCERN_RETRY_CAP_MULTIPLIER
+        from pageindex_mutil.agentic.enhance import POOL_CONCERN_RETRY_CAP_MULTIPLIER
         client = _client()
         _add_doc(client, [_node("n0"), _node("n2")])
         results = [
@@ -391,7 +392,10 @@ class TestPoolConcernRetry:
 
     def test_full_pool_retry_when_pool_concern_and_deferred_empty(self):
         """P2.6：pool_concern 且 deferred 为空 → force_all_candidates=True 全量
-        重选一次；第二次结果生效；至多重试一次（无循环）。"""
+        重选一次；第二次结果生效；至多重试一次（无循环）。
+        审查加固：全池重选同步放宽 cap——候选数超 cap 时零信号候选才不会
+        按分降序垫底被再次截掉（否则全池重选退化为 pass-1）。"""
+        from pageindex_mutil.agentic.enhance import POOL_CONCERN_RETRY_CAP_MULTIPLIER
         client = _client()
         _add_doc(client, [_node("n0"), _node("n1")])
         results = [
@@ -411,7 +415,10 @@ class TestPoolConcernRetry:
         assert len(calls) == 2  # 至多一次重试，无循环
         assert calls[0]["force_all_candidates"] is False
         assert calls[1]["force_all_candidates"] is True
-        assert calls[1]["max_candidates"] is None  # 全池重选不抬 cap，走全量直通
+        # 全池重选同样放宽 cap ×倍数（候选/签名不变，准入面真正扩大）
+        assert calls[1]["max_candidates"] == (
+            enh.union_max_candidates * POOL_CONCERN_RETRY_CAP_MULTIPLIER
+        )
         assert calls[1]["candidates"] is calls[0]["candidates"]
         assert calls[1]["profiles"] == calls[0]["profiles"]
         assert [n["node_id"] for n in result["selected_nodes"]] == ["n1"]
