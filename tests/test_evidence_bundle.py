@@ -104,3 +104,31 @@ def test_tag_text_populated(tmp_path):
     client.closet_index = _StubCloset()
     bundle = build_evidence_bundle(client, db, "帮会活动", topk=30)
     assert bundle[did]["channels"]["tag"] == [{"text": "帮会活动", "confidence": 0.9}]
+
+
+def test_holistic_select_uses_evidence_bundle(tmp_path, monkeypatch):
+    """evidence_bundle 传入时 prompt 证据块来自证据束（field 来源可见）；不传时行为不变。"""
+    client, db = _make_client(
+        tmp_path,
+        [("A", "文档A", "", [("浴血", "content", 3)]),
+         ("B", "文档B", "", [])],
+        None,
+        None,
+    )
+    from pageindex_mutil.super_tree import SuperTreeIndex
+    from pageindex_mutil.agentic.evidence import build_evidence_bundle
+    st = SuperTreeIndex(db, "m", client)
+    bundle = build_evidence_bundle(client, db, "浴血", topk=30)
+    captured = {}
+
+    async def fake_llm(model, prompt, **kw):
+        captured["p"] = prompt
+        return '{"doc_ids": []}'
+
+    monkeypatch.setattr("pageindex_mutil.super_tree.llm_acompletion", fake_llm)
+    # KBIdentity 会同步调 llm_completion；屏蔽以隔离本用例（只验证证据源切换）。
+    monkeypatch.setattr("pageindex_mutil.super_tree.llm_completion",
+                        lambda *a, **k: "测试知识库")
+    import asyncio
+    asyncio.run(st._holistic_select("浴血", [1, 2], evidence_bundle=bundle))
+    assert "浴血(content)" in captured["p"]

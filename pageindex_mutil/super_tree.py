@@ -608,7 +608,8 @@ class SuperTreeIndex:
             lines[db_id] = f"doc {label}: " + " | ".join(parts)
         return lines
 
-    async def _holistic_select(self, query: str, db_ids: list[int], keep: int = None) -> list[int]:
+    async def _holistic_select(self, query: str, db_ids: list[int],
+                               keep: int = None, evidence_bundle: dict = None) -> list[int]:
         """推理式整体挑选：LLM 从 db_ids 中挑选最相关的文档（可变数量，宁缺毋滥）。
 
         与独立打分不同，这里让 LLM 横向比较后"挑选"，只返回真正可能相关的文档，
@@ -633,12 +634,20 @@ class SuperTreeIndex:
 
         # 证据块只针对预算裁剪后幸存的最终文档集计算（spec：pop 后再算）。
         surviving_db_ids = [d.get("db_id") for d in super_tree["documents"] if d.get("db_id") is not None]
-        evidence_lines = self._doc_evidence_lines(query, surviving_db_ids)
-        if evidence_lines:
+        # 证据源：优先证据束直通（L1 呈现更轻，token 压力下降）；None 时回退
+        # _doc_evidence_lines（旧路，逐字节不变，供后续任务复用该签名）。
+        if evidence_bundle is not None:
+            from .agentic.evidence import render_doc_evidence
+            evidence_text = render_doc_evidence(evidence_bundle, surviving_db_ids)
+        else:
+            evidence_lines = self._doc_evidence_lines(query, surviving_db_ids)
+            evidence_text = "\n".join(
+                evidence_lines[did] for did in surviving_db_ids if did in evidence_lines)
+        if evidence_text:
             # 前置/后置换行内嵌于块中，无证据时块为空串 → prompt 与改造前逐字节一致
             evidence_block = (
                 "\n[文档语料证据（关键词/实体/标签命中，供参考）]\n"
-                + "\n".join(evidence_lines[did] for did in surviving_db_ids if did in evidence_lines)
+                + evidence_text
                 + "\n证据是语料事实，请优先依据证据与问题的语义关联程度判断，"
                   "而非简单计数命中个数；无证据命中的文档仍可按标题/摘要判断。\n"
             )
