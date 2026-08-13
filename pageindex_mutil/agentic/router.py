@@ -43,12 +43,14 @@ class AgenticRouter:
                     build_context_with_budget,
                     generate_answer,
                     pages_from_nodes,
+                    spans_from_nodes,
                     build_context_for_doc,
                 )
                 self._main_funcs = {
                     "build_context_with_budget": build_context_with_budget,
                     "generate_answer": generate_answer,
                     "pages_from_nodes": pages_from_nodes,
+                    "spans_from_nodes": spans_from_nodes,
                     "build_context_for_doc": build_context_for_doc,
                 }
             except ImportError:
@@ -209,6 +211,7 @@ class AgenticRouter:
         None/缺该文档 → 传 None，行为与之前完全一致。
         """
         funcs = self._load_main_funcs()
+        spans_from_nodes = funcs.get("spans_from_nodes")
         pages_from_nodes = funcs.get("pages_from_nodes")
 
         if hasattr(self.client, "_ensure_doc_loaded"):
@@ -303,11 +306,20 @@ class AgenticRouter:
             logging.info("[Recall] doc=%s selected ids missed mapping: %s", doc_id, selected_ids[:5])
             return None
 
-        pages = pages_from_nodes(selected)
-        if not pages:
-            if doc.get("type") == "pdf":
-                return None
-            # MD 文档节点无页码索引；上下文由 build_context_for_doc 走节点 text 组装
+        # [S10] 统一 span：spans_from_nodes（page/line 双跨度分派）优先；
+        # 旧调用方/测试 mock 仅提供 pages_from_nodes（T13 删除前）时兜底为
+        # 纯 page 跨度（lines 视为空），行为与改造前一致。
+        if spans_from_nodes:
+            spans = spans_from_nodes(selected)
+        else:
+            spans = {"pages": (pages_from_nodes(selected) if pages_from_nodes else []), "lines": []}
+        pages = spans["pages"]
+        lines = spans["lines"]
+        # 统一 span 门槛（[S10]）：page 跨度文档（PDF）须有 page 跨度经 page_map
+        # 接地，无页即无法取文本 → 拦截；line 跨度文档（MD）行跨度解析期已算
+        # （恒有），无 page 跨度不拦截（节点 text 直接组装）。
+        if not pages and doc.get("type") == "pdf":
+            return None
 
         # 相关度 = 召回覆盖度（selected / 全部候选节点），确定性 (0,1]，
         # 与单文档 _search_single 的 matched_docs score 语义统一。
@@ -319,6 +331,7 @@ class AgenticRouter:
             "structure": structure,
             "selected": selected,
             "pages": pages,
+            "lines": lines,
             "relevance_score": relevance_score,
         }
 
@@ -382,6 +395,7 @@ class AgenticRouter:
         all_nodes = []
         source_docs = 0
         doc_pages_map: Dict[str, List[int]] = {}
+        doc_lines_map: Dict[str, List[tuple]] = {}
 
         build_ctx = self._load_main_funcs().get("build_context_for_doc")
 
@@ -401,6 +415,7 @@ class AgenticRouter:
             structure = result["structure"]
             selected = result["selected"]
             pages = result["pages"]
+            lines = result.get("lines", [])
 
             if build_ctx:
                 context = build_ctx(doc, selected, pages)
@@ -432,6 +447,7 @@ class AgenticRouter:
                 all_nodes.extend(selected)
                 source_docs += 1
                 doc_pages_map[doc_id] = sorted(set(pages))
+                doc_lines_map[doc_id] = lines
                 if _over_budget:
                     # P0 残留修复（[S9]）：首篇不再绕过预算检查——超大单篇
                     # 仍准入（否则完全没有上下文），但准入后立即停止。
@@ -463,21 +479,29 @@ class AgenticRouter:
             except Exception:
                 pass
 
-        # Build pages with text content for UI display
+        # Build pages/lines with text content for UI display（[S10] span 分派：
+        # page 走 page_map；line 输出节点标题 + 行区间，不再空文本）。
         pages_with_text = []
+        node_by_id = {n.get("node_id"): n for n in all_nodes}
         for doc_id, page_nums in doc_pages_map.items():
             doc = self.client.documents.get(doc_id)
-            if not doc or doc.get("type") != "pdf" or not doc.get("pages"):
+            if doc and doc.get("type") == "pdf" and doc.get("pages"):
+                page_map = {p["page"]: p["content"] for p in doc["pages"]}
                 for p in page_nums:
-                    pages_with_text.append({"doc_id": doc_id, "page": p})
-                continue
-            page_map = {p["page"]: p["content"] for p in doc["pages"]}
-            for p in page_nums:
-                pages_with_text.append({
-                    "doc_id": doc_id,
-                    "page": p,
-                    "text": (page_map.get(p, "") or "")[:500]
-                })
+                    pages_with_text.append({
+                        "doc_id": doc_id,
+                        "page": p,
+                        "text": (page_map.get(p, "") or "")[:500]
+                    })
+            else:
+                for node_id, start_line, end_line in doc_lines_map.get(doc_id, []):
+                    node = node_by_id.get(node_id, {})
+                    pages_with_text.append({
+                        "doc_id": doc_id,
+                        "title": node.get("title", ""),
+                        "start_line": start_line,
+                        "end_line": end_line,
+                    })
 
         return "\n\n".join(contexts), all_nodes, source_docs, len(all_nodes), doc_pages_map, pages_with_text
 

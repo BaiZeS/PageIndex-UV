@@ -37,16 +37,26 @@ from typing import Dict, List, Optional, Tuple
 
 
 def _node_payload(nodes: List[dict]) -> List[dict]:
-    """节点序列化——与 AgenticRouter 搜索响应的 selected_nodes 形状一致。"""
+    """节点序列化——与 AgenticRouter 搜索响应的 selected_nodes 形状一致。
+
+    [S10] span 表达：page 节点输出页区间（`pages`，UI 溯源沿用）；line 节点
+    输出行区间（`start_line`/`end_line`），不再臆造页码。
+    """
     out = []
     for n in nodes or []:
-        out.append({
+        kind = n.get("span_kind") or ("page" if n.get("start_index") is not None else "line")
+        item = {
             "node_id": n.get("node_id"),
             "title": n.get("title"),
             "summary": n.get("summary", ""),
             "text": n.get("text", ""),
-            "pages": list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else [],
-        })
+        }
+        if kind == "page":
+            item["pages"] = list(range(n.get("start_index") or 0, (n.get("end_index") or 0) + 1)) if n.get("start_index") else []
+        else:
+            item["start_line"] = n.get("line_num")
+            item["end_line"] = n.get("end_line")
+        out.append(item)
     return out
 
 

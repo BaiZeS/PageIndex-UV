@@ -95,6 +95,33 @@ def pages_from_nodes(nodes):
     return pages
 
 
+def spans_from_nodes(nodes):
+    """按 span_kind 分派节点跨度：PDF→页集合；MD→(node_id, 起, 止) 行区间。
+
+    统一 span locator（[S3]/[S4]）：下游不再按 doc type hack，改按节点 span_kind
+    分派——page 节点输出页区间（去重）；line 节点输出 (node_id, start_line,
+    end_line) 行区间（1-based 含末行）。缺 span_kind 时按 start_index 是否存
+    在兜底判定（page/line），兼容解析期尚未落存 span_kind 的存量节点。
+    """
+    pages, lines, seen = [], [], set()
+    for node in nodes or []:
+        kind = node.get("span_kind") or ("page" if node.get("start_index") is not None else "line")
+        if kind == "page":
+            start, end = node.get("start_index"), node.get("end_index")
+            if start is None or end is None:
+                continue
+            for p in range(start, end + 1):
+                if p not in seen:
+                    seen.add(p)
+                    pages.append(p)
+        else:
+            start, end = node.get("line_num"), node.get("end_line")
+            if start is None or end is None:
+                continue
+            lines.append((node.get("node_id"), start, end))
+    return {"pages": pages, "lines": lines}
+
+
 def get_relevant_nodes(question, tree_json_str):
     """Find relevant node IDs for a question using LLM.
 

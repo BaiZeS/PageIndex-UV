@@ -217,7 +217,8 @@ def extract_node_text_content(node_list, markdown_lines):
         processed_node = {
             'title': node['node_title'],
             'line_num': node['line_num'],
-            'level': len(header_match.group(1))
+            'level': len(header_match.group(1)),
+            'span_kind': 'line',
         }
         all_nodes.append(processed_node)
     
@@ -228,6 +229,8 @@ def extract_node_text_content(node_list, markdown_lines):
         else:
             end_line = len(markdown_lines)
         
+        # end_line 为切片上界（1-based 含末行）；解析期就地落存，零额外解析成本。
+        node['end_line'] = end_line
         node['text'] = '\n'.join(markdown_lines[start_line:end_line]).strip()    
     return all_nodes
 
@@ -330,6 +333,8 @@ def build_tree_from_nodes(node_list):
             'node_id': str(node_counter).zfill(4),
             'text': node['text'],
             'line_num': node['line_num'],
+            'span_kind': node.get('span_kind', 'line'),
+            'end_line': node.get('end_line'),
             'nodes': []
         }
         node_counter += 1
@@ -356,7 +361,9 @@ def clean_tree_for_output(tree_nodes):
             'title': node['title'],
             'node_id': node['node_id'],
             'text': node['text'],
-            'line_num': node['line_num']
+            'line_num': node['line_num'],
+            'span_kind': node.get('span_kind', 'line'),
+            'end_line': node.get('end_line')
         }
         
         if node['nodes']:
@@ -410,6 +417,8 @@ async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_ad
                     "line_num": s.get("line_num", 1),
                     "level": 1,
                     "text": text,
+                    "span_kind": "line",
+                    "end_line": end,
                 })
             tree_structure = build_tree_from_nodes(semantic_nodes)
 
@@ -420,14 +429,14 @@ async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_ad
     
     if if_add_node_summary == 'yes':
         # Always include text for summary generation
-        tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'summary', 'prefix_summary', 'text', 'nodes'])
+        tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'span_kind', 'end_line', 'summary', 'prefix_summary', 'text', 'nodes'])
         
         print(f"Generating summaries for each node...")
         tree_structure = await generate_summaries_for_structure_md(tree_structure, summary_token_threshold=summary_token_threshold, model=model)
         
         if if_add_node_text == 'no':
             # Remove text after summary generation if not requested
-            tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'summary', 'prefix_summary', 'nodes'])
+            tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'span_kind', 'end_line', 'summary', 'prefix_summary', 'nodes'])
         
         if if_add_doc_description == 'yes':
             print(f"Generating document description...")
@@ -443,9 +452,9 @@ async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_ad
     else:
         # No summaries needed, format based on text preference
         if if_add_node_text == 'yes':
-            tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'summary', 'prefix_summary', 'text', 'nodes'])
+            tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'span_kind', 'end_line', 'summary', 'prefix_summary', 'text', 'nodes'])
         else:
-            tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'summary', 'prefix_summary', 'nodes'])
+            tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'span_kind', 'end_line', 'summary', 'prefix_summary', 'nodes'])
     
     return {
         'doc_name': os.path.splitext(os.path.basename(md_path))[0],
