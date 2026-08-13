@@ -315,7 +315,7 @@ class UnifiedNodeEnhancement:
         # 供参考，可推翻"——L2 以本层证据为准，理由不得替代证据（防锚定）。
         # 理由缺失（None/空 dict/空值条目）时该段整体省略，不阻塞。
         reason_section = ""
-        if l1_reasons:
+        if isinstance(l1_reasons, dict) and l1_reasons:
             items = "\n".join(
                 f"- 文档 {k}：{v}" for k, v in l1_reasons.items() if v
             )

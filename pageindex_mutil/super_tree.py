@@ -658,6 +658,9 @@ class SuperTreeIndex:
             evidence_block = ""
             evidence_requirement = ""
 
+        # 动态编号：无证据块时需求序号连续（3. 后接 4.），有证据时 4. 后接 5.
+        idx = 4 if evidence_requirement else 3
+
         prompt = f"""你是一个文档检索专家。给定用户问题、知识库概览和候选文档结构，请挑选出最可能包含答案的文档（最多 {keep} 篇）。
 
 [知识库概览]
@@ -673,7 +676,7 @@ class SuperTreeIndex:
 1. 只挑真正可能包含答案的文档；若没有足够相关的，可以少选甚至不选。
 2. 宁缺毋滥：不要为凑数而挑选不相关的文档。
 3. 基于文档的章节标题和摘要判断相关性。
-{evidence_requirement}5. 为每个选中的文档给出一句话选中理由，填入 reasons 字段（doc_id → 理由）；理由基于该文档的证据/标题/摘要。
+{evidence_requirement}{idx}. 为每个选中的文档给出一句话选中理由，填入 reasons 字段（doc_id → 理由）；理由基于该文档的证据/标题/摘要。
 返回JSON格式：
 {{"doc_ids": ["uuid-1", "uuid-2"], "reasons": {{"uuid-1": "一句话选中理由"}}}}
 直接返回JSON，不要其他内容。"""

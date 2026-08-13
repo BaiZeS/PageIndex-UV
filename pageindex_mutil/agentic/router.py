@@ -273,20 +273,14 @@ class AgenticRouter:
         enhancer = UnifiedNodeEnhancement(self.model, retrieve_model=self.retrieve_model)
         # [S6]#7/[S7]：只把本文档自己的 L1 理由子集下传（防锚定——理由仅为参考判断，
         # L2 以本层证据为准）；无理由时按旧签名调用（不传 l1_reasons），行为与改造前一致。
-        reason_subset = None
+        call_kwargs = {}
         if l1_reasons:
             reason = l1_reasons.get(doc_id)
             if reason:
-                reason_subset = {doc_id: reason}
-        if reason_subset is not None:
-            result = await enhancer.enhance_and_select(
-                query, candidates, profiles, query_entities=query_entities,
-                l1_reasons=reason_subset,
-            )
-        else:
-            result = await enhancer.enhance_and_select(
-                query, candidates, profiles, query_entities=query_entities,
-            )
+                call_kwargs["l1_reasons"] = {doc_id: reason}  # 仅本文档理由子集
+        result = await enhancer.enhance_and_select(
+            query, candidates, profiles, query_entities=query_entities, **call_kwargs
+        )
 
         # [3.2.1] pool_concern 重选（至多一次，二选一分支）走共享助手：
         # ① 有被截候选 → 放宽 union 上限重选；② 无被截候选 → force-all 全池
