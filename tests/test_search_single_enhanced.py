@@ -571,17 +571,16 @@ class TestNFR4AndShape:
         assert ctor_calls == [("m-model", "r-model")]
 
     def test_response_shape_keys_unchanged_via_search_dispatch(self):
+        """[S4] 单链入口：client.search 不再为单文档短路 _search_single——
+        无 router 时返回 Router not available 兜底，响应形状键不变。"""
         client = _client()
         _add_doc(client, [_node("n0", start_index=0, end_index=1)])
-        with _patch_enhance_llm(
-            return_value=_select_json(["n0"]),
-        ), _patch_generate_answer():
-            result = asyncio.run(client.search("q"))  # 单文档 → _search_single
+        result = asyncio.run(client.search("q"))  # 单文档 → 统一链（无 router 兜底）
         assert set(result.keys()) == {
             "query", "mode", "answer", "confidence",
             "matched_docs", "selected_nodes", "pages",
         }
-        assert result["mode"] == "single"
+        assert result["mode"] == "multi"
 
 
 # ---------------------------------------------------------------------------

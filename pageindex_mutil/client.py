@@ -1085,14 +1085,11 @@ class PageIndexClient:
     async def search(self, query: str, top_k: int = 3) -> dict:
         """Search across indexed documents.
 
-        Single-document mode skips the agentic router and performs direct
-        tree reasoning.  Multi-document mode runs the full
-        Plan -> Route -> Act -> Verify pipeline.
+        Unified single chain ([S4]): every query — including a single-document
+        corpus — goes through the agentic router. Scale differences are
+        internalised by the router's top-k / union cap / grouping parameters;
+        a single candidate short-circuits inside the chain at near-zero cost.
         """
-        if len(self.documents) == 1:
-            doc_id = list(self.documents.keys())[0]
-            return await self._search_single(query, doc_id)
-
         if self.router:
             return await self.router.search(query, top_k)
 

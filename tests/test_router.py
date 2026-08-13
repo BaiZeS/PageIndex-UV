@@ -35,6 +35,16 @@ _real_utils_mod = importlib.util.module_from_spec(_real_utils_spec)
 _real_utils_spec.loader.exec_module(_real_utils_mod)
 utils_mod.strip_markdown_fence = _real_utils_mod.strip_markdown_fence
 
+# 补齐 page_index.py / page_index_md.py 等模块从 utils 导入的其余符号（stub 缺
+# generate_summaries_for_structure 等，触发 pageindex_mutil/__init__ 链导入时报
+# ImportError）。已 stub 的 llm_* / count_tokens / extract_json / strip_markdown_fence
+# 保留不覆盖。
+for _name in dir(_real_utils_mod):
+    if _name.startswith("_"):
+        continue
+    if not hasattr(utils_mod, _name):
+        setattr(utils_mod, _name, getattr(_real_utils_mod, _name))
+
 # Pre-seed pageindex.closet_index for _STOPWORDS
 closet_spec = importlib.util.spec_from_file_location("pageindex_mutil.closet_index", pageindex_path / "closet_index.py")
 closet_mod = importlib.util.module_from_spec(closet_spec)
@@ -346,6 +356,20 @@ class TestSearchRouting:
         result = await router.search("test query", top_k=3)
         assert result["answer"] == "v2 answer"
         router._search_v2.assert_awaited_once_with("test query", 3)
+
+    @pytest.mark.asyncio
+    async def test_single_chain_no_multi_hop_pre_gate(self, router):
+        """单链（[S4]）：search 不再走 multi_hop 前置门——super_tree_index 存在时
+        直接 _search_super_tree，multi_hop_reasoner.execute 不得被调用。"""
+        router.super_tree_index = MagicMock()  # truthy → 走 super_tree 单链
+        router.multi_hop_reasoner.execute = AsyncMock(return_value={"answer": "hop"})
+        router._search_super_tree = AsyncMock(return_value={"answer": "super"})
+
+        result = await router.search("q", top_k=3)
+
+        assert result["answer"] == "super"
+        router.multi_hop_reasoner.execute.assert_not_awaited()
+        router._search_super_tree.assert_awaited_once_with("q", 3)
 
 
 class TestActTreeSearchBudget:

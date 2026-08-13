@@ -315,10 +315,10 @@ class AgenticRouter:
             spans = {"pages": (pages_from_nodes(selected) if pages_from_nodes else []), "lines": []}
         pages = spans["pages"]
         lines = spans["lines"]
-        # 统一 span 门槛（[S10]）：page 跨度文档（PDF）须有 page 跨度经 page_map
-        # 接地，无页即无法取文本 → 拦截；line 跨度文档（MD）行跨度解析期已算
-        # （恒有），无 page 跨度不拦截（节点 text 直接组装）。
-        if not pages and doc.get("type") == "pdf":
+        # 统一 span 门槛（[S4]）：纯 span 判定，彻底移除 doc type hack——
+        # page 跨度与 line 跨度皆空（无任何 locator）→ 无法接地取文本 → 拦截；
+        # 有任一跨度即放行（PDF 凭 page、MD 凭 line，节点 text 直接组装）。
+        if not spans["pages"] and not spans["lines"]:
             return None
 
         # 相关度 = 召回覆盖度（selected / 全部候选节点），确定性 (0,1]，
@@ -903,20 +903,13 @@ class AgenticRouter:
     # Public search
     # ------------------------------------------------------------------
     async def search(self, query: str, top_k: int = 3) -> Dict:
-        """Try multi-hop reasoning first, then Super-Tree, fallback to v2."""
-        # Try multi-hop reasoning for decomposable queries
-        if self.super_tree_index and hasattr(self.client, "db") and self.client.db:
-            try:
-                result = await self.multi_hop_reasoner.execute(
-                    query, self, self.client.db, top_k=top_k
-                )
-                logging.info("[Router] Multi-hop hop_count=%d confidence=%s",
-                            result.get("hop_count", 0), result.get("confidence"))
-                return result
-            except Exception as e:
-                logging.warning("Multi-hop reasoning failed, falling back to Super-Tree: %s", e)
+        """Unified single chain ([S4]): direct Super-Tree search; v2 as fallback.
 
-        # Fallback: direct Super-Tree search
+        The multi_hop pre-gate is removed — multi-hop reasoning is re-wired to
+        reuse _extract_intermediate/_guide_next_hop inside the P3 loop, not as a
+        front gate here. _search_v2 stays as the no-super-tree fallback (T13).
+        """
+        # Direct Super-Tree search (single chain, no multi_hop pre-gate)
         if self.super_tree_index:
             try:
                 result = await self._search_super_tree(query, top_k)

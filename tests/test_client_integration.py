@@ -92,3 +92,56 @@ class TestPageIndexClientSuperTree:
         finally:
             client.close()
             os.unlink(db_path)
+
+
+@pytest.mark.asyncio
+async def test_single_doc_goes_through_unified_chain(tmp_path):
+    """单文档不再走 _search_single 分支——统一链（router.search → super_tree）接管。
+
+    [S4] 单链：候选=1 不再短路 _search_single；client.search 一律经 router。
+    _search_single 若被调用会记录 doc_id（应保持为空）。
+    """
+    import types
+
+    sys.modules["PyPDF2"] = MagicMock()
+
+    from pageindex_mutil.client import PageIndexClient
+    from pageindex_mutil.agentic.router import AgenticRouter
+
+    client = PageIndexClient(db_path=str(tmp_path / "t.db"), search_backend="keyword")
+    try:
+        client.documents = {
+            "d1": {
+                "doc_name": "单文档", "doc_description": "", "type": "md",
+                "structure": [{
+                    "node_id": "0001", "title": "t", "summary": "s",
+                    "text": "浴血内容", "span_kind": "line",
+                    "line_num": 1, "end_line": 2, "nodes": [],
+                }],
+            }
+        }
+
+        calls = []
+
+        async def fake_single(self, q, doc_id):
+            calls.append(doc_id)
+            return {"mode": "single"}
+
+        client._search_single = types.MethodType(fake_single, client)
+
+        router = AgenticRouter(client, "m")
+        router.super_tree_index = MagicMock()  # truthy → 单链走 _search_super_tree
+
+        async def fake_unified(q, top_k):
+            calls.append(("unified", q))
+            return {"mode": "multi"}
+
+        router._search_super_tree = fake_unified
+        client.router = router
+
+        await client.search("浴血")
+
+        # 统一链（super_tree）被调用；_search_single 未被调用
+        assert calls == [("unified", "浴血")]
+    finally:
+        client.close()

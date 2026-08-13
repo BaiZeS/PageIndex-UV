@@ -652,16 +652,18 @@ class TestMultiHopMatchedScores:
 
 
 def _md_node(nid, title="标题", summary="摘要", text="正文", **extra):
-    """真实 MD 节点形态：page_index_md.py 不写 start_index/end_index，
-    因此 pages_from_nodes 必为空——T20 回归守卫的靶子形状。"""
-    node = {"node_id": nid, "title": title, "summary": summary, "text": text}
+    """真实 MD 节点形态：page_index_md.py 写 span_kind/line_num/end_line 行跨度，
+    不写 start_index/end_index——因此 spans_from_nodes 派 line 跨度（pages 恒空，
+    lines 恒有）。T20 回归守卫的靶子形状。"""
+    node = {"node_id": nid, "title": title, "summary": summary, "text": text,
+            "span_kind": "line", "line_num": 1, "end_line": 2}
     node.update(extra)
     return node
 
 
 class TestMdNodeRecallNoPagesGate:
     def test_md_recall_returns_selected_with_empty_pages(self):
-        """MD 文档：节点无页码 → pages 为空但召回成功（dict 而非 None）。"""
+        """MD 文档：节点行跨度 → pages 为空但 lines 非空 → 召回成功（dict 而非 None）。"""
         router, _ = _router_with_doc([
             _md_node("n1", title="浴血值获取",
                      text="浴血值可以通过日常任务获得。", keywords=["浴血值"]),
@@ -672,11 +674,15 @@ class TestMdNodeRecallNoPagesGate:
         assert result is not None
         assert [n["node_id"] for n in result["selected"]] == ["n1"]
         assert result["pages"] == []  # MD 节点无页码索引
+        assert result["lines"] == [("n1", 1, 2)]  # line 跨度接地（纯 span 门槛）
         assert result["relevance_score"] == 0.5  # 1/2 候选覆盖度
 
     def test_pdf_without_pages_still_gated(self):
-        """PDF 门槛保持原样：PDF 节点也无页码（异常态）→ 仍返回 None。"""
-        router, _ = _router_with_doc([_md_node("n1")], doc_type="pdf")
+        """纯 span 门槛：无任何 locator（无 span_kind/start_index/line_num）的 PDF
+        节点 → pages 与 lines 皆空 → 仍返回 None（doc type hack 已移除）。"""
+        router, _ = _router_with_doc([
+            {"node_id": "n1", "title": "标题", "summary": "摘要", "text": "正文"},
+        ], doc_type="pdf")
         with _patch_enhance_llm(return_value=_select_json(["n1"])):
             result = asyncio.run(router._recall_nodes_for_doc("q", "doc1"))
         assert result is None
