@@ -308,9 +308,22 @@ class UnifiedNodeEnhancement:
             clauses.append(f"selected_ids 个数不得超过 {node_budget}")
         return "预算约束：" + "；".join(clauses) + "。预算只是约束，不替你决定谁相关。"
 
-    def _build_prompt(self, query, evidence_text, node_budget, token_budget) -> str:
+    def _build_prompt(self, query, evidence_text, node_budget, token_budget, l1_reasons=None) -> str:
         budget_block = self._build_budget_block(node_budget, token_budget)
         budget_section = f"{budget_block}\n\n" if budget_block else ""
+        # [S6]#7/[S7] 上级选档依据：L1 传下的选中理由，明确标注为"判断而非事实，
+        # 供参考，可推翻"——L2 以本层证据为准，理由不得替代证据（防锚定）。
+        # 理由缺失（None/空 dict/空值条目）时该段整体省略，不阻塞。
+        reason_section = ""
+        if l1_reasons:
+            items = "\n".join(
+                f"- 文档 {k}：{v}" for k, v in l1_reasons.items() if v
+            )
+            if items:
+                reason_section = (
+                    "上级选档依据（判断而非事实，供参考，可推翻）：\n"
+                    + items + "\n\n"
+                )
         return f"""你是检索增强专家。请基于语料证据，从候选节点中精选与查询真正相关的节点。宁缺毋滥：数量可变，只选相关的，不相关的一个都不选。
 
 查询：{query}
@@ -320,7 +333,7 @@ class UnifiedNodeEnhancement:
 
 判断指引：{self._GUIDANCE}证据只呈现命中项，未列全量签名。
 
-{budget_section}{self._CONCERN_CRITERIA}
+{reason_section}{budget_section}{self._CONCERN_CRITERIA}
 
 返回JSON格式: {{"selected_ids": [...], "pool_concern": bool, "concern_reason": str}}
 selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不要其他内容。
@@ -339,6 +352,7 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         token_budget=None,
         max_candidates=None,
         force_all_candidates: bool = False,
+        l1_reasons=None,
     ) -> dict:
         """四通道高召回 union → 证据组装 → LLM 精挑。
 
@@ -353,6 +367,9 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         force_all_candidates: True → union 步骤全量候选准入（零信号直通），
                     pool_concern 且无被截候选时的全池重选用 ([3.2.1])；
                     弱候选由证据跨节点预算自然退化为一行标题+摘要 ([7.4])
+        l1_reasons: {doc_id: 一句话选中理由}（[S6]#7/[S7] L1→L2 trace）。None/空
+                    时行为与之前完全一致；传入时注入"上级选档依据"段，标注为
+                    判断而非事实（防锚定）。
         返回: {"selected_ids": [...], "pool_concern": bool,
                "concern_reason": str, "deferred": [node_ids]}
         """
@@ -446,7 +463,7 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         evidence_text = self._assemble_evidence(union, node_signals, cand_by_id)
 
         # ③ LLM 精挑（唯一裁剪者）
-        prompt = self._build_prompt(query, evidence_text, node_budget, token_budget)
+        prompt = self._build_prompt(query, evidence_text, node_budget, token_budget, l1_reasons)
         try:
             response = await asyncio.to_thread(
                 llm_completion, self.retrieve_model or self.model, prompt,

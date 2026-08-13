@@ -192,7 +192,8 @@ class AgenticRouter:
     # Act — tree search + context assembly (parallelized)
     # ------------------------------------------------------------------
     async def _recall_nodes_for_doc(self, query: str, doc_id: str,
-                                      matched_info: List[Dict] = None):
+                                      matched_info: List[Dict] = None,
+                                      l1_reasons: Dict[str, str] = None):
         """Recall relevant nodes for a single document (runs in thread).
 
         [3.2.1] unit = 节点：enhance_and_select 统一接入——四通道 union 宽召回 +
@@ -202,6 +203,10 @@ class AgenticRouter:
         union——存储签名被垃圾词淹没/缺失时的直接内容接地）。LLM 失效时不做
         启发式兜底裁剪（[7.7] 放行 union）——不再有 get_relevant_nodes 旧路，
         也不再有启发式关键词兜底。
+
+        l1_reasons: {doc_id: 一句话选中理由}（[S6]#7/[S7] L1→L2 trace）。仅把
+        本文档自己的理由子集下传 L2 节点裁定（防锚定，标注为判断而非事实）；
+        None/缺该文档 → 传 None，行为与之前完全一致。
         """
         funcs = self._load_main_funcs()
         pages_from_nodes = funcs.get("pages_from_nodes")
@@ -266,9 +271,22 @@ class AgenticRouter:
 
         # NFR4: 检索 LLM 调用点用 retrieve_model（model 兜底）
         enhancer = UnifiedNodeEnhancement(self.model, retrieve_model=self.retrieve_model)
-        result = await enhancer.enhance_and_select(
-            query, candidates, profiles, query_entities=query_entities,
-        )
+        # [S6]#7/[S7]：只把本文档自己的 L1 理由子集下传（防锚定——理由仅为参考判断，
+        # L2 以本层证据为准）；无理由时按旧签名调用（不传 l1_reasons），行为与改造前一致。
+        reason_subset = None
+        if l1_reasons:
+            reason = l1_reasons.get(doc_id)
+            if reason:
+                reason_subset = {doc_id: reason}
+        if reason_subset is not None:
+            result = await enhancer.enhance_and_select(
+                query, candidates, profiles, query_entities=query_entities,
+                l1_reasons=reason_subset,
+            )
+        else:
+            result = await enhancer.enhance_and_select(
+                query, candidates, profiles, query_entities=query_entities,
+            )
 
         # [3.2.1] pool_concern 重选（至多一次，二选一分支）走共享助手：
         # ① 有被截候选 → 放宽 union 上限重选；② 无被截候选 → force-all 全池
@@ -314,10 +332,15 @@ class AgenticRouter:
         self, query: str, candidate_docs: List[str],
         node_matches: Dict[str, List[Dict]] = None,
         doc_scores_out: Dict[str, float] = None,
+        l1_reasons: Dict[str, str] = None,
     ) -> Tuple[str, List[dict], int, int, Dict[str, List[int]], List[dict]]:
         """Act 阶段树搜索。doc_scores_out 非 None 时回填每篇召回成功文档的
         证据派生分数（节点召回覆盖度 (0,1]）——供调用方构造 matched_docs，
-        不再硬编码 1.0（T6.4 score 语义统一）。"""
+        不再硬编码 1.0（T6.4 score 语义统一）。
+
+        l1_reasons: {doc_id: 一句话选中理由}（[S6]#7/[S7] L1→L2 trace 预留槽位，
+        默认 None；真正注入在 T9 L1 裁定改造）。None 时不向下传理由，行为不变。
+        """
         funcs = self._load_main_funcs()
         pages_from_nodes = funcs.get("pages_from_nodes")
         if not pages_from_nodes:
@@ -333,13 +356,14 @@ class AgenticRouter:
                 unique_docs.append(doc_id)
 
         # Parallel node recall across documents (with match info if available)
-        recall_tasks = [
-            self._recall_nodes_for_doc(
-                query, doc_id,
-                matched_info=node_matches.get(doc_id) if node_matches else None
-            )
-            for doc_id in unique_docs
-        ]
+        recall_tasks = []
+        for doc_id in unique_docs:
+            call_kwargs = {
+                "matched_info": node_matches.get(doc_id) if node_matches else None,
+            }
+            if l1_reasons is not None:
+                call_kwargs["l1_reasons"] = l1_reasons
+            recall_tasks.append(self._recall_nodes_for_doc(query, doc_id, **call_kwargs))
         recall_results = await asyncio.gather(*recall_tasks, return_exceptions=True)
 
         # Filter out failures and sort by relevance score (descending).

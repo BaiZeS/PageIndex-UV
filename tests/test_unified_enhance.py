@@ -1388,3 +1388,34 @@ class TestRetryOnPoolConcern:
         assert result2["deferred"] == []
         # 零信号节点不仅可见，且可被 LLM 选中
         assert result2["selected_ids"] == ["n_sig1", "n_z3"]
+
+
+# ===========================================================================
+# 15. [S6]#7/[S7] l1_reasons trace：L1 选中理由注入 L2 节点裁定 prompt（防锚定）
+# ===========================================================================
+
+
+class TestL1ReasonsInjection:
+    def test_l1_reason_injected_and_labeled(self):
+        """未传 l1_reasons 时 prompt 不含该段；传入时带"判断而非事实"标注注入。"""
+        enh = _enhancer()
+        p1 = enh._build_prompt("查询Q", "证据", 2, None)
+        assert "上级选档依据" not in p1  # 未传理由时 prompt 不含该段
+        p2 = enh._build_prompt("查询Q", "证据", 2, None, l1_reasons={"d1": "正文命中"})
+        assert "上级选档依据（判断而非事实，供参考，可推翻）" in p2
+        assert "正文命中" in p2
+
+    def test_enhance_and_select_forwards_l1_reasons_to_prompt(self):
+        """enhance_and_select(l1_reasons=...) 透传至 _build_prompt，标注段入 prompt。"""
+        enh = _enhancer()
+        _, mock_llm = _select_call(
+            enh,
+            return_value=_resp(["n0"]),
+            query="浴血",
+            candidates=[_cand("n0")],
+            profiles={"n0": {"entities": [], "keywords": ["浴血"], "tags": []}},
+            l1_reasons={"d1": "正文命中"},
+        )
+        prompt = _prompt_of(mock_llm)
+        assert "上级选档依据（判断而非事实，供参考，可推翻）" in prompt
+        assert "正文命中" in prompt

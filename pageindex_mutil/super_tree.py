@@ -609,16 +609,18 @@ class SuperTreeIndex:
         return lines
 
     async def _holistic_select(self, query: str, db_ids: list[int],
-                               keep: int = None, evidence_bundle: dict = None) -> list[int]:
+                               keep: int = None, evidence_bundle: dict = None):
         """推理式整体挑选：LLM 从 db_ids 中挑选最相关的文档（可变数量，宁缺毋滥）。
 
         与独立打分不同，这里让 LLM 横向比较后"挑选"，只返回真正可能相关的文档，
-        从机制上避免硬负样本稀释精确率。返回 db_id 列表。
+        从机制上避免硬负样本稀释精确率。返回 (db_id 列表, reasons dict)——
+        reasons 为该文档被选中的一句话理由（[S6]#7/[S7] L1→L2 trace 下传），
+        缺失/非 dict/LLM 失败时降级为空 dict，不阻塞选档。
         """
         if not db_ids:
-            return []
+            return [], {}
         if len(db_ids) == 1:
-            return list(db_ids)
+            return list(db_ids), {}
 
         keep = keep or self._SELECT_TOP_K
         super_tree = self._build_super_tree(db_ids)
@@ -671,20 +673,20 @@ class SuperTreeIndex:
 1. 只挑真正可能包含答案的文档；若没有足够相关的，可以少选甚至不选。
 2. 宁缺毋滥：不要为凑数而挑选不相关的文档。
 3. 基于文档的章节标题和摘要判断相关性。
-{evidence_requirement}
+{evidence_requirement}5. 为每个选中的文档给出一句话选中理由，填入 reasons 字段（doc_id → 理由）；理由基于该文档的证据/标题/摘要。
 返回JSON格式：
-{{"doc_ids": ["uuid-1", "uuid-2"]}}
+{{"doc_ids": ["uuid-1", "uuid-2"], "reasons": {{"uuid-1": "一句话选中理由"}}}}
 直接返回JSON，不要其他内容。"""
 
         response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
         if not response:
-            return []
+            return [], {}
         data = extract_json(response)
         if not isinstance(data, dict):
-            return []
+            return [], {}
         picked = data.get("doc_ids", [])
         if not isinstance(picked, list):
-            return []
+            return [], {}
 
         uuid_to_db = {v: k for k, v in self._get_db_to_uuid().items()}
         db_id_set = set(db_ids)
@@ -697,7 +699,16 @@ class SuperTreeIndex:
                 db_id = uuid_to_db.get(did)
             if db_id is not None and db_id in db_id_set and db_id not in selected:
                 selected.append(db_id)
-        return selected[:keep]
+
+        # [S6]#7/[S7]：规整 LLM 返回的选中理由——缺失/非 dict/空值条目降级跳过，
+        # 不阻塞选档。理由键按 LLM 原样（uuid 或 db_id）字符串化。
+        reasons = {}
+        raw_reasons = data.get("reasons", {})
+        if isinstance(raw_reasons, dict):
+            for k, v in raw_reasons.items():
+                if v:
+                    reasons[str(k)] = str(v)
+        return selected[:keep], reasons
 
     async def _select_documents_reasoning(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
         """三层重构-选择层：map-reduce 推理式选档。
@@ -711,7 +722,7 @@ class SuperTreeIndex:
             return []
 
         if len(truncated) <= self._REASON_GROUP_SIZE:
-            selected_dbids = await self._holistic_select(query, truncated)
+            selected_dbids, _ = await self._holistic_select(query, truncated)
         else:
             groups = [
                 truncated[i:i + self._REASON_GROUP_SIZE]
@@ -724,6 +735,8 @@ class SuperTreeIndex:
             map_results = await asyncio.gather(*map_tasks, return_exceptions=True)
             winners = []
             for r in map_results:
+                if isinstance(r, tuple):
+                    r = r[0]
                 if isinstance(r, list):
                     for db_id in r:
                         if db_id not in winners:
@@ -733,7 +746,7 @@ class SuperTreeIndex:
             if len(winners) <= self._SELECT_TOP_K:
                 selected_dbids = winners
             else:
-                selected_dbids = await self._holistic_select(query, winners)
+                selected_dbids, _ = await self._holistic_select(query, winners)
 
         db_to_uuid = self._get_db_to_uuid()
         return [db_to_uuid[d] for d in selected_dbids if d in db_to_uuid]
