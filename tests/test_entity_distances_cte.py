@@ -68,3 +68,40 @@ def test_cte_matches_bfs_implementation(graph_db):
     assert got[2]["distance"] == 1
     assert got[3]["distance"] == 2
     assert got[4]["distance"] == 3
+
+
+def test_cte_tiebreak_same_hop_max_weight(graph_db):
+    # 两个并行的 1-hop 边：causal(1.0) 与 related_to(0.6)——同 hop 取最大权重
+    with graph_db._connect() as conn:
+        conn.execute("INSERT INTO entities (id, name, entity_type, doc_count) VALUES (5,'甲','concept',1)")
+        conn.execute("INSERT INTO entity_relations (subject_id, predicate, object_id, doc_id, confidence) VALUES (1,'causal',5,NULL,0.9)")
+    got = graph_db.get_entity_distances_cte([1], max_hop=3)
+    assert got[2]["distance"] == 1
+    assert abs(got[2]["weight"] - 0.42) < 1e-6  # 0.7×related_to 0.6
+    assert got[5]["distance"] == 1
+    assert abs(got[5]["weight"] - 0.7) < 1e-6   # 0.7×causal 1.0
+
+
+def test_cte_covers_all_predicates_and_defaults(graph_db):
+    """全部谓词/别名/默认权重与 super_tree 常量程序化对照（防 SQL 内硬编码漂移）。"""
+    from pageindex_mutil.super_tree import SuperTreeIndex
+    decay = SuperTreeIndex._DISTANCE_DECAY
+    rel_w = SuperTreeIndex._RELATION_TYPE_WEIGHTS
+    cases = [
+        ("causal", rel_w["causal"]), ("causes", rel_w["causes"]), ("effect", rel_w["effect"]),
+        ("part_of", rel_w["part_of"]), ("contains", rel_w["contains"]),
+        ("has_part", rel_w["has_part"]), ("belongs_to", rel_w["belongs_to"]),
+        ("related_to", rel_w["related_to"]), ("associated", rel_w["associated"]),
+        ("similar", rel_w["similar"]), ("unknown_pred", rel_w["_default"]),
+    ]
+    base = 100
+    with graph_db._connect() as conn:
+        for i, (pred, w) in enumerate(cases, 1):
+            conn.execute("INSERT INTO entities (id, name, entity_type, doc_count) VALUES (?,?,?,1)",
+                         (base + i, f"N{i}", "concept"))
+            conn.execute("INSERT INTO entity_relations (subject_id, predicate, object_id, doc_id, confidence) VALUES (1,?,?,NULL,0.9)",
+                         (pred, base + i))
+    got = graph_db.get_entity_distances_cte([1], max_hop=3)
+    for i, (pred, w) in enumerate(cases, 1):
+        expected = decay[1] * w  # hop 1 衰减 0.7
+        assert abs(got[base + i]["weight"] - expected) < 1e-6, f"predicate {pred}"

@@ -1154,6 +1154,7 @@ class PageIndexDB:
             by_entity[r["nid"]].append(r)
         out = {}
         for nid, rs in by_entity.items():
+            # 第三键 r["nid"] 在同一实体组内恒等，仅为输出确定性的显式声明
             best = min(rs, key=lambda r: (r["hop"], -r["weight"], r["nid"]))
             out[nid] = {"distance": best["hop"], "relation_type": best["relation_type"],
                         "weight": best["weight"], "name": best["name"]}
