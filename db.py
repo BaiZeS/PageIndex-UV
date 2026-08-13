@@ -3,6 +3,7 @@ import sqlite3
 import json
 import threading
 import time
+from collections import defaultdict
 
 
 SQLITE_MAX_VARIABLE_NUMBER = 999
@@ -1106,6 +1107,57 @@ class PageIndexDB:
             results.extend([dict(r) for r in rows])
         
         return results
+
+    def get_entity_distances_cte(self, query_entity_ids, max_hop=3):
+        """单次递归 CTE 无向 BFS。权重语义与 _precompute_entity_distances 逐项一致：
+        weight = 距离衰减(hop) × 末边关系类型权重（非路径乘积）。聚合：hop-min 优先；
+        同 hop 取最大 weight；再平取最小 entity_id。path 列防环。自身（query entity）
+        从结果中排除。
+        """
+        if not query_entity_ids:
+            return {}
+        placeholders = ",".join("?" for _ in query_entity_ids)
+        conn = self._connect()
+        sql = f"""
+        WITH RECURSIVE walk(nid, hop, weight, relation_type, name, path) AS (
+            SELECT e.id, 0, 1.0, 'direct', e.name, ',' || e.id || ','
+            FROM entities e WHERE e.id IN ({placeholders})
+            UNION ALL
+            SELECT nxt.id,
+                   w.hop + 1,
+                   CASE w.hop + 1
+                       WHEN 1 THEN 0.7 WHEN 2 THEN 0.4 WHEN 3 THEN 0.2 ELSE 0.1 END
+                     * CASE er.predicate
+                       WHEN 'causal' THEN 1.0 WHEN 'causes' THEN 1.0 WHEN 'effect' THEN 1.0
+                       WHEN 'part_of' THEN 0.8 WHEN 'contains' THEN 0.8
+                       WHEN 'has_part' THEN 0.8 WHEN 'belongs_to' THEN 0.8
+                       WHEN 'related_to' THEN 0.6 WHEN 'associated' THEN 0.6
+                       WHEN 'similar' THEN 0.6
+                       ELSE 0.4 END,
+                   er.predicate, nxt.name,
+                   w.path || nxt.id || ','
+            FROM walk w
+            JOIN entity_relations er ON er.subject_id = w.nid OR er.object_id = w.nid
+            JOIN entities nxt ON nxt.id =
+                CASE WHEN er.subject_id = w.nid THEN er.object_id ELSE er.subject_id END
+            WHERE w.hop < {int(max_hop)}
+              AND instr(w.path, ',' ||
+                (CASE WHEN er.subject_id = w.nid THEN er.object_id ELSE er.subject_id END) || ',') = 0
+        )
+        SELECT nid, hop, weight, relation_type, name
+        FROM walk WHERE nid NOT IN ({placeholders})
+        """
+        # `placeholders` 在种子 SELECT 与最终 SELECT 各出现一次，需绑定两倍参数。
+        rows = conn.execute(sql, (*query_entity_ids, *query_entity_ids)).fetchall()
+        by_entity = defaultdict(list)
+        for r in rows:
+            by_entity[r["nid"]].append(r)
+        out = {}
+        for nid, rs in by_entity.items():
+            best = min(rs, key=lambda r: (r["hop"], -r["weight"], r["nid"]))
+            out[nid] = {"distance": best["hop"], "relation_type": best["relation_type"],
+                        "weight": best["weight"], "name": best["name"]}
+        return out
 
     def get_document_entities(self, doc_id: int) -> list:
         """Get all entities mentioned in a document."""
