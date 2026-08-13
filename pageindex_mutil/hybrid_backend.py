@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 class HybridSearchBackend(SearchBackend):
     """Hybrid search combining vector similarity and keyword matching."""
 
+    is_vector = True
+
     _search_cache = {}  # hash(query+top_k) -> (result, timestamp)
     _cache_ttl = 300  # 5 minutes
     _cache_max = 128

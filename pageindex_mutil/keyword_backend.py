@@ -28,6 +28,8 @@ class KeywordSearchBackend(SearchBackend):
     ChromaDB / SentenceTransformer is too slow.
     """
 
+    is_vector = False
+
     _search_cache = {}  # hash(query+top_k) -> (result, timestamp)
     _cache_ttl = 300  # 5 minutes
     _cache_max = 128

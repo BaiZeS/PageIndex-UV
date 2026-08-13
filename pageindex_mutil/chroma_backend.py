@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 class ChromaSearchBackend(SearchBackend):
     """ChromaDB-based vector search backend."""
 
+    is_vector = True
+
     def __init__(self, db_path: str = "./data/vectors", embedding_model: str = "local"):
         """Initialize ChromaDB backend.
         
