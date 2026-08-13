@@ -177,3 +177,11 @@ class TestConfigLoaderMagicNumbers:
         monkeypatch.delenv("RETRIEVE_MODEL_NAME", raising=False)
         cfg = ConfigLoader().load(None)
         assert cfg.max_token_num_each_node == 20000
+
+
+def test_new_config_keys_present():
+    """P1 S10: three newly added config keys must surface via ConfigLoader."""
+    cfg = ConfigLoader().load(None)
+    assert getattr(cfg, "l1_select_keep", None) == 10
+    assert getattr(cfg, "verifier_context_chars", None) == 8000
+    assert getattr(cfg, "cte_max_hop", None) == 3

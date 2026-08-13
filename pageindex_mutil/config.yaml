@@ -63,6 +63,9 @@ node_keyword_topk: 5        # 节点签名显著词个数（TF-IDF top-K，[2.1]
 # P2 统一检索增强（UnifiedNodeEnhancement，[3.2]/[1.2]/[7.4]）
 union_max_candidates: 80    # union 候选安全上限（宽松可配 60–100，宁多勿漏）；超限多信号加权收缩，被截进延迟池
 evidence_max_chars: 6000    # 跨节点证据总字符预算；超限按证据强度退化最弱候选为"标题+摘要"一行
+l1_select_keep: 10            # L1 终选 keep 上限（对齐评测 R@10 口径）
+verifier_context_chars: 8000  # verifier 上下文预算（字符），替代硬编码 2000
+cte_max_hop: 3                # 图谱递归 CTE 最大跳数
 # P2 Agentic 多轮召回循环（spec [3.5]/[7.5]/[7.6]）
 agentic_round_topks: [5, 10, 20]  # 逐轮放宽的召回宽度梯度（precision-first → recall-expansion）；超出列表长度取末值
 agentic_max_rounds: 3             # 最大召回轮数兜底
