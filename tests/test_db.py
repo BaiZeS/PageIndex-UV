@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -364,3 +365,28 @@ class TestTokenizationCache:
         # One more should evict oldest
         PageIndexDB._tokenize_query("new_query")
         assert "new_query" in _TOKENIZE_CACHE
+
+
+def test_connect_reuses_connection_per_thread(tmp_path):
+    from db import PageIndexDB
+    db = PageIndexDB(str(tmp_path / "t.db"))
+    conns = [db._connect(), db._connect()]
+    assert conns[0] is conns[1]  # 同线程复用
+    other = {}
+    def f():
+        other["conn"] = db._connect()
+        other["again"] = db._connect()
+    t = threading.Thread(target=f)
+    t.start(); t.join()
+    assert other["conn"] is not conns[0]  # 跨线程隔离
+    assert other["conn"] is other["again"]
+    db.close()
+
+def test_connect_has_row_factory_and_wal(tmp_path):
+    from db import PageIndexDB
+    db = PageIndexDB(str(tmp_path / "t.db"))
+    conn = db._connect()
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    row = conn.execute("SELECT 1 AS x").fetchone()
+    assert row["x"] == 1  # row_factory=Row
+    db.close()
