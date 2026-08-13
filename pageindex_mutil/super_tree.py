@@ -19,6 +19,7 @@ class KeywordIndex:
             logging.warning("jieba not installed; KeywordIndex will be unavailable")
 
     def _tokenize(self, text: str) -> List[str]:
+        """Tokenize text with jieba (self is unused — safe to call as KeywordIndex._tokenize(None, text))."""
         if not text or jieba is None:
             return []
         tokens = jieba.lcut(text)
@@ -1041,7 +1042,7 @@ class SuperTreeIndex:
         ②关键词——成员文档 node_profiles.keywords 并集计数 top；
         ③标签——成员文档级 closet_tags（source='llm' 才进语义漏斗，[7.2]）。
         成员文档取排序前 _CLUSTER_PROFILE_MAX_DOCS 篇（子树查询成本守卫）。
-        调用方按 navigate_tree run 缓存（树导航期树静态，算一次逐层复用）。
+        调用方按 navigate_tree run 缓存（树导航期树静态，同一 run 内多次访问同一节点时复用——实际导航中每节点仅访问一次，缓存为防御性设计）。
         永不抛出：任何 DB 异常退化为空签名（enhance 对空证据优雅降级，[7.7]）。
         """
         profile: Dict = {"entities": [], "keywords": [], "tags": []}

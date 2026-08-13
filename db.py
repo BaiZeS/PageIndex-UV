@@ -997,7 +997,7 @@ class PageIndexDB:
             FROM entity_mentions em
             JOIN entities e ON em.entity_id = e.id
             WHERE em.doc_id = ?
-            ORDER BY em.confidence DESC
+            ORDER BY em.confidence DESC, em.id
             """,
             (doc_id,)
         ).fetchall()

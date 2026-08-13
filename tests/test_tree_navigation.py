@@ -277,7 +277,6 @@ class TestNodePrefilter:
     def test_no_signal_keeps_all(self, nav_index):
         """无任何匹配信号时不硬过滤，全量交给 LLM 精挑（保召回）。"""
         st, _, _ = nav_index
-        st._NODE_PREFILTER_TOPK = 5
         nodes = [{"id": i, "title": f"节点{i}", "summary": "", "tag": None}
                  for i in range(1, 21)]
         out = st._prefilter_nodes("完全不相关的查询zzz", nodes)

@@ -188,7 +188,10 @@ class PageIndexClient:
         self.model = opt.model
         self.retrieve_model = _normalize_retrieve_model(opt.retrieve_model or self.model)
         # P1.4: per-node salient-keyword count for the node profile signature.
-        self._node_keyword_topk = int(getattr(opt, "node_keyword_topk", 5))
+        try:
+            self._node_keyword_topk = int(getattr(opt, "node_keyword_topk", 5))
+        except (TypeError, ValueError):
+            self._node_keyword_topk = 5
         if self.workspace:
             self.workspace.mkdir(parents=True, exist_ok=True)
         self.documents = {}
