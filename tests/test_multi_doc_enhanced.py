@@ -420,7 +420,7 @@ class TestSuperTreeMatchedScores:
         bundle = {7: {"channels": {
             "keyword": [{"token": "x"}, {"token": "y"}], "tag": [], "entity": [],
         }, "graph": {}}}
-        with patch.object(_evidence_mod(), "build_evidence_bundle", return_value=bundle), \
+        with patch.object(_evidence_mod(), "build_evidence_bundle", return_value=(bundle, {"tokens": [], "query_entities": []})), \
                 _patch_enhance_llm(return_value=_select_json(["n0"])), \
                 _patch_generate_answer("最终答案"):
             result = asyncio.run(router._search_super_tree("q", top_k=3))

@@ -444,7 +444,7 @@ class AgenticRouter:
                 from .evidence import build_evidence_bundle
                 from ..utils import ConfigLoader
                 cfg = ConfigLoader().load(None)
-                bundle = build_evidence_bundle(
+                bundle, _ = build_evidence_bundle(
                     self.client, db, query,
                     topk=getattr(cfg, "l0_channel_topk", 30),
                 )

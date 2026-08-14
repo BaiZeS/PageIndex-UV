@@ -35,7 +35,7 @@ def test_bundle_keyword_field_provenance(tmp_path):
     client, db = _make_client(tmp_path,
         [("A", "文档A", "", [("浴血", "content", 3), ("帮会", "node_title", 1)]),
          ("B", "文档B", "", [("帮会", "content", 2)])], None, None)
-    bundle = build_evidence_bundle(client, db, "帮会浴血怎么获得", topk=30)
+    bundle, ctx = build_evidence_bundle(client, db, "帮会浴血怎么获得", topk=30)
     a_kw = {(k["token"], k["field"]) for k in bundle[1]["channels"]["keyword"]}
     assert ("浴血", "content") in a_kw
     assert ("帮会", "node_title") in a_kw  # field 来源可追溯
@@ -69,7 +69,7 @@ def test_graph_channel_links_neighbor_entities(tmp_path):
     db.insert_entity_mention(e1, doc_a)
     db.insert_entity_mention(e2, doc_b)
 
-    bundle = build_evidence_bundle(client, db, "浴血", topk=30)
+    bundle, ctx = build_evidence_bundle(client, db, "浴血", topk=30)
 
     # entity 通道：query 实体 浴血 → doc A
     assert any(x["name"] == "浴血" for x in bundle[doc_a]["channels"]["entity"])
@@ -86,7 +86,7 @@ def test_render_shows_field_and_missing_docs(tmp_path):
         None,
         None,
     )
-    bundle = build_evidence_bundle(client, db, "浴血", topk=30)
+    bundle, ctx = build_evidence_bundle(client, db, "浴血", topk=30)
     text = render_doc_evidence(bundle, [1])
     assert "浴血(content)" in text
 
@@ -105,7 +105,7 @@ def test_tag_text_populated(tmp_path):
             return [(did, 0.9)]
 
     client.closet_index = _StubCloset()
-    bundle = build_evidence_bundle(client, db, "帮会活动", topk=30)
+    bundle, ctx = build_evidence_bundle(client, db, "帮会活动", topk=30)
     assert bundle[did]["channels"]["tag"] == [{"text": "帮会活动", "confidence": 0.9}]
 
 
@@ -121,7 +121,7 @@ def test_holistic_select_uses_evidence_bundle(tmp_path, monkeypatch):
     from pageindex_mutil.super_tree import SuperTreeIndex
     from pageindex_mutil.agentic.evidence import build_evidence_bundle
     st = SuperTreeIndex(db, "m", client)
-    bundle = build_evidence_bundle(client, db, "浴血", topk=30)
+    bundle, ctx = build_evidence_bundle(client, db, "浴血", topk=30)
     captured = {}
 
     async def fake_llm(model, prompt, **kw):
@@ -153,7 +153,7 @@ def test_bundle_reaches_holistic_select_via_select_documents(tmp_path, monkeypat
     from pageindex_mutil.super_tree import SuperTreeIndex
     from pageindex_mutil.agentic.evidence import build_evidence_bundle
     st = SuperTreeIndex(db, "m", client)
-    bundle = build_evidence_bundle(client, db, "浴血", topk=30)
+    bundle, ctx = build_evidence_bundle(client, db, "浴血", topk=30)
     captured = {}
 
     async def fake_llm(model, prompt, **kw):
@@ -182,3 +182,16 @@ def test_bundle_max_hop_param_consumed(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "get_entity_distances_cte", fake_cte)
     build_evidence_bundle(client, db, "浴血", topk=30, max_hop=5)
     assert captured["max_hop"] == 5
+
+
+def test_bundle_returns_query_ctx(tmp_path):
+    """义务：build_evidence_bundle 返回 (bundle, ctx)，ctx 携带 query tokens 与展平实体名。"""
+    from pageindex_mutil.agentic.evidence import build_evidence_bundle
+    client, db = _make_client(tmp_path,
+        [("A", "文档A", "", [("浴血", "content", 3)])], None, None)
+    # 造一个含别名的实体，验证 ctx.query_entities 展平 name+aliases
+    db.insert_entity("concept", "浴血值", ["浴血"])
+    bundle, ctx = build_evidence_bundle(client, db, "浴血怎么获得", topk=30)
+    assert isinstance(bundle, dict)
+    assert "tokens" in ctx and isinstance(ctx["tokens"], list)
+    assert "query_entities" in ctx and "浴血值" in ctx["query_entities"]

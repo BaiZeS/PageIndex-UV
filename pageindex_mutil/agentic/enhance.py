@@ -499,24 +499,11 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         }
 
 
-def resolve_query_entities(db, query, limit=5) -> list:
-    """查询实体解析（共享助手）：search_entities 命中实体的规范名 + 别名展开。
-
-    供检索路径（T6.2 单文档 / T6.4 router）复用：把 query 命中的实体名与别名
-    展平为字符串列表，交给 enhance_and_select 的实体通道。确定性：按搜索结果
-    顺序去重（casefold 判重，保留首见写法）。防御性：db 调用异常、别名 JSON
-    解析失败均不抛出——坏条目跳过，其余照常返回。
-    """
-    if db is None or not query or not str(query).strip():
-        return []
-    try:
-        rows = db.search_entities(query, limit=limit)
-    except Exception as e:
-        logging.warning("resolve_query_entities: search_entities failed: %s", e)
-        return []
-
-    names = []
-    seen = set()
+def _flatten_entity_names(rows) -> list:
+    """把 search_entities 结果行展平为「名字 + 别名」字符串列表（casefold 判重，
+    保留首见写法）。纯函数，供 resolve_query_entities 与 build_evidence_bundle 复用
+    （query 实体一次解析、全链引用，[S5]）。"""
+    names, seen = [], set()
 
     def _add(value):
         if not isinstance(value, str):
@@ -543,6 +530,24 @@ def resolve_query_entities(db, query, limit=5) -> list:
             for alias in aliases:
                 _add(alias)
     return names
+
+
+def resolve_query_entities(db, query, limit=5) -> list:
+    """查询实体解析（共享助手）：search_entities 命中实体的规范名 + 别名展开。
+
+    供检索路径（T6.2 单文档 / T6.4 router）复用：把 query 命中的实体名与别名
+    展平为字符串列表，交给 enhance_and_select 的实体通道。确定性：按搜索结果
+    顺序去重（casefold 判重，保留首见写法）。防御性：db 调用异常、别名 JSON
+    解析失败均不抛出——坏条目跳过，其余照常返回。
+    """
+    if db is None or not query or not str(query).strip():
+        return []
+    try:
+        rows = db.search_entities(query, limit=limit)
+    except Exception as e:
+        logging.warning("resolve_query_entities: search_entities failed: %s", e)
+        return []
+    return _flatten_entity_names(rows)
 
 
 def resolve_node_profiles(db, db_doc_id, mapping) -> dict:

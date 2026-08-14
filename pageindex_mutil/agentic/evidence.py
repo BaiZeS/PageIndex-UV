@@ -22,8 +22,9 @@ def derive_evidence_score(entry) -> float:
     )
 
 
-def build_evidence_bundle(client, db, query, topk=30, max_hop=None) -> dict:
-    """构建证据束。返回 {db_id: {"channels": {...}, "graph": {...}}}。
+def build_evidence_bundle(client, db, query, topk=30, max_hop=None) -> tuple[dict, dict]:
+    """构建证据束。返回 (bundle, ctx)：bundle = {db_id: {"channels": {...}, "graph": {...}}}；
+    ctx = {"tokens": [...], "query_entities": [...]}（query 级共享物，一次计算全链引用，[S5]）。
 
     max_hop: 图谱递归 CTE 最大跳数；None 时读 config `cte_max_hop`（默认 3），
     替代旧硬编码 3（[S6]#2/[S6]#8 证据束生产端接线，T9）。
@@ -111,6 +112,8 @@ def build_evidence_bundle(client, db, query, topk=30, max_hop=None) -> dict:
         logging.warning("evidence entity search failed: %s", e)
         entities = []
     query_ids = [e["id"] for e in entities if e.get("id")]
+    from .enhance import _flatten_entity_names
+    query_entities = _flatten_entity_names(entities)
     try:
         dist_table = db.get_entity_distances_cte(query_ids, max_hop=max_hop) if query_ids else {}
     except Exception as e:
@@ -150,7 +153,7 @@ def build_evidence_bundle(client, db, query, topk=30, max_hop=None) -> dict:
         e["channels"]["keyword"] = _dedup(e["channels"]["keyword"], lambda k: (k["token"], k["field"]))
         e["channels"]["entity"] = _dedup(e["channels"]["entity"], lambda k: k["name"])
         e["channels"]["tag"] = _dedup(e["channels"]["tag"], lambda k: k["text"])
-    return bundle
+    return bundle, {"tokens": tokens, "query_entities": query_entities}
 
 
 def render_doc_evidence(bundle, db_ids) -> str:
