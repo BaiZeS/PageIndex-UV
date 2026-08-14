@@ -67,7 +67,6 @@ l1_select_keep: 10            # L1 终选 keep 上限（对齐评测 R@10 口径
 verifier_context_chars: 8000  # verifier 上下文预算（字符），替代硬编码 2000
 cte_max_hop: 3                # 图谱递归 CTE 最大跳数
 # P2 Agentic 多轮召回循环（spec [3.5]/[7.5]/[7.6]）
-agentic_round_topks: [5, 10, 20]  # 逐轮放宽的召回宽度梯度（precision-first → recall-expansion）；超出列表长度取末值
 agentic_max_rounds: 3             # 最大召回轮数兜底
 agentic_max_latency_ms: 45000     # 总耗时预算：已用时 + 预估新轮耗时超预算 → 不再开新轮 → best-effort
 agentic_round_timeout_s: 30       # 单轮超时：超时轮降级为 best-effort（不挂死）
