@@ -34,14 +34,12 @@ class AgenticRouter:
                 from ..reasoning import (
                     build_context_with_budget,
                     generate_answer,
-                    pages_from_nodes,
                     spans_from_nodes,
                     build_context_for_doc,
                 )
                 self._main_funcs = {
                     "build_context_with_budget": build_context_with_budget,
                     "generate_answer": generate_answer,
-                    "pages_from_nodes": pages_from_nodes,
                     "spans_from_nodes": spans_from_nodes,
                     "build_context_for_doc": build_context_for_doc,
                 }
@@ -71,7 +69,6 @@ class AgenticRouter:
         """
         funcs = self._load_main_funcs()
         spans_from_nodes = funcs.get("spans_from_nodes")
-        pages_from_nodes = funcs.get("pages_from_nodes")
 
         if hasattr(self.client, "_ensure_doc_loaded"):
             self.client._ensure_doc_loaded(doc_id)
@@ -165,13 +162,8 @@ class AgenticRouter:
             logging.info("[Recall] doc=%s selected ids missed mapping: %s", doc_id, selected_ids[:5])
             return None
 
-        # [S10] 统一 span：spans_from_nodes（page/line 双跨度分派）优先；
-        # 旧调用方/测试 mock 仅提供 pages_from_nodes（T13 删除前）时兜底为
-        # 纯 page 跨度（lines 视为空），行为与改造前一致。
-        if spans_from_nodes:
-            spans = spans_from_nodes(selected)
-        else:
-            spans = {"pages": (pages_from_nodes(selected) if pages_from_nodes else []), "lines": []}
+        # [S10] 统一 span：spans_from_nodes（page/line 双跨度分派）。
+        spans = spans_from_nodes(selected)
         pages = spans["pages"]
         lines = spans["lines"]
         # 统一 span 门槛（[S4]）：纯 span 判定，彻底移除 doc type hack——
@@ -220,8 +212,8 @@ class AgenticRouter:
         无证据束）时回退既有覆盖度分排序，保持既有调用方兼容。
         """
         funcs = self._load_main_funcs()
-        pages_from_nodes = funcs.get("pages_from_nodes")
-        if not pages_from_nodes:
+        spans_from_nodes = funcs.get("spans_from_nodes")
+        if not spans_from_nodes:
             raise RuntimeError("main.py helpers not available")
 
         # [S6] 软归属去重：同一文档可经多个簇分支命中（软归属 ⇒ DAG），

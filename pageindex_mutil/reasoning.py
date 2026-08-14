@@ -77,22 +77,6 @@ def _call_llm_json(prompt, extract_key=None, expect_list=False):
         return []
 
 
-def pages_from_nodes(nodes):
-    """Extract unique page numbers from a list of nodes."""
-    seen = set()
-    pages = []
-    for node in nodes:
-        start = node.get('start_index')
-        end = node.get('end_index')
-        if start is None or end is None:
-            continue
-        for p in range(start, end + 1):
-            if p not in seen:
-                seen.add(p)
-                pages.append(p)
-    return pages
-
-
 def spans_from_nodes(nodes):
     """按 span_kind 分派节点跨度：PDF→页集合；MD→(node_id, 起, 止) 行区间。
 

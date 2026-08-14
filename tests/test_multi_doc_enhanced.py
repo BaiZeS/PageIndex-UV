@@ -476,7 +476,7 @@ class TestActTreeSearchScoresOut:
         router, _ = _router_with_doc([_node("n0")])
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "ctx",
-            "pages_from_nodes": lambda n: [1],
+            "spans_from_nodes": lambda n: [1],
         }
 
         async def fake_recall(query, doc_id, matched_info=None):
@@ -502,7 +502,7 @@ class TestActTreeSearchScoresOut:
         router, _ = _router_with_doc([_node("n0")])
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "ctx",
-            "pages_from_nodes": lambda n: [1],
+            "spans_from_nodes": lambda n: [1],
         }
 
         async def fake_recall(query, doc_id, matched_info=None):

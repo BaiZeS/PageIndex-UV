@@ -953,7 +953,7 @@ class TestMultiHopEntityToDocE2E:
             router.verifier = MagicMock()
             router.verifier.verify.return_value = MagicMock(action="answer")
             router._load_main_funcs.return_value = {
-                "pages_from_nodes": MagicMock(return_value=[1]),
+                "spans_from_nodes": MagicMock(return_value={"pages": [1], "lines": []}),
                 "build_context_for_doc": MagicMock(
                     side_effect=lambda doc, selected, pages: "\n".join(
                         n.get("text", "") for n in selected

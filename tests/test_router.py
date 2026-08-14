@@ -324,7 +324,7 @@ class TestActTreeSearchBudget:
 
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
-            "pages_from_nodes": lambda n: [1],
+            "spans_from_nodes": lambda n: [1],
         }
 
         async def fake_recall(query, doc_id, matched_info=None):
@@ -367,7 +367,7 @@ class TestActTreeSearchBudget:
         )
         router._main_funcs = {
             "build_context_for_doc": build_ctx,
-            "pages_from_nodes": lambda n: [1],
+            "spans_from_nodes": lambda n: [1],
         }
 
         async def fake_recall(query, doc_id, matched_info=None):
@@ -406,7 +406,7 @@ class TestActTreeSearchBudget:
 
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
-            "pages_from_nodes": lambda n: [1],
+            "spans_from_nodes": lambda n: [1],
         }
 
         async def fake_recall(query, doc_id, matched_info=None):
@@ -443,7 +443,7 @@ class TestActTreeSearchBudget:
         # 单篇 400 字符 = 100 token → 余量仅 50 token
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
-            "pages_from_nodes": lambda n: [1],
+            "spans_from_nodes": lambda n: [1],
         }
 
         async def fake_recall(query, doc_id, matched_info=None):
@@ -488,7 +488,7 @@ class TestActTreeSearchBudget:
 
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
-            "pages_from_nodes": lambda n: [1],
+            "spans_from_nodes": lambda n: [1],
         }
 
         async def fake_recall(query, doc_id, matched_info=None):
@@ -538,7 +538,7 @@ class TestActTreeSearchDedup:
         router._recall_nodes_for_doc = fake_recall
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "ctx",
-            "pages_from_nodes": lambda n: [1],
+            "spans_from_nodes": lambda n: [1],
         }
 
         _ctx, _nodes, src_docs, _cov, dpm, _pwt = await router._act_tree_search(
@@ -557,7 +557,7 @@ class TestActTreeSearchEvidenceSort:
     def _setup_recall(self, router):
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "ctx",
-            "pages_from_nodes": lambda n: [1],
+            "spans_from_nodes": lambda n: [1],
         }
 
         async def fake_recall(query, doc_id, matched_info=None):
