@@ -54,7 +54,10 @@ def client_factory(tmp_path):
             search_backend="keyword",
         )
 
-    return _make
+    # index()/index_batch generate doc_summary via client_mod.llm_completion;
+    # mock it so no test triggers a real LLM (restores the header promise).
+    with patch.object(client_mod, "llm_completion", return_value="mock doc summary"):
+        yield _make
 
 
 def _two_node_structure():

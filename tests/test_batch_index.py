@@ -29,14 +29,18 @@ def db(tmp_path):
 
 @pytest.fixture
 def client_factory(tmp_path):
-    """Create a PageIndexClient with a temp DB."""
+    """Create a PageIndexClient with a temp DB. All LLM calls mocked."""
     sys.modules["PyPDF2"] = MagicMock()
     from pageindex_mutil.client import PageIndexClient
 
     def _make():
         db_path = str(tmp_path / "test.db")
         return PageIndexClient(db_path=db_path, search_backend="keyword")
-    return _make
+
+    # index_batch now generates doc_summary via llm_completion; mock it so no
+    # test triggers a real LLM (restores the "All LLM calls mocked" header).
+    with patch("pageindex_mutil.client.llm_completion", return_value="mock doc summary"):
+        yield _make
 
 
 def _make_md_file(tmp_path, name="test.md", content=None):
@@ -484,7 +488,7 @@ class TestBatchQualityImprovement:
             client.close()
 
     def test_batch_search_backend_indexed_for_all_docs(self, client_factory, tmp_path):
-        """Phase 4: search_backend.index_document called for each doc."""
+        """Phase 3: search_backend.index_document called for each doc."""
         client = client_factory()
         try:
             client.super_tree_index.on_document_added = MagicMock()

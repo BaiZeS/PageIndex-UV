@@ -685,44 +685,48 @@ class PageIndexClient:
         Exceptions are caught and logged — never propagate.
         """
         try:
-            # Start entity extraction in parallel (independent of search backend).
-            entity_future = None
-            if self.entity_extractor and doc.get('structure'):
-                entity_future = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(
-                    self._extract_entities_for_doc, db_doc_id, doc
-                )
-
-            # doc_summary ([S3]): document-level grounded summary, generated in
-            # parallel with entity extraction. Empty on failure → L1 falls back
-            # to doc_description.
-            summary_future = None
-            if self.db and doc.get('structure'):
-                summary_future = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(
-                    self._generate_doc_summary, db_doc_id, doc
-                )
-
-            # Index in vector search backend
-            if self.search_backend and doc.get('structure'):
-                try:
-                    self.search_backend.index_document(
-                        db_doc_id,
-                        doc['structure'],
-                        doc.get('pages')
+            # Entity extraction + doc_summary ([S3]) run in parallel with the
+            # search backend index (they are independent of it). A single
+            # short-lived executor (with block → shutdown) runs both; no
+            # cross-call persistent pool (D2), no leaked non-daemon threads.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                entity_future = None
+                if self.entity_extractor and doc.get('structure'):
+                    entity_future = pool.submit(
+                        self._extract_entities_for_doc, db_doc_id, doc
                     )
-                except Exception as e:
-                    logging.warning("Failed to index in search backend: %s", e)
 
-            # Wait for entity extraction + doc_summary to complete
-            if entity_future is not None:
-                try:
-                    entity_future.result()
-                except Exception as e:
-                    logging.warning("Entity extraction thread failed for doc %d: %s", db_doc_id, e)
-            if summary_future is not None:
-                try:
-                    summary_future.result()
-                except Exception as e:
-                    logging.warning("doc_summary thread failed for doc %d: %s", db_doc_id, e)
+                # doc_summary ([S3]): document-level grounded summary, generated
+                # in parallel with entity extraction. Empty on failure → L1
+                # falls back to doc_description.
+                summary_future = None
+                if self.db and doc.get('structure'):
+                    summary_future = pool.submit(
+                        self._generate_doc_summary, db_doc_id, doc
+                    )
+
+                # Index in vector search backend
+                if self.search_backend and doc.get('structure'):
+                    try:
+                        self.search_backend.index_document(
+                            db_doc_id,
+                            doc['structure'],
+                            doc.get('pages')
+                        )
+                    except Exception as e:
+                        logging.warning("Failed to index in search backend: %s", e)
+
+                # Wait for entity extraction + doc_summary to complete
+                if entity_future is not None:
+                    try:
+                        entity_future.result()
+                    except Exception as e:
+                        logging.warning("Entity extraction thread failed for doc %d: %s", db_doc_id, e)
+                if summary_future is not None:
+                    try:
+                        summary_future.result()
+                    except Exception as e:
+                        logging.warning("doc_summary thread failed for doc %d: %s", db_doc_id, e)
 
             # Node profiles (P1.2): canonical entity signatures per TOC node.
             # Runs after entity extraction so mentions exist; also attaches the
@@ -902,8 +906,22 @@ class PageIndexClient:
             except Exception as e:
                 logging.warning("Entity extraction failed for doc %d: %s", db_doc_id, e)
 
+        def _generate_summary_one(item):
+            # doc_summary ([S3]): per-doc grounded summary. Parity with the
+            # single-doc index() path — reuse the same _generate_doc_summary
+            # helper so batch-mode summaries are generated identically.
+            _, db_doc_id, doc = item
+            self._generate_doc_summary(db_doc_id, doc)
+
+        # Entity + relation extraction and doc_summary run in parallel, in the
+        # same pool (same parallelism as single-doc _enrich_document).
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-            list(pool.map(_extract_entities_one, phase1_results))
+            entity_futures = [pool.submit(_extract_entities_one, item)
+                              for item in phase1_results]
+            summary_futures = [pool.submit(_generate_summary_one, item)
+                               for item in phase1_results]
+            for fut in entity_futures + summary_futures:
+                fut.result()
 
         # -- Phase 2: batch entity normalization --
         if self.entity_extractor:

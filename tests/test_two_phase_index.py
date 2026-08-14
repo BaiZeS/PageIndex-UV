@@ -30,14 +30,18 @@ def db(tmp_path):
 
 @pytest.fixture
 def client_factory(tmp_path):
-    """Create a PageIndexClient with a temp DB."""
+    """Create a PageIndexClient with a temp DB. All LLM calls mocked."""
     sys.modules["PyPDF2"] = MagicMock()
     from pageindex_mutil.client import PageIndexClient
 
     def _make():
         db_path = str(tmp_path / "test.db")
         return PageIndexClient(db_path=db_path, search_backend="keyword")
-    return _make
+
+    # index() now generates a doc_summary via llm_completion; mock it so no
+    # test triggers a real LLM (restores the "All LLM calls mocked" header).
+    with patch("pageindex_mutil.client.llm_completion", return_value="mock doc summary"):
+        yield _make
 
 
 def _make_md_file(tmp_path, name="test.md"):
@@ -146,7 +150,6 @@ class TestPhase1FastReturn:
             # Make Phase 2 hang so we can inspect the set
             barrier = threading.Event()
             client.search_backend.index_document = MagicMock(side_effect=lambda *a, **k: barrier.wait(timeout=10))
-            client.search_backend.index_document = MagicMock()
             client.entity_extractor = MagicMock()
 
             md_path = _make_md_file(tmp_path)

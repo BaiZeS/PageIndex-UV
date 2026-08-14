@@ -137,3 +137,49 @@ class TestDocSummaryEnrichment:
             assert db_doc["doc_description"] == "旧描述"
         finally:
             client.close()
+
+    def test_index_batch_generates_doc_summary_using_retrieve_model(
+        self, client_factory, tmp_path
+    ):
+        """Batch path also generates doc_summary (NFR4 retrieve_model wiring)."""
+        client = client_factory(retrieve_model="r-model")
+        try:
+            client.super_tree_index.on_document_added = MagicMock()
+            client.closet_index.add_document = MagicMock()
+            client.search_backend.index_document = MagicMock()
+            client.entity_extractor.extract_from_document = MagicMock(
+                return_value=([], [], [])
+            )
+            client.entity_extractor.normalize_entities_batch = MagicMock()
+
+            calls = []
+
+            def fake_llm(model, prompt, **kw):
+                calls.append(model)
+                return "批量接地摘要"
+
+            md_path = tmp_path / "doc.md"
+            md_path.write_text("# Test\n\ncontent\n", encoding="utf-8")
+            with patch(
+                "pageindex_mutil.client.md_to_tree",
+                return_value={
+                    "doc_name": "doc.md",
+                    "doc_description": "旧描述",
+                    "line_count": 2,
+                    "structure": [{
+                        "node_id": "n1", "title": "Test",
+                        "text": "content", "summary": "s", "level": 1,
+                    }],
+                },
+            ), patch(
+                "pageindex_mutil.client.llm_completion", side_effect=fake_llm
+            ):
+                client.index_batch([str(md_path)], mode="md")
+
+            db_doc = client.db.get_document_by_name("doc.md")
+            assert db_doc["doc_summary"] == "批量接地摘要"
+            # 不覆盖 doc_description
+            assert db_doc["doc_description"] == "旧描述"
+            assert calls == ["r-model"]
+        finally:
+            client.close()
