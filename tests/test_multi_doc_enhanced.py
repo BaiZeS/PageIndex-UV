@@ -299,7 +299,7 @@ def _instrumented_enhancer(select_results, model="m-model", retrieve_model="r-mo
 
     async def fake_select(query, candidates, profiles, query_entities=None,
                           node_budget=None, token_budget=None, max_candidates=None,
-                          force_all_candidates=False):
+                          force_all_candidates=False, **kw):
         calls.append({
             "query": query, "candidates": candidates, "profiles": profiles,
             "query_entities": query_entities, "max_candidates": max_candidates,
@@ -419,10 +419,28 @@ class TestSuperTreeMatchedScores:
         bundle = {7: {"channels": {
             "keyword": [{"token": "x"}, {"token": "y"}], "tag": [], "entity": [],
         }, "graph": {}}}
-        with patch.object(_evidence_mod(), "build_evidence_bundle", return_value=(bundle, {"tokens": [], "query_entities": []})), \
+
+        # [S7] 记录 enhance_and_select 实参：query_entities/query_tokens 应来自
+        # evidence_ctx（非内部 resolve_query_entities/tokenize 重新计算）。
+        enhance_calls = []
+        real_enhance = _enhance_mod().UnifiedNodeEnhancement.enhance_and_select
+
+        async def recording_enhance(self_, query, candidates, profiles, **kwargs):
+            enhance_calls.append(kwargs)
+            return await real_enhance(self_, query, candidates, profiles, **kwargs)
+
+        with patch.object(_enhance_mod().UnifiedNodeEnhancement, "enhance_and_select",
+                          recording_enhance), \
+                patch.object(_evidence_mod(), "build_evidence_bundle",
+                             return_value=(bundle, {"tokens": ["浴血"], "query_entities": ["张三"]})), \
                 _patch_enhance_llm(return_value=_select_json(["n0"])), \
                 _patch_generate_answer("最终答案"):
             result = asyncio.run(router._search_super_tree("q", top_k=3))
+
+        # [S7] L2 复用证据束 query 物：query_entities/query_tokens 来自 ctx
+        # （"张三"/"浴血"），而非 db.search_entities（返回 []）或内部 tokenize。
+        assert enhance_calls and enhance_calls[0]["query_entities"] == ["张三"]
+        assert enhance_calls[0]["query_tokens"] == ["浴血"]
 
         # 证据分 = 1*2 keyword = 2.0（不再是硬编码 1.0 / 覆盖度）
         assert result["matched_docs"] == [{"doc_id": "doc1", "score": 2.0}]

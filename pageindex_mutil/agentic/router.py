@@ -52,7 +52,8 @@ class AgenticRouter:
     # ------------------------------------------------------------------
     async def _recall_nodes_for_doc(self, query: str, doc_id: str,
                                       matched_info: List[Dict] = None,
-                                      l1_reasons: Dict[str, str] = None):
+                                      l1_reasons: Dict[str, str] = None,
+                                      query_entities=None, query_tokens=None):
         """Recall relevant nodes for a single document (runs in thread).
 
         [3.2.1] unit = 节点：enhance_and_select 统一接入——四通道 union 宽召回 +
@@ -66,6 +67,10 @@ class AgenticRouter:
         l1_reasons: {doc_id: 一句话选中理由}（[S6]#7/[S7] L1→L2 trace）。仅把
         本文档自己的理由子集下传 L2 节点裁定（防锚定，标注为判断而非事实）；
         None/缺该文档 → 传 None，行为与之前完全一致。
+
+        query_entities/query_tokens: [S7] L0 证据束共享物（_act_tree_search 经
+        evidence_ctx 提取下传）。非 None 时直接使用，不再 db.search_entities /
+        内部 tokenize；None 时回退既有解析（v2 路径 / 无证据束调用方兼容）。
         """
         funcs = self._load_main_funcs()
         spans_from_nodes = funcs.get("spans_from_nodes")
@@ -108,7 +113,8 @@ class AgenticRouter:
         if db is not None and id_mapper is not None and hasattr(id_mapper, "to_db"):
             db_doc_id = id_mapper.to_db(doc_id)
         profiles = resolve_node_profiles(db, db_doc_id, mapping)
-        query_entities = resolve_query_entities(db, query, limit=5) if db else []
+        if query_entities is None:
+            query_entities = resolve_query_entities(db, query, limit=5) if db else []
 
         # 内容策略命中词并入关键词证据（v2 词面接地的保全，仅证据不裁决）。
         # 写时拷贝：structure 兜底签名的 list 与内存文档节点共享引用，
@@ -137,6 +143,8 @@ class AgenticRouter:
             reason = l1_reasons.get(doc_id)
             if reason:
                 call_kwargs["l1_reasons"] = {doc_id: reason}  # 仅本文档理由子集
+        if query_tokens is not None:
+            call_kwargs["query_tokens"] = query_tokens
         result = await enhancer.enhance_and_select(
             query, candidates, profiles, query_entities=query_entities, **call_kwargs
         )
@@ -212,9 +220,10 @@ class AgenticRouter:
         与 matched_docs 同口径——保证支撑段可见，替代覆盖度分排序。None（v2 路径
         无证据束）时回退既有覆盖度分排序，保持既有调用方兼容。
 
-        evidence_ctx: [S5] 证据束上下文（{"tokens", "query_entities"}）。本任务只
-        留槽位、不消费（T3 才在方法体内提取并下传），避免 **act_kwargs 传入抛
-        TypeError。
+        evidence_ctx: [S5]/[S7] 证据束上下文（{"tokens", "query_entities"}）。
+        本任务在方法体内提取 ctx_qe/ctx_qt 并透传 _recall_nodes_for_doc → 最终
+        enhance_and_select 复用 query_tokens、_recall_nodes_for_doc 不再重复
+        resolve_query_entities。
         """
         funcs = self._load_main_funcs()
         spans_from_nodes = funcs.get("spans_from_nodes")
@@ -230,6 +239,12 @@ class AgenticRouter:
                 seen_docs.add(doc_id)
                 unique_docs.append(doc_id)
 
+        # [S7] L2 复用证据束 query 物：从 evidence_ctx 提取 query tokens/entities
+        # 下传 _recall_nodes_for_doc（直通 enhance_and_select），消除重复 tokenize/
+        # search_entities。None（v2 路径/无证据束）时各自回退既有解析。
+        ctx_qe = evidence_ctx.get("query_entities") if evidence_ctx else None
+        ctx_qt = evidence_ctx.get("tokens") if evidence_ctx else None
+
         # Parallel node recall across documents (with match info if available)
         recall_tasks = []
         for doc_id in unique_docs:
@@ -238,6 +253,10 @@ class AgenticRouter:
             }
             if l1_reasons is not None:
                 call_kwargs["l1_reasons"] = l1_reasons
+            if ctx_qe is not None:
+                call_kwargs["query_entities"] = ctx_qe
+            if ctx_qt is not None:
+                call_kwargs["query_tokens"] = ctx_qt
             recall_tasks.append(self._recall_nodes_for_doc(query, doc_id, **call_kwargs))
         recall_results = await asyncio.gather(*recall_tasks, return_exceptions=True)
 

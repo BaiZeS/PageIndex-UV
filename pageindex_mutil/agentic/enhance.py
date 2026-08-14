@@ -348,6 +348,7 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         candidates,
         profiles,
         query_entities=None,
+        query_tokens=None,
         node_budget=None,
         token_budget=None,
         max_candidates=None,
@@ -362,6 +363,8 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         profiles:   {node_id: {"entities": [{"name","type"}], "keywords": [...], "tags": [...]}}
                     （缺失节点 → 空证据，仍可被选中，[7.7] 签名缺失退化）
         query_entities: 实体名字符串列表（由调用方解析，含别名）
+        query_tokens: query 分词结果（[S7] L0 证据束共享物）；非 None 时直接复用，
+                     不再内部 _tokenize(query)——消除 L2 与 L0 的重复分词。
         max_candidates: 本次调用的 union 上限覆盖（None → 实例配置的
                     union_max_candidates）；pool_concern 放宽重选时用 ([3.2.1])
         force_all_candidates: True → union 步骤全量候选准入（零信号直通），
@@ -395,7 +398,8 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
             return empty
 
         # ① union（纯查表/集合并，全程无 LLM，[7.3]）
-        query_tokens = self._tokenize(query)
+        # [S7] query_tokens 非 None → 复用 L0 证据束共享物，不再内部 tokenize。
+        query_tokens = query_tokens if query_tokens is not None else self._tokenize(query)
         query_cf = query.casefold()
         node_signals = {}
         union = []

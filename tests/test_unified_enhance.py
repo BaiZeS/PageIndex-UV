@@ -1419,3 +1419,27 @@ class TestL1ReasonsInjection:
         prompt = _prompt_of(mock_llm)
         assert "上级选档依据（判断而非事实，供参考，可推翻）" in prompt
         assert "正文命中" in prompt
+
+
+# ===========================================================================
+# 16. [S7] query_tokens 直通：非 None 时复用 L0 共享物，不再内部 tokenize
+# ===========================================================================
+
+
+class TestQueryTokensReuse:
+    def test_enhance_reuses_provided_query_tokens(self, monkeypatch):
+        """义务：query_tokens 非 None 时不再内部 tokenize（复用 L0 共享物）。"""
+        enh = UnifiedNodeEnhancement("m", retrieve_model="r")
+        calls = {"n": 0}
+        real = UnifiedNodeEnhancement._tokenize
+
+        def spy(cls, text):
+            calls["n"] += 1
+            return real(text)
+
+        monkeypatch.setattr(UnifiedNodeEnhancement, "_tokenize", classmethod(spy))
+        with patch.object(enhance_mod, "llm_completion", return_value=_resp(["n1"])):
+            asyncio.run(enh.enhance_and_select(
+                "q", [{"node_id": "n1", "title": "t", "summary": "s", "text": "浴血"}],
+                {}, query_tokens=["浴血"]))
+        assert calls["n"] == 0  # 提供 tokens 后零内部 tokenize
