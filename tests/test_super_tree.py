@@ -227,8 +227,9 @@ class TestSuperTreeIndex:
             client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2, "uuid-c": 3}
             for i in (1, 2, 3):
                 db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
-            result = await st.select_documents("test", {1: 1.0, 2: 1.0, 3: 1.0})
+            result, reasons = await st.select_documents("test", {1: 1.0, 2: 1.0, 3: 1.0})
             assert result == ["uuid-a"]
+            assert reasons == {}
 
     @pytest.mark.asyncio
     async def test_select_documents_reasoning_variable_count(self, super_tree_index):
@@ -240,16 +241,18 @@ class TestSuperTreeIndex:
             client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2, "uuid-c": 3}
             for i in (1, 2, 3):
                 db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
-            result = await st.select_documents("test", {1: 1.0, 2: 1.0, 3: 1.0})
+            result, reasons = await st.select_documents("test", {1: 1.0, 2: 1.0, 3: 1.0})
             assert result == ["uuid-b"]
             assert len(result) == 1
+            assert reasons == {}
 
     @pytest.mark.asyncio
     async def test_select_documents_reasoning_empty_candidates(self, super_tree_index):
         """三层重构-选择层：空候选返回空列表。"""
         st, db, client = super_tree_index
-        result = await st.select_documents("test", {})
+        result, reasons = await st.select_documents("test", {})
         assert result == []
+        assert reasons == {}
 
     @pytest.mark.asyncio
     async def test_select_documents_reasoning_map_reduce(self, super_tree_index):
@@ -267,7 +270,7 @@ class TestSuperTreeIndex:
                 json.dumps({"doc_ids": ["uuid-1"]}),
                 json.dumps({"doc_ids": ["uuid-5"]}),
             ]
-            result = await st.select_documents("test", {i: 1.0 for i in range(1, 10)})
+            result, reasons = await st.select_documents("test", {i: 1.0 for i in range(1, 10)})
         assert set(result) == {"uuid-1", "uuid-5", "uuid-9"}
 
     def test_hierarchy_boost_soft_routing(self, super_tree_index):
@@ -517,29 +520,43 @@ class TestDocEvidenceLines:
 
 
 class TestHolisticSelectPromptEvidence:
-    """_holistic_select：证据块注入 prompt（有命中才出现，零命中完全不变）。"""
+    """_holistic_select：证据（有命中才出现）+ 呈现单元（名称 + 摘要 + 证据行）。"""
 
     @pytest.mark.asyncio
     async def test_evidence_block_in_prompt(self, super_tree_index):
-        """命中文档证据行 + 指引 + 要求进 prompt；零命中文档不出行。"""
+        """命中文档证据行进 prompt（呈现单元 JSON）；零命中文档无证据字段。"""
         with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
             mock_llm.return_value = json.dumps({"doc_ids": ["uuid-a"]})
             st, db, client = super_tree_index
             d1, d2 = _seed_matching_docs(st, db, client)
-            result = await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
+            result, _ = await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
         assert result == ["uuid-a"]
         prompt = mock_llm.call_args[0][1]
-        assert "[文档语料证据（关键词/实体/标签命中，供参考）]" in prompt
-        assert ("doc uuid-a: 关键词命中: 风控, 合规 | 实体命中: 风控系统 | "
+        # 呈现单元：文档名 + 摘要 + 证据行（doc_summary 列未建 → doc_description 兜底为空）
+        assert '"doc_id": "uuid-a"' in prompt
+        assert ("关键词命中: 风控, 合规 | 实体命中: 风控系统 | "
                 "标签命中: 合规管理") in prompt
-        assert "doc uuid-b" not in prompt  # 零命中文档不出行
         assert "证据是语料事实，请优先依据证据与问题的语义关联程度判断" in prompt
-        assert "无证据命中的文档仍可按标题/摘要判断" in prompt
-        assert "证据命中是强信号" in prompt  # 新增要求行
-        # 位置契约：证据段在 [候选文档结构] 之后、要求 之前
-        assert (prompt.index("[候选文档结构]")
-                < prompt.index("[文档语料证据")
-                < prompt.index("要求："))
+        assert "证据命中是强信号" in prompt  # 新增要求行（证据段）
+        # 位置契约：证据段（候选文档结构）在 要求 之前
+        assert prompt.index("[候选文档结构]") < prompt.index("要求：")
+
+    @pytest.mark.asyncio
+    async def test_prompt_drops_contradictory_instructions(self, super_tree_index):
+        """[S6]#3：删除"基于标题摘要判断"引导与"可以少选甚至不选"判空授权句；
+        保留"宁缺毋滥"；证据段固定句不带"仍可按标题/摘要判断"尾巴。"""
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = json.dumps({"doc_ids": ["uuid-a"]})
+            st, db, client = super_tree_index
+            d1, d2 = _seed_matching_docs(st, db, client)
+            await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
+        prompt = mock_llm.call_args[0][1]
+        assert "可以少选甚至不选" not in prompt
+        assert "基于文档的章节标题和摘要判断相关性" not in prompt
+        assert "无证据命中的文档仍可按标题/摘要判断" not in prompt
+        assert "宁缺毋滥" in prompt  # 保留
+        assert ("证据是语料事实，请优先依据证据与问题的语义关联程度判断，"
+                "而非简单计数命中个数。" in prompt)
 
     @pytest.mark.asyncio
     async def test_no_hits_evidence_section_absent(self, super_tree_index):
@@ -556,7 +573,6 @@ class TestHolisticSelectPromptEvidence:
             }])
             await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
         prompt = mock_llm.call_args[0][1]
-        assert "文档语料证据" not in prompt
         assert "证据是语料事实" not in prompt
         assert "证据命中是强信号" not in prompt
 
@@ -576,7 +592,7 @@ class TestHolisticSelectPromptEvidence:
                 "keywords": [None, 9, "风控"],
                 "tags": {"not": "a list"},
             }])
-            result = await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
+            result, _ = await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
         assert result == ["uuid-a"]
         prompt = mock_llm.call_args[0][1]
         assert "关键词命中: 风控" in prompt
@@ -584,7 +600,7 @@ class TestHolisticSelectPromptEvidence:
 
     @pytest.mark.asyncio
     async def test_evidence_prompt_deterministic(self, super_tree_index):
-        """两次相同选档 → 注入 prompt 的证据段逐字节一致。"""
+        """两次相同选档 → 注入 prompt 的候选文档块逐字节一致。"""
         st, db, client = super_tree_index
         d1, d2 = _seed_matching_docs(st, db, client)
         prompts = []
@@ -593,9 +609,93 @@ class TestHolisticSelectPromptEvidence:
                 mock_llm.return_value = json.dumps({"doc_ids": ["uuid-a"]})
                 await st.select_documents("风控合规审查", {d1: 1.0, d2: 1.0})
             prompts.append(mock_llm.call_args[0][1])
-        ev0 = prompts[0].split("[文档语料证据")[1]
-        ev1 = prompts[1].split("[文档语料证据")[1]
-        assert ev0 == ev1
+        assert prompts[0] == prompts[1]
+
+
+class TestL1SelectKeep:
+    """[S6]#6：终选 keep 上限取 l1_select_keep（默认 10，可配）。"""
+
+    def test_l1_select_keep_default_ten(self, super_tree_index):
+        st, db, client = super_tree_index
+        assert st._L1_SELECT_KEEP == 10
+
+    @pytest.mark.asyncio
+    async def test_l1_keep_configurable(self, super_tree_index):
+        st, db, client = super_tree_index
+        st._L1_SELECT_KEEP = 3
+        docs = {f"uuid-{i}": i for i in range(1, 6)}
+        client._uuid_to_db = docs
+        client.documents = {u: {"id": u} for u in docs}
+        for i in range(1, 6):
+            db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = json.dumps({"doc_ids": ["uuid-1"]})
+            await st.select_documents("test", {i: 1.0 for i in range(1, 6)})
+        prompt = mock_llm.call_args[0][1]
+        assert "最多 3 篇" in prompt  # keep 上限来自 l1_select_keep（非旧 _SELECT_TOP_K=5）
+
+
+class TestBudgetNoPop:
+    """[S6]#4：预算超限先截摘要/退化弱候选，绝不静默 pop 文档。"""
+
+    @pytest.mark.asyncio
+    async def test_budget_truncates_summary_not_pop_docs(self, super_tree_index):
+        st, db, client = super_tree_index
+        st._MAX_SUPER_TREE_TOKENS = 30  # 极低预算，强制截短/降级
+        n = 8
+        docs = {}
+        for i in range(n):
+            did = db.insert_document(f"doc{i}.pdf", "/tmp/{i}.pdf",
+                                     doc_description="摘要" * 200)
+            docs[f"uuid-{i}"] = did
+        client._uuid_to_db = docs
+        client.documents = {u: {"id": u} for u in docs}
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = json.dumps({"doc_ids": ["uuid-0"]})
+            result, _ = await st.select_documents("查询", {d: 1.0 for d in docs.values()})
+        prompt = mock_llm.call_args[0][1]
+        # 不 pop 文档：全部候选名称仍在呈现中
+        for i in range(n):
+            assert f"doc{i}.pdf" in prompt
+        # 完整 400 字符摘要已截短/清空（降级行只保留名称 + 证据摘要）
+        assert "摘要" * 200 not in prompt
+
+
+class TestReasonsNormalization:
+    """[S6]#7：reasons 键规范化（db_id 键 → uuid；uuid 键原样；只含 keep 内条目）。"""
+
+    @pytest.mark.asyncio
+    async def test_db_id_keys_normalized_to_uuid_and_filtered(self, super_tree_index):
+        st, db, client = super_tree_index
+        client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2, "uuid-c": 3}
+        client.documents = {u: {"id": u} for u in ("uuid-a", "uuid-b", "uuid-c")}
+        for i in (1, 2, 3):
+            db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            # LLM 回 db_id 键（JSON 序列化为字符串键）的理由；doc 3 未选中 → 应被过滤
+            mock_llm.return_value = json.dumps({
+                "doc_ids": ["uuid-a", "uuid-b"],
+                "reasons": {"1": "理由A", "2": "理由B", "3": "未被选中"},
+            })
+            selected, reasons = await st._holistic_select("test", [1, 2, 3])
+        assert selected == [1, 2]
+        assert reasons == {"uuid-a": "理由A", "uuid-b": "理由B"}
+
+    @pytest.mark.asyncio
+    async def test_uuid_keys_passthrough_and_unselected_filtered(self, super_tree_index):
+        st, db, client = super_tree_index
+        client._uuid_to_db = {"uuid-a": 1, "uuid-b": 2}
+        client.documents = {u: {"id": u} for u in ("uuid-a", "uuid-b")}
+        for i in (1, 2):
+            db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
+        with patch.object(super_tree_mod, "llm_acompletion") as mock_llm:
+            mock_llm.return_value = json.dumps({
+                "doc_ids": ["uuid-a"],
+                "reasons": {"uuid-a": "理由A", "uuid-b": "未选"},
+            })
+            selected, reasons = await st._holistic_select("test", [1, 2])
+        assert selected == [1]
+        assert reasons == {"uuid-a": "理由A"}  # uuid 键原样；未选的 uuid-b 被过滤
 
 
 # ---------------------------------------------------------------------------

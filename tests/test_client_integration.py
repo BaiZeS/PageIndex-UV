@@ -232,7 +232,9 @@ async def test_single_doc_lexical_hit_end_to_end(tmp_path):
         }
         assert result["answer"] == "最终答案"
         assert result["confidence"] == "high"
-        assert result["matched_docs"] == [{"doc_id": "d1", "score": 1.0}]
+        # matched_docs score = 证据分（词面命中加权 > 0），非硬编码/覆盖度
+        assert [d["doc_id"] for d in result["matched_docs"]] == ["d1"]
+        assert all(d["score"] > 0 for d in result["matched_docs"])
         assert [n["node_id"] for n in result["selected_nodes"]] == ["n1"]
     finally:
         client.close()

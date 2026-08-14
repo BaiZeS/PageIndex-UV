@@ -68,6 +68,11 @@ def _reasoning_mod():
     return m
 
 
+def _evidence_mod():
+    import pageindex_mutil.agentic.evidence as m
+    return m
+
+
 def _node(nid, title="标题", summary="摘要", text="正文", **extra):
     node = {"node_id": nid, "title": title, "summary": summary, "text": text,
             "start_index": 0, "end_index": 0}
@@ -394,23 +399,34 @@ def _plan_result(queries=None):
 
 
 class TestSuperTreeMatchedScores:
-    def test_matched_scores_are_coverage_not_hardcoded(self):
-        """端到端：prefilter→选档→enhance 节点召回→matched=覆盖度∈(0,1]。"""
-        router, client = _router_with_doc([_node(f"n{i}") for i in range(4)])
+    def test_matched_scores_are_evidence_score(self):
+        """端到端：prefilter→选档→enhance 节点召回→matched score = 证据分
+        （derive_evidence_score，通道命中加权标量，[S6]#8）。"""
+        router, client = _router_with_doc([_node("n0")])
 
         mock_st = MagicMock()
         mock_st.prefilter.return_value = {1: 1.0}
-        mock_st.select_documents = AsyncMock(return_value=["doc1"])
+        mock_st.select_documents = AsyncMock(return_value=(["doc1"], {}))
         router.super_tree_index = mock_st
         router.planner.plan = AsyncMock(return_value=_plan_result())
         router.verifier.verify = MagicMock(return_value=MagicMock(action="answer"))
 
-        with _patch_enhance_llm(return_value=_select_json(["n0"])), \
+        # 触发 bundle 构建：db 非 None；recall 路径经空签名回退结构（安全）
+        client.db = MagicMock()
+        client.db.get_node_profiles.return_value = []
+        client.db.search_entities.return_value = []
+        client._id_mapper = None
+        client._uuid_to_db = {"doc1": 7}
+        bundle = {7: {"channels": {
+            "keyword": [{"token": "x"}, {"token": "y"}], "tag": [], "entity": [],
+        }, "graph": {}}}
+        with patch.object(_evidence_mod(), "build_evidence_bundle", return_value=bundle), \
+                _patch_enhance_llm(return_value=_select_json(["n0"])), \
                 _patch_generate_answer("最终答案"):
             result = asyncio.run(router._search_super_tree("q", top_k=3))
 
-        # 1/4 候选 = 0.25（不再是硬编码 1.0）
-        assert result["matched_docs"] == [{"doc_id": "doc1", "score": 0.25}]
+        # 证据分 = 1*2 keyword = 2.0（不再是硬编码 1.0 / 覆盖度）
+        assert result["matched_docs"] == [{"doc_id": "doc1", "score": 2.0}]
         assert result["answer"] == "最终答案"
         assert result["confidence"] == "high"
         assert set(result.keys()) == {
@@ -424,7 +440,7 @@ class TestSuperTreeMatchedScores:
 
         mock_st = MagicMock()
         mock_st.prefilter.return_value = {1: 1.0}
-        mock_st.select_documents = AsyncMock(return_value=["doc1"])
+        mock_st.select_documents = AsyncMock(return_value=(["doc1"], {}))
         router.super_tree_index = mock_st
         router.planner.plan = AsyncMock(return_value=_plan_result())
         router.verifier.verify = MagicMock(return_value=MagicMock(action="answer"))
@@ -442,7 +458,7 @@ class TestSuperTreeMatchedScores:
 
         mock_st = MagicMock()
         mock_st.prefilter.return_value = {1: 1.0}
-        mock_st.select_documents = AsyncMock(return_value=["doc1"])
+        mock_st.select_documents = AsyncMock(return_value=(["doc1"], {}))
         router.super_tree_index = mock_st
         router.planner.plan = AsyncMock(return_value=_plan_result())
         router._act_tree_search = AsyncMock(side_effect=RuntimeError("boom"))
@@ -710,8 +726,8 @@ class TestMdNodeRecallNoPagesGate:
         assert dpm.get("doc1") == []  # 空页列表容忍，不抛错
 
     def test_super_tree_end_to_end_md_corpus_matched_and_context(self):
-        """端到端：MD 语料经 _search_super_tree → matched_docs 非空（覆盖度
-        分数），且传给答案 LLM 的上下文含节点 text（不再 No relevant content）。"""
+        """端到端：MD 语料经 _search_super_tree → matched_docs 非空（证据分，
+        无 bundle 条目给 0），且传给答案 LLM 的上下文含节点 text（不再 No relevant content）。"""
         router, _ = _router_with_doc([
             _md_node("n1", title="浴血值获取",
                      text="浴血值可以通过日常任务获得。", keywords=["浴血值"]),
@@ -720,7 +736,7 @@ class TestMdNodeRecallNoPagesGate:
 
         mock_st = MagicMock()
         mock_st.prefilter.return_value = {1: 1.0}
-        mock_st.select_documents = AsyncMock(return_value=["doc1"])
+        mock_st.select_documents = AsyncMock(return_value=(["doc1"], {}))
         router.super_tree_index = mock_st
         router.planner.plan = AsyncMock(return_value=_plan_result())
         router.verifier.verify = MagicMock(return_value=MagicMock(action="answer"))
@@ -735,8 +751,8 @@ class TestMdNodeRecallNoPagesGate:
                 patch.object(_reasoning_mod(), "generate_answer", fake_generate):
             result = asyncio.run(router._search_super_tree("浴血值怎么获得", top_k=3))
 
-        # 召回未被 pages 门槛拦截 → 覆盖度证据进 matched（0.5，非硬编码）
-        assert result["matched_docs"] == [{"doc_id": "doc1", "score": 0.5}]
+        # 召回未被 pages 门槛拦截 → 证据分进 matched（db=None → bundle 空 → 0.0）
+        assert result["matched_docs"] == [{"doc_id": "doc1", "score": 0.0}]
         assert result["answer"] == "最终答案"
         assert result["confidence"] == "high"
         # 传给答案 LLM 的上下文确实含节点 text（证据接地闭环）

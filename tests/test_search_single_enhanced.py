@@ -582,7 +582,7 @@ class TestNFR4AndShape:
         router = AgenticRouter(client, "m-model", retrieve_model="r-model")
         router.super_tree_index = MagicMock()
         router.super_tree_index.prefilter.return_value = {1: 1.0}
-        router.super_tree_index.select_documents = AsyncMock(return_value=["doc1"])
+        router.super_tree_index.select_documents = AsyncMock(return_value=(["doc1"], {}))
         router.planner.plan = AsyncMock(return_value=PlanResult(
             queries=["q"], weights={}, query_type="factual",
         ))
@@ -599,7 +599,7 @@ class TestNFR4AndShape:
         }
         assert result["mode"] == "multi"
         assert result["answer"] == "ANSWER"
-        assert result["matched_docs"] == [{"doc_id": "doc1", "score": 1.0}]
+        assert result["matched_docs"] == [{"doc_id": "doc1", "score": 0.0}]
 
 
 # ---------------------------------------------------------------------------

@@ -22,8 +22,18 @@ def derive_evidence_score(entry) -> float:
     )
 
 
-def build_evidence_bundle(client, db, query, topk=30) -> dict:
-    """构建证据束。返回 {db_id: {"channels": {...}, "graph": {...}}}。"""
+def build_evidence_bundle(client, db, query, topk=30, max_hop=None) -> dict:
+    """构建证据束。返回 {db_id: {"channels": {...}, "graph": {...}}}。
+
+    max_hop: 图谱递归 CTE 最大跳数；None 时读 config `cte_max_hop`（默认 3），
+    替代旧硬编码 3（[S6]#2/[S6]#8 证据束生产端接线，T9）。
+    """
+    if max_hop is None:
+        try:
+            from ..utils import ConfigLoader
+            max_hop = getattr(ConfigLoader().load(None), "cte_max_hop", 3)
+        except Exception:
+            max_hop = 3
     bundle = {}
 
     def entry(db_id):
@@ -102,7 +112,7 @@ def build_evidence_bundle(client, db, query, topk=30) -> dict:
         entities = []
     query_ids = [e["id"] for e in entities if e.get("id")]
     try:
-        dist_table = db.get_entity_distances_cte(query_ids, max_hop=3) if query_ids else {}
+        dist_table = db.get_entity_distances_cte(query_ids, max_hop=max_hop) if query_ids else {}
     except Exception as e:
         logging.warning("evidence entity distance CTE failed: %s", e)
         dist_table = {}

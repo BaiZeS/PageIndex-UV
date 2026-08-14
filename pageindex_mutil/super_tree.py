@@ -185,6 +185,7 @@ class SuperTreeIndex:
     _SUMMARY_MAX_LEN = 100
     _RANK_K = 12
     _SELECT_TOP_K = 5
+    _L1_SELECT_KEEP = 10  # L1 终选 keep 上限（对齐评测 R@10 口径，[S6]#6）
     _SCORE_RATIO = 0.5
     # 三层重构-选择层：map-reduce 推理选择参数
     _REASON_GROUP_SIZE = 10   # 候选 <= 该值走单次整体挑选；否则分组 map-reduce
@@ -211,6 +212,10 @@ class SuperTreeIndex:
     _DOC_EVIDENCE_MAX_KEYWORDS = 4
     _DOC_EVIDENCE_MAX_ENTITIES = 3
     _DOC_EVIDENCE_MAX_TAGS = 2
+    # L1 预算守卫（[S6]#4）：先截短 doc_summary（最短 _DOC_SUMMARY_MIN_LEN），
+    # 仍超才退化弱候选为一行"名称 + 证据摘要"（证据摘要截断上限）。
+    _DOC_SUMMARY_MIN_LEN = 50
+    _DOC_EVIDENCE_SUMMARY_MAX_LEN = 40
 
     def __init__(self, db, model: str, client, retrieve_model: str = None):
         self.db = db
@@ -233,6 +238,7 @@ class SuperTreeIndex:
             self._SUMMARY_MAX_LEN = getattr(cfg, "summary_max_len", self._SUMMARY_MAX_LEN)
             self._RANK_K = getattr(cfg, "rank_k", self._RANK_K)
             self._SELECT_TOP_K = getattr(cfg, "select_top_k", self._SELECT_TOP_K)
+            self._L1_SELECT_KEEP = getattr(cfg, "l1_select_keep", self._L1_SELECT_KEEP)
             self._SCORE_RATIO = getattr(cfg, "score_ratio", self._SCORE_RATIO)
             self._REASON_GROUP_SIZE = getattr(cfg, "reason_group_size", self._REASON_GROUP_SIZE)
             self._REASON_KEEP_PER_GROUP = getattr(cfg, "reason_keep_per_group", self._REASON_KEEP_PER_GROUP)
@@ -608,60 +614,181 @@ class SuperTreeIndex:
             lines[db_id] = f"doc {label}: " + " | ".join(parts)
         return lines
 
+    def _build_doc_entries(self, query: str, db_ids: List[int],
+                           evidence_bundle: dict = None) -> List[dict]:
+        """L1 候选呈现单元：文档名 + doc_summary(or doc_description) + 证据行。
+
+        替换 _build_super_tree 的 top-nodes 结构（_build_super_tree 函数保留至
+        T13 删除）与 _doc_evidence_lines 的 node_profiles 重算（证据束直通优先）。
+        doc_summary 列尚不存在（T12 落库）——读 doc.get("doc_summary") 兜底
+        doc_description，T12 落库后自动生效。
+        """
+        try:
+            all_docs = self.db.get_all_documents()
+        except Exception:
+            all_docs = []
+        docs_by_id = {d["id"]: d for d in all_docs if isinstance(d, dict) and "id" in d}
+        db_to_uuid = self._get_db_to_uuid()
+
+        if evidence_bundle is not None:
+            from .agentic.evidence import render_doc_evidence, derive_evidence_score
+
+            def _evidence(db_id):
+                line = render_doc_evidence(evidence_bundle, [db_id])
+                prefix = f"doc {db_id}: "
+                if line.startswith(prefix):
+                    line = line[len(prefix):]
+                return "" if line == "无通道命中" else line
+
+            def _score(db_id):
+                return derive_evidence_score(evidence_bundle.get(int(db_id)))
+        else:
+            evidence_lines = self._doc_evidence_lines(query, db_ids)
+
+            def _evidence(db_id):
+                line = evidence_lines.get(db_id, "")
+                return line.split(": ", 1)[1] if ": " in line else line
+
+            def _score(db_id):
+                return 1.0 if db_id in evidence_lines else 0.0
+
+        entries = []
+        for db_id in db_ids:
+            doc = docs_by_id.get(db_id) or {}
+            entries.append({
+                "db_id": db_id,
+                "uuid": db_to_uuid.get(db_id, str(db_id)),
+                "name": doc.get("pdf_name") or "",
+                "summary": doc.get("doc_summary") or doc.get("doc_description") or "",
+                "evidence": _evidence(db_id),
+                "evidence_score": _score(db_id),
+                "degraded": False,
+            })
+        return entries
+
+    def _render_doc_block(self, entries: List[dict]) -> str:
+        """候选文档块 JSON：{doc_id, name, summary, evidence}（退化条目无 summary）。"""
+        documents = []
+        for e in entries:
+            item = {"doc_id": e["uuid"], "name": e["name"]}
+            if not e["degraded"]:
+                item["summary"] = e["summary"]
+            if e["evidence"]:
+                item["evidence"] = e["evidence"]
+            documents.append(item)
+        return json.dumps({"documents": documents}, ensure_ascii=False)
+
+    def _fit_budget(self, entries: List[dict], kb_identity: str, query: str) -> List[dict]:
+        """预算守卫（[S6]#4，不 pop 文档）：先逐条截短 doc_summary（最短
+        _DOC_SUMMARY_MIN_LEN 字符），仍超才退化弱候选（证据分最低者优先）为
+        一行"名称 + 证据摘要"。返回调整后的 entries（原地改）。"""
+        def _tokens():
+            return (count_tokens(self._render_doc_block(entries))
+                    + count_tokens(kb_identity) + count_tokens(query))
+
+        if _tokens() <= self._MAX_SUPER_TREE_TOKENS:
+            return entries
+
+        # 阶段 1：逐条截短摘要（保序轮转最长者，最短 50 字符）
+        for _ in range(len(entries) * 4 + 1):
+            if _tokens() <= self._MAX_SUPER_TREE_TOKENS:
+                return entries
+            truncatable = [
+                e for e in entries
+                if not e["degraded"] and len(e["summary"]) > self._DOC_SUMMARY_MIN_LEN
+            ]
+            if not truncatable:
+                break
+            e = max(truncatable, key=lambda x: len(x["summary"]))
+            e["summary"] = e["summary"][:max(self._DOC_SUMMARY_MIN_LEN, len(e["summary"]) // 2)]
+
+        if _tokens() <= self._MAX_SUPER_TREE_TOKENS:
+            return entries
+
+        # 阶段 2：退化弱候选（证据分最低、db_id 小者优先）为一行"名称 + 证据摘要"
+        degradable = sorted(
+            [e for e in entries if not e["degraded"]],
+            key=lambda x: (x["evidence_score"], x["db_id"]),
+        )
+        for e in degradable:
+            if _tokens() <= self._MAX_SUPER_TREE_TOKENS:
+                break
+            e["degraded"] = True
+            e["summary"] = ""
+            if e["evidence"]:
+                e["evidence"] = e["evidence"][:self._DOC_EVIDENCE_SUMMARY_MAX_LEN]
+        return entries
+
+    def _reason_key_to_uuid(self, k, db_to_uuid: Dict[int, str],
+                            uuid_to_db: Dict[str, int]):
+        """理由键规范化（[S6]#7/[S7]）：uuid 键原样；int db_id 键 / 数字字符串
+        db_id 键 → uuid；无法识别者原样返回（随后由 selected 过滤丢弃）。"""
+        if isinstance(k, int):
+            return db_to_uuid.get(k)
+        if isinstance(k, str):
+            if k in uuid_to_db:
+                return k
+            try:
+                db_id = int(k)
+            except (TypeError, ValueError):
+                db_id = None
+            if db_id is not None and db_id in db_to_uuid:
+                return db_to_uuid[db_id]
+            return k
+        return None
+
+    def _normalize_reasons(self, raw_reasons, selected: List[int]) -> Dict[str, str]:
+        """规整 LLM 选中理由：键统一为 uuid（db_id 键 → uuid；uuid 键原样），
+        只保留 selected（已截 keep）内的条目。缺失/非 dict/空值条目降级跳过。"""
+        if not isinstance(raw_reasons, dict):
+            return {}
+        db_to_uuid = self._get_db_to_uuid()
+        uuid_to_db = {v: k for k, v in db_to_uuid.items()}
+        selected_uuids = {db_to_uuid.get(db_id, str(db_id)) for db_id in selected}
+        reasons: Dict[str, str] = {}
+        for k, v in raw_reasons.items():
+            if not v:
+                continue
+            key = self._reason_key_to_uuid(k, db_to_uuid, uuid_to_db)
+            if key is None or key not in selected_uuids:
+                continue
+            reasons[key] = str(v)
+        return reasons
+
     async def _holistic_select(self, query: str, db_ids: list[int],
                                keep: int = None, evidence_bundle: dict = None):
         """推理式整体挑选：LLM 从 db_ids 中挑选最相关的文档（可变数量，宁缺毋滥）。
 
         与独立打分不同，这里让 LLM 横向比较后"挑选"，只返回真正可能相关的文档，
         从机制上避免硬负样本稀释精确率。返回 (db_id 列表, reasons dict)——
-        reasons 为该文档被选中的一句话理由（[S6]#7/[S7] L1→L2 trace 下传），
-        缺失/非 dict/LLM 失败时降级为空 dict，不阻塞选档。
+        reasons 键已规范化为 uuid、只含 selected[:keep] 内条目（[S6]#7/[S7]
+        L1→L2 trace 下传）；候选呈现单元 = 文档名 + doc_summary + 证据行（[S6]#2）。
         """
         if not db_ids:
             return [], {}
         if len(db_ids) == 1:
             return list(db_ids), {}
 
-        keep = keep or self._SELECT_TOP_K
-        super_tree = self._build_super_tree(db_ids)
+        keep = keep or self._L1_SELECT_KEEP
         kb_identity = self.kb_identity.get_identity()
 
-        # 预算保护：超限时缩减候选，避免挑选 prompt 过长。
-        tree_json = json.dumps(super_tree, ensure_ascii=False)
-        total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
-        while total_tokens > self._MAX_SUPER_TREE_TOKENS and len(super_tree["documents"]) > 2:
-            super_tree["documents"].pop()
-            tree_json = json.dumps(super_tree, ensure_ascii=False)
-            total_tokens = count_tokens(tree_json) + count_tokens(kb_identity) + count_tokens(query)
+        entries = self._build_doc_entries(query, db_ids, evidence_bundle)
+        entries = self._fit_budget(entries, kb_identity, query)
+        doc_block = self._render_doc_block(entries)
 
-        # 证据块只针对预算裁剪后幸存的最终文档集计算（spec：pop 后再算）。
-        surviving_db_ids = [d.get("db_id") for d in super_tree["documents"] if d.get("db_id") is not None]
-        # 证据源：优先证据束直通（L1 呈现更轻，token 压力下降）；None 时回退
-        # _doc_evidence_lines（旧路，逐字节不变，供后续任务复用该签名）。
-        if evidence_bundle is not None:
-            from .agentic.evidence import render_doc_evidence
-            evidence_text = render_doc_evidence(evidence_bundle, surviving_db_ids)
-        else:
-            evidence_lines = self._doc_evidence_lines(query, surviving_db_ids)
-            evidence_text = "\n".join(
-                evidence_lines[did] for did in surviving_db_ids if did in evidence_lines)
-        if evidence_text:
-            # 前置/后置换行内嵌于块中，无证据时块为空串 → prompt 与改造前逐字节一致
-            evidence_block = (
-                "\n[文档语料证据（关键词/实体/标签命中，供参考）]\n"
-                + evidence_text
-                + "\n证据是语料事实，请优先依据证据与问题的语义关联程度判断，"
-                  "而非简单计数命中个数；无证据命中的文档仍可按标题/摘要判断。\n"
+        has_evidence = any(e["evidence"] for e in entries)
+        if has_evidence:
+            evidence_note = (
+                "\n证据是语料事实，请优先依据证据与问题的语义关联程度判断，"
+                "而非简单计数命中个数。\n"
             )
-            evidence_requirement = "4. 证据命中是强信号，但选档仍须宁缺毋滥，不因命中而硬选不相关文档。\n"
+            evidence_requirement = "3. 证据命中是强信号，但选档仍须宁缺毋滥，不因命中而硬选不相关文档。\n"
         else:
-            evidence_block = ""
+            evidence_note = ""
             evidence_requirement = ""
-
-        # 动态编号：无证据块时需求序号连续（3. 后接 4.），有证据时 4. 后接 5.
         idx = 4 if evidence_requirement else 3
 
-        prompt = f"""你是一个文档检索专家。给定用户问题、知识库概览和候选文档结构，请挑选出最可能包含答案的文档（最多 {keep} 篇）。
+        prompt = f"""你是一个文档检索专家。给定用户问题、知识库概览和候选文档，请挑选出最可能包含答案的文档（最多 {keep} 篇）。
 
 [知识库概览]
 {kb_identity}
@@ -670,12 +797,11 @@ class SuperTreeIndex:
 {query}
 
 [候选文档结构]
-{tree_json}
-{evidence_block}
+{doc_block}
+{evidence_note}
 要求：
-1. 只挑真正可能包含答案的文档；若没有足够相关的，可以少选甚至不选。
+1. 只挑真正可能包含答案的文档。
 2. 宁缺毋滥：不要为凑数而挑选不相关的文档。
-3. 基于文档的章节标题和摘要判断相关性。
 {evidence_requirement}{idx}. 为每个选中的文档给出一句话选中理由，填入 reasons 字段（doc_id → 理由）；理由基于该文档的证据/标题/摘要。
 返回JSON格式：
 {{"doc_ids": ["uuid-1", "uuid-2"], "reasons": {{"uuid-1": "一句话选中理由"}}}}
@@ -703,36 +829,35 @@ class SuperTreeIndex:
             if db_id is not None and db_id in db_id_set and db_id not in selected:
                 selected.append(db_id)
 
-        # [S6]#7/[S7]：规整 LLM 返回的选中理由——缺失/非 dict/空值条目降级跳过，
-        # 不阻塞选档。理由键按 LLM 原样（uuid 或 db_id）字符串化。
-        reasons = {}
-        raw_reasons = data.get("reasons", {})
-        if isinstance(raw_reasons, dict):
-            for k, v in raw_reasons.items():
-                if v:
-                    reasons[str(k)] = str(v)
-        return selected[:keep], reasons
+        selected = selected[:keep]
+        reasons = self._normalize_reasons(data.get("reasons"), selected)
+        return selected, reasons
 
-    async def _select_documents_reasoning(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
+    async def _select_documents_reasoning(self, query: str, candidate_db_ids: Dict[int, float],
+                                          evidence_bundle: dict = None):
         """三层重构-选择层：map-reduce 推理式选档。
 
         小候选集(<= _REASON_GROUP_SIZE)走单次整体挑选；大候选集先分组 map
         (每组挑选 top-_REASON_KEEP_PER_GROUP)，再 reduce 精选出最终 top-k。
-        全程"推理挑选"而非"独立打分"，返回 uuid 列表。
+        全程"推理挑选"而非"独立打分"。返回 (uuid 列表, reasons_by_uuid)——
+        reduce 阶段阈值与终选 keep 同源（均取 _L1_SELECT_KEEP，[S6]#5/#6）。
+        证据束直通 _holistic_select（生产链路生效，[S6]#2）。
         """
         truncated = self._truncate_candidates(candidate_db_ids)
         if not truncated:
-            return []
+            return [], {}
 
         if len(truncated) <= self._REASON_GROUP_SIZE:
-            selected_dbids, _ = await self._holistic_select(query, truncated)
+            selected_dbids, reasons = await self._holistic_select(
+                query, truncated, evidence_bundle=evidence_bundle)
         else:
             groups = [
                 truncated[i:i + self._REASON_GROUP_SIZE]
                 for i in range(0, len(truncated), self._REASON_GROUP_SIZE)
             ]
             map_tasks = [
-                self._holistic_select(query, g, keep=self._REASON_KEEP_PER_GROUP)
+                self._holistic_select(query, g, keep=self._REASON_KEEP_PER_GROUP,
+                                      evidence_bundle=evidence_bundle)
                 for g in groups
             ]
             map_results = await asyncio.gather(*map_tasks, return_exceptions=True)
@@ -745,14 +870,17 @@ class SuperTreeIndex:
                         if db_id not in winners:
                             winners.append(db_id)
             if not winners:
-                return []
-            if len(winners) <= self._SELECT_TOP_K:
+                return [], {}
+            if len(winners) <= self._L1_SELECT_KEEP:
                 selected_dbids = winners
+                reasons = {}
             else:
-                selected_dbids, _ = await self._holistic_select(query, winners)
+                selected_dbids, reasons = await self._holistic_select(
+                    query, winners, evidence_bundle=evidence_bundle)
 
         db_to_uuid = self._get_db_to_uuid()
-        return [db_to_uuid[d] for d in selected_dbids if d in db_to_uuid]
+        selected_uuids = [db_to_uuid[d] for d in selected_dbids if d in db_to_uuid]
+        return selected_uuids, reasons
 
     def _hierarchy_boost(self, query: str, candidate_db_ids: Dict[int, float]) -> Dict[int, float]:
         """三层重构-层级：集合标签软路由。
@@ -792,24 +920,27 @@ class SuperTreeIndex:
             boosted[db_id] = float(score) + boost * self._HIERARCHY_BOOST_WEIGHT
         return boosted
 
-    async def select_documents(self, query: str, candidate_db_ids: Dict[int, float]) -> list[str]:
+    async def select_documents(self, query: str, candidate_db_ids: Dict[int, float],
+                               evidence_bundle: dict = None):
         """量级自适应入口（[S5]）：小=直连 / 中=单层领域路由 / 海量=层级树导航。
 
         语料树未建、导航落空或导航候选挑选为空时，一律降级回扁平管线
         （标签软路由 + map-reduce 推理选档），行为与改造前一致。
+        返回 (selected_uuids, reasons_by_uuid)；evidence_bundle 直通推理选档（[S6]#2）。
         """
         if not candidate_db_ids:
-            return []
+            return [], {}
         tier = self.detect_scale_tier()
         if tier == TIER_MASSIVE:
             nav_docs = await self.navigate_tree(query)
             if nav_docs:
                 # 树导航候选（已按 doc_id 去重、留最大权重）→ 软路由加权 → 推理选档
                 boosted = self._hierarchy_boost(query, nav_docs)
-                selected = await self._select_documents_reasoning(query, boosted)
+                selected, reasons = await self._select_documents_reasoning(
+                    query, boosted, evidence_bundle=evidence_bundle)
                 if selected:
                     logging.info("[SuperTree] massive tier: tree navigation selected %d docs", len(selected))
-                    return selected
+                    return selected, reasons
                 logging.info("[SuperTree] tree-nav selection empty; falling back to flat candidates")
             else:
                 logging.info("[SuperTree] tree navigation yielded nothing (or tree absent); flat fallback")
@@ -817,7 +948,7 @@ class SuperTreeIndex:
             candidate_db_ids = self._cluster_route_boost(query, candidate_db_ids)
         # 小语料直连 / 中语料域内匹配 / 海量兜底：扁平管线
         boosted = self._hierarchy_boost(query, candidate_db_ids)
-        return await self._select_documents_reasoning(query, boosted)
+        return await self._select_documents_reasoning(query, boosted, evidence_bundle=evidence_bundle)
 
     # ------------------------------------------------------------------
     # P2 量级自适应引擎（[S5]）

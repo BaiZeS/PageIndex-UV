@@ -138,3 +138,47 @@ def test_holistic_select_uses_evidence_bundle(tmp_path, monkeypatch):
     monkeypatch.setattr(st_module, "llm_completion", lambda *a, **k: "测试知识库")
     asyncio.run(st._holistic_select("浴血", [1, 2], evidence_bundle=bundle))
     assert "浴血(content)" in captured["p"]
+
+
+def test_bundle_reaches_holistic_select_via_select_documents(tmp_path, monkeypatch):
+    """义务 A：evidence_bundle 经 select_documents → _select_documents_reasoning →
+    _holistic_select 生产链路到达 prompt（证据束渲染行 field 来源可见）。"""
+    client, db = _make_client(
+        tmp_path,
+        [("A", "文档A", "", [("浴血", "content", 3)]),
+         ("B", "文档B", "", [])],
+        None,
+        None,
+    )
+    from pageindex_mutil.super_tree import SuperTreeIndex
+    from pageindex_mutil.agentic.evidence import build_evidence_bundle
+    st = SuperTreeIndex(db, "m", client)
+    bundle = build_evidence_bundle(client, db, "浴血", topk=30)
+    captured = {}
+
+    async def fake_llm(model, prompt, **kw):
+        captured["p"] = prompt
+        return '{"doc_ids": []}'
+
+    st_module = sys.modules[SuperTreeIndex.__module__]
+    monkeypatch.setattr(st_module, "llm_acompletion", fake_llm)
+    monkeypatch.setattr(st_module, "llm_completion", lambda *a, **k: "测试知识库")
+    asyncio.run(st.select_documents("浴血", {1: 1.0, 2: 1.0}, evidence_bundle=bundle))
+    assert "浴血(content)" in captured["p"]
+
+
+def test_bundle_max_hop_param_consumed(tmp_path, monkeypatch):
+    """义务 A：build_evidence_bundle 接受 max_hop 可选参数并透传给 CTE（替代硬编码 3）。"""
+    client, db = _graph_client(tmp_path)
+    doc = db.insert_document(pdf_name="A", pdf_path="", doc_description="")
+    e1 = db.insert_entity("concept", "浴血", [])
+    db.insert_entity_mention(e1, doc)
+    captured = {}
+
+    def fake_cte(query_ids, max_hop=3):
+        captured["max_hop"] = max_hop
+        return {}
+
+    monkeypatch.setattr(db, "get_entity_distances_cte", fake_cte)
+    build_evidence_bundle(client, db, "浴血", topk=30, max_hop=5)
+    assert captured["max_hop"] == 5

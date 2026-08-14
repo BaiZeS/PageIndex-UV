@@ -688,7 +688,7 @@ class TestAdaptiveSelectDocuments:
         with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake), \
                 patch.object(_enhance_module(), "llm_completion",
                              side_effect=lambda m, p, **k: _enh_response([])) as mock_enh:
-            result = await st.select_documents("q", {d1: 1.0, d2: 1.0})
+            result, _ = await st.select_documents("q", {d1: 1.0, d2: 1.0})
         assert result == ["uuid-1"]
         assert not any(M_ENH in p for p in prompts)
         mock_enh.assert_not_called()  # 小语料直连：不触发树导航精挑
@@ -717,7 +717,7 @@ class TestAdaptiveSelectDocuments:
 
         with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake_acompletion), \
                 patch.object(_enhance_module(), "llm_completion", side_effect=fake_completion):
-            result = await st.select_documents("风控制度", {1: 1.0, 2: 1.0, 3: 1.0})
+            result, _ = await st.select_documents("风控制度", {1: 1.0, 2: 1.0, 3: 1.0})
         assert result == ["uuid-2"]
         _ = ids
 
@@ -739,7 +739,7 @@ class TestAdaptiveSelectDocuments:
             return ""
 
         with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake):
-            result = await st.select_documents("q", {d1: 1.0, d2: 1.0})
+            result, _ = await st.select_documents("q", {d1: 1.0, d2: 1.0})
         assert result == ["uuid-2"]
         assert not any(M_ENH in p for p in prompts)  # 无树 → 无逐层精挑
 
@@ -760,7 +760,7 @@ class TestAdaptiveSelectDocuments:
         with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake_acompletion), \
                 patch.object(_enhance_module(), "llm_completion",
                              side_effect=lambda m, p, **k: _enh_response([])):
-            result = await st.select_documents("q", {1: 1.0, 2: 1.0, 3: 1.0})
+            result, _ = await st.select_documents("q", {1: 1.0, 2: 1.0, 3: 1.0})
         assert result == ["uuid-3"]
 
     def test_medium_cluster_route_boost(self, nav_index):
@@ -810,7 +810,7 @@ class TestAdaptiveSelectDocuments:
         with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake), \
              patch.object(st, "_cluster_route_boost",
                           side_effect=st._cluster_route_boost) as spy:
-            result = await st.select_documents("风控", {d1: 1.0, d2: 1.0})
+            result, _ = await st.select_documents("风控", {d1: 1.0, d2: 1.0})
         assert result == ["uuid-1"]
         spy.assert_called_once()
 

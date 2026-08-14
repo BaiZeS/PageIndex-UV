@@ -628,8 +628,24 @@ class AgenticRouter:
                 "pages": [],
             }
 
-        # L1: Super-Tree LLM selection
-        selected_uuids = await self.super_tree_index.select_documents(query, candidate_db_ids)
+        # L1: Super-Tree LLM selection（证据束生产端接线，[S6]#2）——build_evidence_bundle
+        # 消费 config cte_max_hop（evidence.py 内部读）/l0_channel_topk；bundle 直通
+        # select_documents → _select_documents_reasoning → _holistic_select。
+        bundle = {}
+        db = getattr(self.client, "db", None)
+        if db is not None:
+            try:
+                from .evidence import build_evidence_bundle
+                from ..utils import ConfigLoader
+                cfg = ConfigLoader().load(None)
+                bundle = build_evidence_bundle(
+                    self.client, db, query,
+                    topk=getattr(cfg, "l0_channel_topk", 30),
+                )
+            except Exception as e:
+                logging.warning("[SuperTree] evidence bundle build failed: %s", e)
+        selected_uuids, l1_reasons = await self.super_tree_index.select_documents(
+            query, candidate_db_ids, evidence_bundle=bundle)
         logging.info("[SuperTree] L1 selected=%d docs: %s", len(selected_uuids), selected_uuids)
         if not selected_uuids:
             fallback = self._content_fallback(query, top_k)
@@ -656,9 +672,13 @@ class AgenticRouter:
 
         # L2/L3: Act — tree search on selected documents (reuse existing _act_tree_search)
         doc_scores: Dict[str, float] = {}
+        # [S6]#7 端到端：L1 选中理由经 conditional-kwarg 下传（有理由才传，行为不变）。
+        act_kwargs = {"doc_scores_out": doc_scores}
+        if l1_reasons:
+            act_kwargs["l1_reasons"] = l1_reasons
         try:
             ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = await self._act_tree_search(
-                query, selected_uuids, doc_scores_out=doc_scores
+                query, selected_uuids, **act_kwargs
             )
             logging.info("[SuperTree] L2/L3 context_len=%d src_docs=%d nodes=%d",
                         len(ctx), src_docs, cov_nodes)
@@ -675,10 +695,18 @@ class AgenticRouter:
                 "pages": [],
             }
 
-        # matched_docs score = 节点召回覆盖度（evidence-derived，(0,1]），
-        # 取代旧硬编码 1.0；召回无果（LLM 精挑为空）的文档不进 matched。
+        # matched_docs score = 证据分（derive_evidence_score，通道命中加权标量；
+        # 无 bundle 条目给 0），同分按 selected_uuids 顺序（L1 裁定序）排列（[S6]#8）。
+        # 召回无果（LLM 精挑为空）的文档不进 matched（不虚报匹配，语义保持）。
+        id_mapper = getattr(self.client, "_id_mapper", None)
+        if id_mapper is not None:
+            uuid_to_db = dict(id_mapper.items())
+        else:
+            uuid_to_db = getattr(self.client, "_uuid_to_db", {}) or {}
+        from .evidence import derive_evidence_score
         matched = [
-            {"doc_id": doc_id, "score": round(doc_scores[doc_id], 4)}
+            {"doc_id": doc_id,
+             "score": round(derive_evidence_score(bundle.get(uuid_to_db.get(doc_id))), 4)}
             for doc_id in selected_uuids if doc_id in doc_scores
         ]
 
