@@ -237,19 +237,20 @@ class TestHeuristicFallback:
 class TestVerifierContextBudgetAndNeed:
     """[S8] verifier 上下文预算可配（verifier_context_chars）+ need 点名输出。"""
 
-    def test_verifier_context_budget_from_config(self, monkeypatch):
-        """预算上调（默认 8000）后，>2000 字上下文全文进 prompt，不再只给 2000 字。"""
+    def test_verifier_context_budget_truncates_prompt(self, monkeypatch):
+        """ctx_budget 生效（不依赖 config.yaml）：context[:ctx_budget] 进 prompt。"""
         v = _verifier_cls()("qwen-plus", retrieve_model="r")
+        monkeypatch.setattr(v, "ctx_budget", 300)
         captured = {}
         monkeypatch.setattr(
             _verifier_mod(), "llm_completion",
             lambda *a, **k: captured.setdefault("p", a[1]),
         )
-        long_ctx = "证据内容。" * 600  # 3000 字符 > 2000
-        res = v.verify("答案", long_ctx, "查询", 2, 3)
-        # 预算上调后全文不截断（旧实现 context[:2000] 会截掉后 1000 字）
-        assert long_ctx in captured["p"]
-        assert hasattr(res, "need") and res.need == []
+        long_ctx = "证据内容。" * 600  # 3000 字符
+        v.verify("答案", long_ctx, "查询", 2, 3)
+        # 只截取前 300 字符进 prompt，全文不得出现
+        assert long_ctx[:300] in captured["p"]
+        assert long_ctx not in captured["p"]
 
     def test_verifier_parses_need_field(self, monkeypatch):
         """sufficient=false 且给出 need 列表 → 规整进 VerifyResult.need。"""
@@ -285,3 +286,34 @@ class TestVerifierContextBudgetAndNeed:
         assert norm(None) == []
         assert norm("need") == []
         assert norm({"doc_id": "d1"}) == []
+
+    def test_verifier_normalizes_page_str_and_none_reason(self):
+        """page 数字字符串规整为 int（非法省略）；reason None 规整为空串。"""
+        norm = _verifier_cls()._normalize_need
+        raw = [
+            {"doc_id": "d1", "page": "5", "reason": None},
+            {"node_id": "n2", "page": "abc", "reason": "缺 n2"},
+            {"doc_id": "d3", "page": 7},
+        ]
+        assert norm(raw) == [
+            {"doc_id": "d1", "page": 5, "reason": ""},
+            {"node_id": "n2", "reason": "缺 n2"},
+            {"doc_id": "d3", "page": 7, "reason": ""},
+        ]
+
+
+class TestCoerceCtxBudget:
+    """[S8] _coerce_ctx_budget 规整：正整数原样返回，0/负/非数值/溢出回退 8000。"""
+
+    def test_valid_value_passthrough(self):
+        coerce = _verifier_cls()._coerce_ctx_budget
+        assert coerce(4000) == 4000
+        assert coerce("4000") == 4000
+
+    def test_invalid_falls_back_to_8000(self):
+        coerce = _verifier_cls()._coerce_ctx_budget
+        assert coerce(0) == 8000
+        assert coerce(-5) == 8000
+        assert coerce("abc") == 8000
+        assert coerce(None) == 8000
+        assert coerce(float("inf")) == 8000

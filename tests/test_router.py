@@ -631,3 +631,55 @@ class TestActTreeSearchDedup:
         assert set(calls) == {"d1", "d2"}
         assert src_docs == 2
         assert set(dpm) == {"d1", "d2"}
+
+
+class TestActTreeSearchEvidenceSort:
+    """[S8] 上下文组装排序：证据分（derive_evidence_score）降序主键，平分按
+    candidate_docs 裁定序（次键）——与 matched_docs 同口径。"""
+
+    def _setup_recall(self, router):
+        router._main_funcs = {
+            "build_context_for_doc": lambda doc, selected, pages: "ctx",
+            "pages_from_nodes": lambda n: [1],
+        }
+
+        async def fake_recall(query, doc_id, matched_info=None):
+            return {
+                "doc_id": doc_id,
+                "doc": {"doc_name": doc_id, "type": "md"},
+                "structure": [{"node_id": "n1"}],
+                "selected": [{"node_id": "n1", "text": "x"}],
+                "pages": [1],
+                "relevance_score": 1.0,
+            }
+
+        router._recall_nodes_for_doc = fake_recall
+
+    @pytest.mark.asyncio
+    async def test_sorts_by_evidence_score_desc(self, router):
+        """证据分不同 → 按证据分降序（覆盖度分/裁定序皆被证据分压过）。"""
+        self._setup_recall(router)
+        router.client._id_mapper = {"docA": 101, "docB": 102}
+        evidence_bundle = {
+            101: {"channels": {"entity": [{"name": "甲"}], "tag": [], "keyword": []}},
+            102: {"channels": {"entity": [], "tag": [], "keyword": []}},
+        }
+        # candidate_docs 裁定序把低分 docB 排前——证据分排序必须把它压到后面
+        _ctx, _nodes, _src, _cov, dpm, _pwt = await router._act_tree_search(
+            "q", ["docB", "docA"], evidence_bundle=evidence_bundle
+        )
+        assert list(dpm) == ["docA", "docB"]
+
+    @pytest.mark.asyncio
+    async def test_tie_broken_by_candidate_docs_order(self, router):
+        """证据分平分 → 保持 candidate_docs（L1 裁定序）顺序。"""
+        self._setup_recall(router)
+        router.client._id_mapper = {"docA": 101, "docB": 102}
+        evidence_bundle = {
+            101: {"channels": {"entity": [], "tag": [{"text": "x"}], "keyword": []}},
+            102: {"channels": {"entity": [], "tag": [{"text": "x"}], "keyword": []}},
+        }
+        _ctx, _nodes, _src, _cov, dpm, _pwt = await router._act_tree_search(
+            "q", ["docB", "docA"], evidence_bundle=evidence_bundle
+        )
+        assert list(dpm) == ["docB", "docA"]

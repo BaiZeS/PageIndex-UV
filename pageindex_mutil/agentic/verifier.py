@@ -50,19 +50,20 @@ class CRAGVerifier:
 
     @staticmethod
     def _coerce_ctx_budget(val) -> int:
-        """verifier_context_chars 规整：正整数否则回退 8000。"""
+        """verifier_context_chars 规整：正整数原样返回；0/负数/非数值/溢出（如 inf）回退 8000。"""
         try:
             v = int(val)
             if v > 0:
                 return v
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pass
         return 8000
 
     @staticmethod
     def _normalize_need(raw) -> list:
         """[S8] 规整 need 输出：每项保留 doc_id/node_id/page(可选)/reason，
-        跳过非 dict 或缺对象键（doc_id 与 node_id 皆无）的条目；解析失败给 []。"""
+        跳过非 dict 或缺对象键（doc_id 与 node_id 皆无）的条目；解析失败给 []。
+        page 为数字字符串（"5"）规整为 int（非法则省略）；reason 缺失/None 规整为空串。"""
         if not isinstance(raw, list):
             return []
         out = []
@@ -71,8 +72,16 @@ class CRAGVerifier:
                 continue
             if "doc_id" not in item and "node_id" not in item:
                 continue
-            entry = {k: item[k] for k in ("doc_id", "node_id", "page", "reason") if k in item}
-            entry.setdefault("reason", "")
+            entry = {k: item[k] for k in ("doc_id", "node_id") if k in item}
+            if "page" in item:
+                try:
+                    page = int(item["page"])
+                except (TypeError, ValueError, OverflowError):
+                    page = None
+                if page is not None:
+                    entry["page"] = page
+            reason = item.get("reason")
+            entry["reason"] = reason if reason is not None else ""
             out.append(entry)
         return out
 
