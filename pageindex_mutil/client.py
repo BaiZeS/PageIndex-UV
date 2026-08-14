@@ -855,8 +855,9 @@ class PageIndexClient:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = [pool.submit(_extract_one, fp) for fp in file_paths]
-            for fut in concurrent.futures.as_completed(futures):
-                phase1_results.append(fut.result())
+            # 并发执行不变，但按提交序等待结果——返回的 UUID 列表须与输入 file_paths 同序
+            # （as_completed 是完成序，会让调用方按序 zip 时 doc_id 错配）。
+            phase1_results = [fut.result() for fut in futures]
 
         # Entity + relation extraction (parallel with semaphore)
         def _extract_entities_one(item):

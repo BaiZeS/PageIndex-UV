@@ -122,6 +122,50 @@ class TestBatchExtractsAllDocs:
         finally:
             client.close()
 
+    def test_batch_returns_doc_ids_in_input_order(self, client_factory, tmp_path):
+        """index_batch 返回的 UUID 须与输入 file_paths 同序（契约：调用方按序 zip 不失配）。"""
+        client = client_factory()
+        try:
+            client.super_tree_index.on_document_added = MagicMock()
+            client.closet_index.add_document = MagicMock()
+            client.search_backend.index_document = MagicMock()
+            client.entity_extractor.extract_from_document = MagicMock(
+                return_value=([], [], [])
+            )
+            paths = [
+                _make_md_file(tmp_path, f"doc{i}.md", f"# Doc {i}\n\nContent {i}\n")
+                for i in range(3)
+            ]
+            with patch(
+                "pageindex_mutil.client.md_to_tree",
+                side_effect=[
+                    {
+                        "doc_name": f"doc{i}.md",
+                        "doc_description": f"Document {i}",
+                        "line_count": 3,
+                        "structure": [
+                            {
+                                "node_id": f"n{i}",
+                                "title": f"Doc {i}",
+                                "text": f"Content {i}",
+                                "summary": f"Summary {i}",
+                                "level": 1,
+                            }
+                        ],
+                    }
+                    for i in range(3)
+                ],
+            ):
+                doc_ids = client.index_batch(paths, mode="md")
+
+            names = []
+            for uuid in doc_ids:
+                row = client.db.get_document_by_id(client._id_mapper.to_db(uuid))
+                names.append(row["pdf_name"])
+            assert names == [f"doc{i}.md" for i in range(3)]
+        finally:
+            client.close()
+
     def test_batch_inserts_documents_in_db(self, client_factory, tmp_path):
         """Each document from index_batch is persisted in the DB."""
         client = client_factory()
