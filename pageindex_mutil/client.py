@@ -12,10 +12,9 @@ from pathlib import Path
 from .page_index import page_index
 from .page_index_md import md_to_tree
 from .retrieve import get_document, get_document_structure, get_page_content
-from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, create_node_mapping, configure_llm
+from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, create_node_mapping, configure_llm, llm_completion
 from .closet_index import ClosetIndex
 from .super_tree import SuperTreeIndex, KeywordIndex
-from .corpus_tree import CorpusTreeBuilder
 from .page_index_liteparse import is_liteparse_format, liteparse_to_tree
 
 # Import search backends
@@ -215,7 +214,6 @@ class PageIndexClient:
         self.db = None
         self.closet_index = None
         self.super_tree_index = None
-        self.corpus_tree = None
         self.router = None
         self._id_mapper = DocIdMapper()
         self._pending_enrichment: set[int] = set()
@@ -227,7 +225,6 @@ class PageIndexClient:
             self.db = PageIndexDB(db_path)
             self.closet_index = ClosetIndex(self.db, self.model, self.retrieve_model)
             self.super_tree_index = SuperTreeIndex(self.db, self.model, self, self.retrieve_model)
-            self.corpus_tree = CorpusTreeBuilder(self.db, self.model, self.retrieve_model)
             if AgenticRouter:
                 self.router = AgenticRouter(self, self.model, self.retrieve_model)
 
@@ -570,7 +567,7 @@ class PageIndexClient:
                     self.super_tree_index.on_document_added(
                         db_doc_id, content=_extract_structure_text(doc.get('structure')))
 
-                # Phase 2: corpus tree, search backend, entity extraction.
+                # Phase 2: doc_summary, search backend, entity extraction.
                 # By default (sync=True) this runs inline.
                 if sync:
                     self._enrich_document(db_doc_id, doc)
@@ -601,7 +598,7 @@ class PageIndexClient:
     def _extract_entities_for_doc(self, db_doc_id: int, doc: dict) -> None:
         """Extract and store entities + relations for a document.
 
-        Runs in a background thread, parallel with tags/corpus_tree/search_backend.
+        Runs in a background thread, parallel with doc_summary/search_backend.
         """
         if not (self.entity_extractor and doc.get('structure')):
             return
@@ -653,28 +650,56 @@ class PageIndexClient:
         except Exception as e:
             logging.warning("Entity extraction failed for doc %d: %s", db_doc_id, e)
 
+    def _generate_doc_summary(self, db_doc_id: int, doc: dict) -> None:
+        """Generate the document-level grounded summary (doc_summary, [S3]).
+
+        Input is the cleaned structure (titles + summaries) via the existing
+        description pipeline helper. LLM failure / empty response leaves the
+        column empty — L1 presentation falls back to doc_description (T9).
+        """
+        if not doc.get('structure'):
+            return
+        try:
+            structure = create_clean_structure_for_description(doc['structure'])
+            prompt = (
+                "你是一个文档摘要专家。基于文档结构生成覆盖式接地摘要（≤200字）："
+                "涵盖主要章节范围、关键实体与概念、适合回答的问题类型。"
+                "仅输出摘要文本。\n\n文档结构：\n"
+                f"{json.dumps(structure, ensure_ascii=False)}"
+            )
+            # NFR4: retrieval-path LLM call sites use retrieve_model or model.
+            summary = llm_completion(
+                self.retrieve_model or self.model, prompt, thinking_disabled=True
+            )
+            if summary:
+                self.db.update_doc_summary(db_doc_id, summary.strip())
+        except Exception as e:
+            logging.warning("doc_summary generation failed for doc %d: %s", db_doc_id, e)
+
     def _enrich_document(self, db_doc_id: int, doc: dict) -> None:
-        """Phase 2: corpus tree + search backend + entity extraction.
+        """Phase 2: doc_summary + search backend + entity extraction.
 
         Runs in a background thread (or inline when sync=True).
-        Entity extraction runs in parallel with tags/corpus_tree/search_backend
-        (it is independent of those steps).
+        Entity extraction and doc_summary generation run in parallel with the
+        search backend index (they are independent of it).
         Exceptions are caught and logged — never propagate.
         """
         try:
-            # Start entity extraction in parallel (independent of tags/corpus_tree).
+            # Start entity extraction in parallel (independent of search backend).
             entity_future = None
             if self.entity_extractor and doc.get('structure'):
                 entity_future = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(
                     self._extract_entities_for_doc, db_doc_id, doc
                 )
 
-            # Corpus tree (P1): incremental attach after closet tags exist.
-            if self.corpus_tree:
-                try:
-                    self.corpus_tree.update_for_document(db_doc_id)
-                except Exception as e:
-                    logging.warning("Corpus tree incremental update failed: %s", e)
+            # doc_summary ([S3]): document-level grounded summary, generated in
+            # parallel with entity extraction. Empty on failure → L1 falls back
+            # to doc_description.
+            summary_future = None
+            if self.db and doc.get('structure'):
+                summary_future = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(
+                    self._generate_doc_summary, db_doc_id, doc
+                )
 
             # Index in vector search backend
             if self.search_backend and doc.get('structure'):
@@ -687,12 +712,17 @@ class PageIndexClient:
                 except Exception as e:
                     logging.warning("Failed to index in search backend: %s", e)
 
-            # Wait for entity extraction to complete
+            # Wait for entity extraction + doc_summary to complete
             if entity_future is not None:
                 try:
                     entity_future.result()
                 except Exception as e:
                     logging.warning("Entity extraction thread failed for doc %d: %s", db_doc_id, e)
+            if summary_future is not None:
+                try:
+                    summary_future.result()
+                except Exception as e:
+                    logging.warning("doc_summary thread failed for doc %d: %s", db_doc_id, e)
 
             # Node profiles (P1.2): canonical entity signatures per TOC node.
             # Runs after entity extraction so mentions exist; also attaches the
@@ -802,10 +832,9 @@ class PageIndexClient:
         """Batch index multiple documents with batch normalization.
 
         Phase 1 — Extraction (per-doc, concurrent with semaphore)
-        Phase 2 — Batch corpus tree rebuild
-        Phase 3 — Batch entity normalization
-        Phase 4 — Search backend + super_tree indexing
-        Phase 5 — Node profiles (post-normalization → canonical entities)
+        Phase 2 — Batch entity normalization
+        Phase 3 — Search backend + super_tree indexing
+        Phase 4 — Node profiles (post-normalization → canonical entities)
 
         Returns list of doc_ids (UUIDs).
         """
@@ -876,20 +905,14 @@ class PageIndexClient:
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
             list(pool.map(_extract_entities_one, phase1_results))
 
-        # -- Phase 2: batch corpus tree rebuild --
-        try:
-            self.rebuild_corpus_tree()
-        except Exception as e:
-            logging.warning("Batch corpus tree rebuild failed: %s", e)
-
-        # -- Phase 3: batch entity normalization --
+        # -- Phase 2: batch entity normalization --
         if self.entity_extractor:
             try:
                 self.entity_extractor.normalize_entities_batch(self.db)
             except Exception as e:
                 logging.warning("Batch entity normalization failed: %s", e)
 
-        # -- Phase 4: search backend + super_tree indexing --
+        # -- Phase 3: search backend + super_tree indexing --
         for doc_id, db_doc_id, doc in phase1_results:
             try:
                 if hasattr(self, 'super_tree_index') and self.super_tree_index:
@@ -899,9 +922,9 @@ class PageIndexClient:
                     self.search_backend.index_document(
                         db_doc_id, doc['structure'], doc.get('pages'))
             except Exception as e:
-                logging.warning("Phase 4 indexing failed for doc %d: %s", db_doc_id, e)
+                logging.warning("Phase 3 indexing failed for doc %d: %s", db_doc_id, e)
 
-        # -- Phase 5: node profiles (after normalization → canonical names) --
+        # -- Phase 4: node profiles (after normalization → canonical names) --
         for _, db_doc_id, doc in phase1_results:
             try:
                 if self.db and doc.get('structure'):
@@ -912,16 +935,6 @@ class PageIndexClient:
         doc_ids = [r[0] for r in phase1_results]
         logging.info("Batch indexing complete: %d documents", len(doc_ids))
         return doc_ids
-
-    def rebuild_corpus_tree(self) -> dict:
-        """Full (re)build of the corpus tree (P1). Returns the inspectable tree.
-
-        Use for initial construction or periodic structural adjustment; the
-        per-document incremental path is wired into index().
-        """
-        if not self.corpus_tree:
-            return {}
-        return self.corpus_tree.rebuild()
 
     @staticmethod
     def _make_meta_entry(doc: dict) -> dict:

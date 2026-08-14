@@ -1,7 +1,7 @@
 """T10: Two-phase indexing tests.
 
 Phase 1 (synchronous): parse → DB insert → tags → keyword index → return fast.
-Phase 2 (background): corpus tree → search backend → entity extraction.
+Phase 2 (background): doc_summary → search backend → entity extraction.
 
 All LLM calls mocked. No real LLM, no vectors.
 """
@@ -80,7 +80,7 @@ def _phase2_barrier(barrier):
 # ===========================================================================
 
 class TestPhase1FastReturn:
-    """Phase 1 should return doc_id without waiting for corpus tree or entity extraction."""
+    """Phase 1 should return doc_id without waiting for search backend or entity extraction."""
 
     def test_phase1_returns_doc_id(self, client_factory, tmp_path):
         """index() returns a valid doc_id immediately."""
@@ -88,7 +88,6 @@ class TestPhase1FastReturn:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock()
             client.search_backend.index_document = MagicMock()
             client.entity_extractor = MagicMock()
 
@@ -109,7 +108,6 @@ class TestPhase1FastReturn:
             client.super_tree_index.on_document_added = MagicMock()
             add_doc_mock = MagicMock()
             client.closet_index.add_document = add_doc_mock
-            client.corpus_tree.update_for_document = MagicMock()
             client.search_backend.index_document = MagicMock()
             client.entity_extractor = MagicMock()
 
@@ -128,7 +126,6 @@ class TestPhase1FastReturn:
             on_added_mock = MagicMock()
             client.super_tree_index.on_document_added = on_added_mock
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock()
             client.search_backend.index_document = MagicMock()
             client.entity_extractor = MagicMock()
 
@@ -148,7 +145,7 @@ class TestPhase1FastReturn:
             client.closet_index.add_document = MagicMock()
             # Make Phase 2 hang so we can inspect the set
             barrier = threading.Event()
-            client.corpus_tree.update_for_document = MagicMock(side_effect=lambda *a, **k: barrier.wait(timeout=10))
+            client.search_backend.index_document = MagicMock(side_effect=lambda *a, **k: barrier.wait(timeout=10))
             client.search_backend.index_document = MagicMock()
             client.entity_extractor = MagicMock()
 
@@ -174,34 +171,12 @@ class TestPhase1FastReturn:
 class TestPhase2Background:
     """Phase 2 should run in background and complete enrichment."""
 
-    def test_phase2_corpus_tree_called(self, client_factory, tmp_path):
-        """Phase 2 calls corpus_tree.update_for_document."""
-        client = client_factory()
-        try:
-            client.super_tree_index.on_document_added = MagicMock()
-            client.closet_index.add_document = MagicMock()
-            corpus_mock = MagicMock()
-            client.corpus_tree.update_for_document = corpus_mock
-            client.search_backend.index_document = MagicMock()
-            client.entity_extractor = MagicMock()
-
-            md_path = _make_md_file(tmp_path)
-            with _mock_md_to_tree():
-                doc_id = client.index(md_path, mode="md")
-
-            # Wait for background thread
-            time.sleep(1)
-            corpus_mock.assert_called_once()
-        finally:
-            client.close()
-
     def test_phase2_search_backend_called(self, client_factory, tmp_path):
         """Phase 2 calls search_backend.index_document."""
         client = client_factory()
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock()
             search_mock = MagicMock()
             client.search_backend.index_document = search_mock
             client.entity_extractor = MagicMock()
@@ -221,7 +196,6 @@ class TestPhase2Background:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock()
             client.search_backend.index_document = MagicMock()
             extract_mock = MagicMock(return_value=([], [], []))
             client.entity_extractor.extract_from_document = extract_mock
@@ -241,7 +215,6 @@ class TestPhase2Background:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock()
             client.search_backend.index_document = MagicMock()
             client.entity_extractor = MagicMock()
 
@@ -270,12 +243,11 @@ class TestPhase2Background:
             phase2_started = threading.Event()
             phase2_continue = threading.Event()
 
-            def slow_corpus_update(*args, **kwargs):
+            def slow_search(*args, **kwargs):
                 phase2_started.set()
                 phase2_continue.wait(timeout=10)
 
-            client.corpus_tree.update_for_document = slow_corpus_update
-            client.search_backend.index_document = MagicMock()
+            client.search_backend.index_document = slow_search
             client.entity_extractor = MagicMock()
 
             md_path = _make_md_file(tmp_path)
@@ -302,35 +274,12 @@ class TestPhase2Background:
 class TestPhase2Failure:
     """Phase 2 failure must not crash or prevent searchability."""
 
-    def test_phase2_corpus_tree_failure_logged(self, client_factory, tmp_path):
-        """Phase 2 corpus_tree failure is logged, not raised."""
-        client = client_factory()
-        try:
-            client.super_tree_index.on_document_added = MagicMock()
-            client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock(
-                side_effect=RuntimeError("corpus tree boom")
-            )
-            client.search_backend.index_document = MagicMock()
-            client.entity_extractor = MagicMock()
-
-            md_path = _make_md_file(tmp_path)
-            with _mock_md_to_tree():
-                doc_id = client.index(md_path, mode="md")
-
-            # Should not raise; doc_id should be valid
-            assert doc_id is not None
-            time.sleep(1)
-        finally:
-            client.close()
-
     def test_phase2_entity_extraction_failure_logged(self, client_factory, tmp_path):
         """Phase 2 entity extraction failure is logged, not raised."""
         client = client_factory()
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock()
             client.search_backend.index_document = MagicMock()
             client.entity_extractor.extract_from_document = MagicMock(
                 side_effect=RuntimeError("entity boom")
@@ -351,7 +300,6 @@ class TestPhase2Failure:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock()
             client.search_backend.index_document = MagicMock(
                 side_effect=RuntimeError("search boom")
             )
@@ -372,10 +320,9 @@ class TestPhase2Failure:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock(
+            client.search_backend.index_document = MagicMock(
                 side_effect=RuntimeError("boom")
             )
-            client.search_backend.index_document = MagicMock()
             client.entity_extractor = MagicMock()
 
             md_path = _make_md_file(tmp_path)
@@ -400,33 +347,6 @@ class TestPhase2Failure:
 class TestSyncMode:
     """sync=True should run Phase 2 synchronously (current behavior)."""
 
-    def test_sync_true_runs_corpus_tree_synchronously(self, client_factory, tmp_path):
-        """With sync=True, corpus_tree.update_for_document is called before index() returns."""
-        call_order = []
-
-        client = client_factory()
-        try:
-            client.super_tree_index.on_document_added = MagicMock()
-            client.closet_index.add_document = MagicMock()
-
-            def track_corpus(*args, **kwargs):
-                call_order.append("corpus_tree")
-
-            client.corpus_tree.update_for_document = track_corpus
-            client.search_backend.index_document = MagicMock()
-            client.entity_extractor = MagicMock()
-
-            md_path = _make_md_file(tmp_path)
-            with _mock_md_to_tree():
-                call_order.append("index_start")
-                doc_id = client.index(md_path, mode="md", sync=True)
-                call_order.append("index_end")
-
-            assert call_order.index("corpus_tree") > call_order.index("index_start")
-            assert call_order.index("corpus_tree") < call_order.index("index_end")
-        finally:
-            client.close()
-
     def test_sync_true_runs_entity_extraction_synchronously(self, client_factory, tmp_path):
         """With sync=True, entity extraction runs before index() returns."""
         call_order = []
@@ -435,7 +355,6 @@ class TestSyncMode:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock()
             client.search_backend.index_document = MagicMock()
 
             def track_entity(*args, **kwargs):
@@ -461,7 +380,6 @@ class TestSyncMode:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.update_for_document = MagicMock()
             client.search_backend.index_document = MagicMock()
             client.entity_extractor = MagicMock()
 
@@ -483,12 +401,11 @@ class TestSyncMode:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
 
-            def slow_corpus(*args, **kwargs):
+            def slow_search(*args, **kwargs):
                 time.sleep(0.3)
-                call_order.append("corpus_tree")
+                call_order.append("search_backend")
 
-            client.corpus_tree.update_for_document = slow_corpus
-            client.search_backend.index_document = MagicMock()
+            client.search_backend.index_document = slow_search
             client.entity_extractor = MagicMock()
 
             md_path = _make_md_file(tmp_path)
@@ -499,8 +416,8 @@ class TestSyncMode:
                 elapsed = time.monotonic() - t0
                 call_order.append("index_end")
 
-            # index() should wait for corpus_tree since default is sync=True
+            # index() should wait for Phase 2 since default is sync=True
             assert elapsed >= 0.3
-            assert call_order.index("corpus_tree") < call_order.index("index_end")
+            assert call_order.index("search_backend") < call_order.index("index_end")
         finally:
             client.close()

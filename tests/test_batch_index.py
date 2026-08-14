@@ -1,9 +1,8 @@
 """T11: Batch mode index_batch tests.
 
 Phase 1 — Extraction (per-doc, concurrent with semaphore)
-Phase 2 — Batch corpus tree rebuild
-Phase 3 — Batch entity normalization (LLM merges synonyms once)
-Phase 4 — Search backend + super_tree indexing
+Phase 2 — Batch entity normalization (LLM merges synonyms once)
+Phase 3 — Search backend + super_tree indexing
 
 All LLM calls mocked. No real LLM, no vectors.
 """
@@ -81,7 +80,6 @@ class TestBatchExtractsAllDocs:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.rebuild = MagicMock(return_value={})
             client.search_backend.index_document = MagicMock()
             client.entity_extractor.extract_from_document = MagicMock(
                 return_value=([], [], [])
@@ -126,7 +124,6 @@ class TestBatchExtractsAllDocs:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.rebuild = MagicMock(return_value={})
             client.search_backend.index_document = MagicMock()
             client.entity_extractor.extract_from_document = MagicMock(
                 return_value=([], [], [])
@@ -170,7 +167,6 @@ class TestBatchExtractsAllDocs:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.rebuild = MagicMock(return_value={})
             client.search_backend.index_document = MagicMock()
             extract_mock = MagicMock(return_value=([], [], []))
             client.entity_extractor.extract_from_document = extract_mock
@@ -212,55 +208,7 @@ class TestBatchExtractsAllDocs:
 # ===========================================================================
 
 class TestBatchNormalizationRunsOnce:
-    """Batch mode should call corpus_tree.rebuild() once, NOT
-    corpus_tree.update_for_document() per doc."""
-
-    def test_rebuild_called_once_not_incremental(self, client_factory, tmp_path):
-        """corpus_tree.rebuild() called exactly once; update_for_document NOT called."""
-        client = client_factory()
-        try:
-            client.super_tree_index.on_document_added = MagicMock()
-            client.closet_index.add_document = MagicMock()
-            rebuild_mock = MagicMock(return_value={})
-            client.corpus_tree.rebuild = rebuild_mock
-            update_mock = MagicMock()
-            client.corpus_tree.update_for_document = update_mock
-            client.search_backend.index_document = MagicMock()
-            client.entity_extractor.extract_from_document = MagicMock(
-                return_value=([], [], [])
-            )
-
-            paths = [
-                _make_md_file(tmp_path, f"doc{i}.md", f"# Doc {i}\n\nContent {i}\n")
-                for i in range(5)
-            ]
-            with patch(
-                "pageindex_mutil.client.md_to_tree",
-                side_effect=[
-                    {
-                        "doc_name": f"doc{i}.md",
-                        "doc_description": f"Document {i}",
-                        "line_count": 3,
-                        "structure": [
-                            {
-                                "node_id": f"n{i}",
-                                "title": f"Doc {i}",
-                                "text": f"Content {i}",
-                                "summary": f"Summary {i}",
-                                "level": 1,
-                            }
-                        ],
-                    }
-                    for i in range(5)
-                ],
-            ):
-                client.index_batch(paths, mode="md")
-
-            # Batch: rebuild once, NOT incremental per-doc
-            rebuild_mock.assert_called_once()
-            update_mock.assert_not_called()
-        finally:
-            client.close()
+    """Batch mode should call normalize_entities_batch once (not per-doc)."""
 
     def test_entity_normalize_batch_called_once(self, client_factory, tmp_path):
         """normalize_entities_batch is called exactly once after extraction."""
@@ -268,7 +216,6 @@ class TestBatchNormalizationRunsOnce:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.rebuild = MagicMock(return_value={})
             client.search_backend.index_document = MagicMock()
             client.entity_extractor.extract_from_document = MagicMock(
                 return_value=([], [], [])
@@ -475,7 +422,6 @@ class TestBatchQualityImprovement:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.rebuild = MagicMock(return_value={})
             client.search_backend.index_document = MagicMock()
 
             # Simulate: doc1 extracts "张三", doc2 extracts "张先生"
@@ -537,62 +483,12 @@ class TestBatchQualityImprovement:
         finally:
             client.close()
 
-    def test_batch_no_incremental_corpus_update(self, client_factory, tmp_path):
-        """Batch mode does NOT call corpus_tree.update_for_document (incremental)."""
-        client = client_factory()
-        try:
-            client.super_tree_index.on_document_added = MagicMock()
-            client.closet_index.add_document = MagicMock()
-            rebuild_mock = MagicMock(return_value={})
-            client.corpus_tree.rebuild = rebuild_mock
-            update_mock = MagicMock()
-            client.corpus_tree.update_for_document = update_mock
-            client.search_backend.index_document = MagicMock()
-            client.entity_extractor.extract_from_document = MagicMock(
-                return_value=([], [], [])
-            )
-            client.entity_extractor.normalize_entities_batch = MagicMock()
-
-            paths = [
-                _make_md_file(tmp_path, f"doc{i}.md", f"# Doc {i}\n\nContent {i}\n")
-                for i in range(3)
-            ]
-            with patch(
-                "pageindex_mutil.client.md_to_tree",
-                side_effect=[
-                    {
-                        "doc_name": f"doc{i}.md",
-                        "doc_description": f"Document {i}",
-                        "line_count": 3,
-                        "structure": [
-                            {
-                                "node_id": f"n{i}",
-                                "title": f"Doc {i}",
-                                "text": f"Content {i}",
-                                "summary": f"Summary {i}",
-                                "level": 1,
-                            }
-                        ],
-                    }
-                    for i in range(3)
-                ],
-            ):
-                client.index_batch(paths, mode="md")
-
-            # No incremental updates
-            update_mock.assert_not_called()
-            # One batch rebuild
-            rebuild_mock.assert_called_once()
-        finally:
-            client.close()
-
     def test_batch_search_backend_indexed_for_all_docs(self, client_factory, tmp_path):
         """Phase 4: search_backend.index_document called for each doc."""
         client = client_factory()
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.rebuild = MagicMock(return_value={})
             search_mock = MagicMock()
             client.search_backend.index_document = search_mock
             client.entity_extractor.extract_from_document = MagicMock(

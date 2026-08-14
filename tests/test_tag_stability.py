@@ -32,7 +32,6 @@ import pageindex_mutil.closet_index as closet_mod
 import pageindex_mutil.corpus_tree as corpus_tree_mod
 from db import PageIndexDB
 from pageindex_mutil.closet_index import ClosetIndex
-from pageindex_mutil.corpus_tree import CorpusTreeBuilder
 
 # Prompt markers used to route mocked LLM responses.
 M_EXTRACT = "语义标签提取专家"
@@ -91,7 +90,7 @@ def _patch_llm(fake):
     """Patch llm_completion on every module the code under test can reach.
 
     - ``closet_mod`` (captured): ClosetIndex._extract_tags globals.
-    - ``corpus_tree_mod`` (captured): CorpusTreeBuilder._resolve_new_tag path.
+    - ``corpus_tree_mod`` (captured): resolve_new_tag path.
     - live corpus_tree: ClosetIndex._anchor_tags' lazy import target.
 
     Dedup by id so double-patching the same object is avoided.
@@ -254,30 +253,6 @@ class TestCanonicalAnchoring:
             closet.add_document(doc_id, "容器平台", "", [{"title": "x"}])
         rows = _raw_rows(db, doc_id)
         assert [(r["tag_text"], r["confidence"]) for r in rows] == [("容器编排", 0.9)]
-
-    def test_corpus_tree_reuses_anchor_without_extra_arbitration(self, db, closet):
-        """锚定落库后 corpus_tree 增量挂簇命中 norm_map，不再产生裁定调用。"""
-        db.upsert_corpus_tag_norm("风险管理", "风险管理")
-        root = db.insert_corpus_tree_node(None, "知识库", "", 0, kind="root")
-        cluster = db.insert_corpus_tree_node(
-            root, "风险管理", "", 1, kind="cluster", tag="风险管理")
-        builder = CorpusTreeBuilder(db, model="m", cluster_min=1)
-        doc_id = db.insert_document("a.pdf", "/tmp/a.pdf")
-        fake = _route_llm({
-            M_EXTRACT: json.dumps([{"tag": "风控", "confidence": 0.8}]),
-            M_ARBITRATE: json.dumps({"canonical": "风险管理"}),
-        })
-        with _patch_llm(fake):
-            closet.add_document(doc_id, "风控手册", "", [{"title": "x"}])
-            # 锚定后落库即为规范名，供 corpus_tree 直接复用
-            assert [r["tag_text"] for r in _raw_rows(db, doc_id)] == ["风险管理"]
-            arb_after_add = len(_arb_calls(fake))
-            assert arb_after_add == 1  # 仅 add_document 锚定一次
-            builder.update_for_document(doc_id)
-        # corpus_tree 挂簇复用 norm_map，不产生新的裁定调用
-        assert len(_arb_calls(fake)) == arb_after_add
-        mem = db.get_corpus_doc_memberships(doc_id)
-        assert [node_id for node_id, _ in mem] == [cluster]
 
     def test_arbitration_uses_retrieve_model(self, db, tmp_path):
         """NFR4：锚定裁定调用接 retrieve_model。"""

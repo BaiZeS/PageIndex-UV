@@ -268,6 +268,14 @@ class PageIndexDB:
             except sqlite3.OperationalError:
                 conn.execute("ALTER TABLE documents ADD COLUMN doc_description TEXT")
 
+            # Migrate: add doc_summary if missing ([S3] 语料树简化替代——文档级
+            # 接地摘要；空值回退 doc_description，L1 消费端 `or` 兜底自动生效)。
+            # 幂等：列已存在时 ALTER 抛 OperationalError，吞掉即可。
+            try:
+                conn.execute("ALTER TABLE documents ADD COLUMN doc_summary TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # 列已存在
+
             # One-shot backfill (idempotent): before a93ee95,
             # ClosetIndex.add_document hardcoded source="llm" for jieba
             # fallback tags, so legacy DBs carry fallback words mislabeled
@@ -316,6 +324,14 @@ class PageIndexDB:
             conn.execute(
                 "UPDATE documents SET doc_description = ? WHERE id = ?",
                 (doc_description, doc_id),
+            )
+
+    def update_doc_summary(self, doc_id, summary):
+        """写入文档级接地摘要（[S3] doc_summary）。不覆盖 doc_description。"""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE documents SET doc_summary = ? WHERE id = ?",
+                (summary, doc_id),
             )
 
     def insert_nodes(self, doc_id, records):

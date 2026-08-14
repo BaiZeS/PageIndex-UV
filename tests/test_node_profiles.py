@@ -225,7 +225,6 @@ def _prepare_client_for_index(client):
     """Mock every LLM-touching component except entity logic under test."""
     client.super_tree_index.on_document_added = MagicMock()
     client.closet_index.add_document = MagicMock()
-    client.corpus_tree.update_for_document = MagicMock()
     client.search_backend.index_document = MagicMock()
 
 
@@ -428,7 +427,6 @@ class TestBatchProfiles:
         try:
             client.super_tree_index.on_document_added = MagicMock()
             client.closet_index.add_document = MagicMock()
-            client.corpus_tree.rebuild = MagicMock(return_value={})
             client.search_backend.index_document = MagicMock()
 
             def fake_extract(doc_name, doc_description, structure):
