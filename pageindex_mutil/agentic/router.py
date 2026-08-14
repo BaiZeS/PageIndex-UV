@@ -53,7 +53,8 @@ class AgenticRouter:
     async def _recall_nodes_for_doc(self, query: str, doc_id: str,
                                       matched_info: List[Dict] = None,
                                       l1_reasons: Dict[str, str] = None,
-                                      query_entities=None, query_tokens=None):
+                                      query_entities=None, query_tokens=None,
+                                      node_entities=None):
         """Recall relevant nodes for a single document (runs in thread).
 
         [3.2.1] unit = 节点：enhance_and_select 统一接入——四通道 union 宽召回 +
@@ -71,6 +72,10 @@ class AgenticRouter:
         query_entities/query_tokens: [S7] L0 证据束共享物（_act_tree_search 经
         evidence_ctx 提取下传）。非 None 时直接使用，不再 db.search_entities /
         内部 tokenize；None 时回退既有解析（v2 路径 / 无证据束调用方兼容）。
+
+        node_entities: {node_id: [{"name","type","confidence"}]}（[S7]/[S5] 节点级
+        实体直通）。非 None 时透传 enhance_and_select，节点实体证据改用证据束
+        派生值（替代 resolve_node_profiles 的实体重读）；None 时行为不变。
         """
         funcs = self._load_main_funcs()
         spans_from_nodes = funcs.get("spans_from_nodes")
@@ -145,6 +150,8 @@ class AgenticRouter:
                 call_kwargs["l1_reasons"] = {doc_id: reason}  # 仅本文档理由子集
         if query_tokens is not None:
             call_kwargs["query_tokens"] = query_tokens
+        if node_entities is not None:
+            call_kwargs["node_entities"] = node_entities
         result = await enhancer.enhance_and_select(
             query, candidates, profiles, query_entities=query_entities, **call_kwargs
         )
@@ -245,6 +252,34 @@ class AgenticRouter:
         ctx_qe = evidence_ctx.get("query_entities") if evidence_ctx else None
         ctx_qt = evidence_ctx.get("tokens") if evidence_ctx else None
 
+        # [S7] 节点级实体直通：从 evidence_bundle 按 doc 聚合 {node_id: [实体条目]}，
+        # 透传 L2（替代 resolve_node_profiles 的实体重读）。需 db_id→uuid 反查——
+        # 提前重建映射，不依赖下方排序段才建的 uuid_to_db。
+        node_entities_by_doc: Dict[str, Dict[str, list]] = {}
+        if evidence_bundle is not None:
+            id_mapper = getattr(self.client, "_id_mapper", None)
+            if id_mapper is not None:
+                db_to_uuid = {int(db): uuid for uuid, db in id_mapper.items()}
+            else:
+                db_to_uuid = {
+                    int(v): k
+                    for k, v in (getattr(self.client, "_uuid_to_db", {}) or {}).items()
+                }
+            for db_id, e in evidence_bundle.items():
+                uuid_id = db_to_uuid.get(int(db_id))
+                if not uuid_id:
+                    continue
+                node_map = node_entities_by_doc.setdefault(uuid_id, {})
+                for ent in ((e.get("channels") or {}).get("entity") or []):
+                    nid = ent.get("node_id")
+                    if not nid:
+                        continue
+                    node_map.setdefault(str(nid), []).append({
+                        "name": ent.get("name"),
+                        "type": ent.get("type"),
+                        "confidence": ent.get("confidence"),
+                    })
+
         # Parallel node recall across documents (with match info if available)
         recall_tasks = []
         for doc_id in unique_docs:
@@ -257,6 +292,10 @@ class AgenticRouter:
                 call_kwargs["query_entities"] = ctx_qe
             if ctx_qt is not None:
                 call_kwargs["query_tokens"] = ctx_qt
+            if evidence_bundle is not None:
+                ne = node_entities_by_doc.get(doc_id)
+                if ne:
+                    call_kwargs["node_entities"] = ne
             recall_tasks.append(self._recall_nodes_for_doc(query, doc_id, **call_kwargs))
         recall_results = await asyncio.gather(*recall_tasks, return_exceptions=True)
 

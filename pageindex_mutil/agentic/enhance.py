@@ -383,6 +383,7 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         max_candidates=None,
         force_all_candidates: bool = False,
         l1_reasons=None,
+        node_entities: dict = None,
     ) -> dict:
         """四通道高召回 union → 证据组装 → LLM 精挑。
 
@@ -402,6 +403,10 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         l1_reasons: {doc_id: 一句话选中理由}（[S6]#7/[S7] L1→L2 trace）。None/空
                     时行为与之前完全一致；传入时注入"上级选档依据"段，标注为
                     判断而非事实（防锚定）。
+        node_entities: {node_id: [{"name","type","confidence"}]}（[S7]/[S5] 证据束
+                    节点级实体直通）。非 None 时该节点实体证据源改用
+                    node_entities.get(raw_id/nid)（替代 prof["entities"] 重读）；
+                    keywords/tags 仍来自 prof。None 时行为与之前完全一致。
         返回: {"selected_ids": [...], "pool_concern": bool,
                "concern_reason": str, "deferred": [node_ids]}
         """
@@ -443,7 +448,17 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
             if prof is None:
                 prof = profiles.get(nid)
             prof = prof if isinstance(prof, dict) else {}
-            ents = self._entity_hits(query_entities, prof.get("entities"))
+            if node_entities is not None:
+                # [S7] 节点级实体直通：实体证据源改用证据束派生的 node→entity map
+                # （替代 prof["entities"] 重读）；keywords/tags 仍来自 prof。
+                try:
+                    ent_src = node_entities.get(raw_id) or node_entities.get(nid)
+                except TypeError:
+                    # 不可哈希 node_id：回退 str(nid) 查表
+                    ent_src = node_entities.get(nid)
+            else:
+                ent_src = prof.get("entities")
+            ents = self._entity_hits(query_entities, ent_src)
             kws = self._keyword_hits(query_tokens, prof.get("keywords"))
             tags = self._tag_hits(query_tokens, query_cf, prof.get("tags"))
             # 正文内容通道（P2.6）：命中词并入关键词证据（casefold 去重，

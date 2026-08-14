@@ -195,3 +195,27 @@ def test_bundle_returns_query_ctx(tmp_path):
     assert isinstance(bundle, dict)
     assert "tokens" in ctx and isinstance(ctx["tokens"], list)
     assert "query_entities" in ctx and "浴血值" in ctx["query_entities"]
+
+
+def test_entity_channel_carries_node_id_and_name_node_dedup(tmp_path):
+    """[S7]/[S5] entity 通道携带 node_id；(name, node_id) 去重保多节点同实体归属；
+    derive_evidence_score/render_doc_evidence 按 name 去重（同名只计一次/只列一次）。"""
+    client, db = _graph_client(tmp_path)
+    doc = db.insert_document(pdf_name="A", pdf_path="", doc_description="")
+    e1 = db.insert_entity("concept", "浴血", [])
+    # 同一实体在同一文档的两个节点各提及一次（同 doc，不同 node_id）
+    db.insert_entity_mention(e1, doc, node_id="n1")
+    db.insert_entity_mention(e1, doc, node_id="n2")
+
+    bundle, ctx = build_evidence_bundle(client, db, "浴血", topk=30)
+
+    ents = bundle[doc]["channels"]["entity"]
+    # 每条都携带 node_id
+    assert all("node_id" in x for x in ents)
+    # (name, node_id) 去重：同名不同 node 各成一条（保多节点同实体归属）
+    assert {(x["name"], x["node_id"]) for x in ents} == {("浴血", "n1"), ("浴血", "n2")}
+    # derive_evidence_score：同名只计一次 → 3.0（而非 3.0*2）
+    assert derive_evidence_score(bundle[doc]) == 3.0
+    # render_doc_evidence：同名只列一次
+    text = render_doc_evidence(bundle, [doc])
+    assert text.count("浴血") == 1

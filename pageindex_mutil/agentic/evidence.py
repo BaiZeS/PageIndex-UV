@@ -15,8 +15,10 @@ def _dedup(items, key):
 def derive_evidence_score(entry) -> float:
     """文档级证据分：3*实体 + 2*标签 + 1*关键词（仅用于分组序/补充清单序/matched_docs，不参与裁定）。"""
     ch = (entry or {}).get("channels") or {}
+    # 实体按 name 去重计数（[S7] entity 通道去重 key 已改为 (name, node_id)，
+    # 多节点同实体在 bundle 里各成一条，但文档级证据分不得重复计数）。
     return (
-        3.0 * len(ch.get("entity") or [])
+        3.0 * len({e["name"] for e in ch.get("entity") or []})
         + 2.0 * len(ch.get("tag") or [])
         + 1.0 * len(ch.get("keyword") or [])
     )
@@ -123,12 +125,13 @@ def build_evidence_bundle(client, db, query, topk=30, max_hop=None) -> tuple[dic
         if query_ids:
             placeholders = ",".join("?" for _ in query_ids)
             rows = db._connect().execute(
-                f"SELECT em.entity_id, em.doc_id, em.confidence, e.name, e.entity_type "
+                f"SELECT em.entity_id, em.doc_id, em.confidence, e.name, e.entity_type, em.node_id "
                 f"FROM entity_mentions em JOIN entities e ON e.id = em.entity_id "
                 f"WHERE em.entity_id IN ({placeholders})", query_ids).fetchall()
             for r in rows:
                 entry(r["doc_id"])["channels"]["entity"].append(
-                    {"name": r["name"], "type": r["entity_type"], "confidence": r["confidence"]})
+                    {"name": r["name"], "type": r["entity_type"], "confidence": r["confidence"],
+                     "node_id": r["node_id"]})
     except Exception as e:
         logging.warning("evidence entity channel failed: %s", e)
 
@@ -151,7 +154,10 @@ def build_evidence_bundle(client, db, query, topk=30, max_hop=None) -> tuple[dic
 
     for db_id, e in bundle.items():
         e["channels"]["keyword"] = _dedup(e["channels"]["keyword"], lambda k: (k["token"], k["field"]))
-        e["channels"]["entity"] = _dedup(e["channels"]["entity"], lambda k: k["name"])
+        # [S7] entity 通道去重 key = (name, node_id)：同名不同节点的实体各成一条，
+        # 保多节点同实体归属（节点级实体直通 L2 需 node_id 归属）；文档级证据分
+        # /渲染在 derive_evidence_score / render_doc_evidence 内按 name 另行去重。
+        e["channels"]["entity"] = _dedup(e["channels"]["entity"], lambda k: (k["name"], k["node_id"]))
         e["channels"]["tag"] = _dedup(e["channels"]["tag"], lambda k: k["text"])
     return bundle, {"tokens": tokens, "query_entities": query_entities}
 
@@ -169,7 +175,15 @@ def render_doc_evidence(bundle, db_ids) -> str:
         if ch["keyword"]:
             parts.append("关键词命中: " + ", ".join(f"{k['token']}({k['field']})" for k in ch["keyword"]))
         if ch["entity"]:
-            parts.append("实体命中: " + ", ".join(f"{x['name']}（{x['type']}）" for x in ch["entity"]))
+            # [S7] 同名只列一次（bundle 条目已按 (name, node_id) 去重，多节点同实体
+            # 各成一条；渲染按 name 去重，避免重复列出）。
+            seen_names = set()
+            ent_parts = []
+            for x in ch["entity"]:
+                if x["name"] not in seen_names:
+                    seen_names.add(x["name"])
+                    ent_parts.append(f"{x['name']}（{x['type']}）")
+            parts.append("实体命中: " + ", ".join(ent_parts))
         if ch["tag"]:
             parts.append("标签命中: " + ", ".join(t["text"] for t in ch["tag"]))
         links = e["graph"].get("doc_entity_links") or []

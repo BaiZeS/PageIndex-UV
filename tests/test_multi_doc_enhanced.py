@@ -806,3 +806,76 @@ class TestNFR4RouterSite:
 
         asyncio.run(call_recall())
         assert models and all(m == "r-model" for m in models)
+
+
+# ---------------------------------------------------------------------------
+# 6. [S7]/[S5] 节点级实体直通：entity 通道 node_id → node_entities 透传 L2
+# ---------------------------------------------------------------------------
+
+
+class TestNodeEntitiesPassThrough:
+    def test_recall_passes_node_entities_to_enhance(self):
+        """[S7] node_entities 经 _recall_nodes_for_doc 透传 enhance_and_select：
+        节点实体证据用注入值（替代 prof 实体重读），keywords/tags 仍来自 prof。"""
+        router, _ = _router_with_doc([
+            _node("n1", entities=[{"name": "张三", "type": "人物"}]),
+        ])
+        captured = []
+
+        def fake_llm(model, prompt, **kwargs):
+            captured.append(prompt)
+            # 只有看到注入实体 李四 才选 n1（结构键实体 张三 不应作为证据来源）
+            return _select_json(["n1"]) if "李四" in prompt else _select_json([])
+
+        with _patch_enhance_llm(side_effect=fake_llm):
+            result = asyncio.run(router._recall_nodes_for_doc(
+                "李四的事", "doc1",
+                query_entities=["李四"],
+                node_entities={"n1": [{"name": "李四", "type": "人物", "confidence": 0.9}]},
+            ))
+
+        assert len(captured) == 1
+        assert "实体匹配：李四（人物）" in captured[0]
+        assert "张三" not in captured[0]  # 注入实体替代结构键实体
+        assert [n["node_id"] for n in result["selected"]] == ["n1"]
+
+    @pytest.mark.asyncio
+    async def test_act_tree_search_aggregates_bundle_node_entities(self):
+        """[S7] _act_tree_search 从 evidence_bundle 按 doc 聚合 {node_id: 实体条目}
+        透传 _recall_nodes_for_doc（db_id→uuid 反查）。"""
+        router, client = _router_with_doc([_node("n0")])
+        router._main_funcs = {
+            "build_context_for_doc": lambda doc, selected, pages: "ctx",
+            "spans_from_nodes": lambda n: [1],
+        }
+
+        calls = []
+
+        async def fake_recall(query, doc_id, matched_info=None, node_entities=None, **kw):
+            calls.append((doc_id, node_entities))
+            return {
+                "doc_id": doc_id,
+                "doc": {"doc_name": doc_id, "type": "md"},
+                "structure": [{"node_id": "n0"}],
+                "selected": [{"node_id": "n0", "text": "x"}],
+                "pages": [1],
+                "relevance_score": 1.0,
+            }
+
+        router._recall_nodes_for_doc = fake_recall
+        from pageindex_mutil.client import DocIdMapper
+        client._id_mapper = DocIdMapper()
+        client._id_mapper.register("doc1", 7)
+        evidence_bundle = {
+            7: {"channels": {"entity": [
+                {"name": "浴血", "type": "concept", "confidence": 0.9, "node_id": "n1"},
+                {"name": "浴血", "type": "concept", "confidence": 0.8, "node_id": "n2"},
+            ], "tag": [], "keyword": []}, "graph": {}},
+        }
+
+        await router._act_tree_search("q", ["doc1"], evidence_bundle=evidence_bundle)
+
+        assert calls == [("doc1", {
+            "n1": [{"name": "浴血", "type": "concept", "confidence": 0.9}],
+            "n2": [{"name": "浴血", "type": "concept", "confidence": 0.8}],
+        })]
