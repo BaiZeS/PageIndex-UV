@@ -149,6 +149,30 @@ class UnifiedNodeEnhancement:
         return hits
 
     @staticmethod
+    def _content_hit_contexts(query_tokens, text, window=60, max_hits=2):
+        """命中处上下文：query token 命中正文时取 ±window 字符窗口（casefold 定位，
+        首尾省略号），供 L2 证据渲染补知识盲区。防御：非字符串/空 → []。"""
+        if not isinstance(text, str) or not text or not query_tokens:
+            return []
+        t = text.casefold()
+        out = []
+        for qt in query_tokens:
+            if len(out) >= max_hits:
+                break
+            if len(qt) < 2:
+                continue
+            i = t.find(qt)
+            if i < 0:
+                continue
+            lo = max(0, i - window)
+            hi = min(len(text), i + len(qt) + window)
+            s = text[lo:hi]
+            prefix = "…" if lo > 0 else ""
+            suffix = "…" if hi < len(text) else ""
+            out.append(f"{prefix}{s}{suffix}")
+        return out
+
+    @staticmethod
     def _entity_hits(query_entities, entities) -> list:
         """实体通道：query_entities 名 vs 节点实体名（casefold，子串放行）。"""
         hits = []
@@ -189,6 +213,7 @@ class UnifiedNodeEnhancement:
                 "entities": list(sig["entities"]),
                 "keywords": list(sig["keywords"]),
                 "tags": list(sig["tags"]),
+                "content_contexts": list(sig.get("content_contexts") or []),
             }
 
         def keeper_of(node_ids):
@@ -258,6 +283,10 @@ class UnifiedNodeEnhancement:
                 lines.append("关键词命中：" + "、".join(str(k) for k in m["keywords"]))
             if m["tags"]:
                 lines.append("标签命中：" + "、".join(str(t) for t in m["tags"]))
+            if m.get("content_contexts"):
+                lines.append("正文命中: " + "；".join(
+                    c[:120] for c in m["content_contexts"][:2]
+                ))
             lines.append(f"摘要：{summary}")
             blocks[nid] = "\n".join(lines)
 
@@ -428,9 +457,11 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
                 + WEIGHT_TAG * len(tags)
                 + WEIGHT_KEYWORD * len(kws)
             )
+            content_contexts = self._content_hit_contexts(query_tokens, cand.get("text") or "") if body_hits else []
             node_signals[nid] = {
                 "entities": ents, "keywords": kws, "tags": tags,
                 "score": score, "pos": pos,
+                "content_contexts": content_contexts,
             }
             if ents or kws or tags:
                 union.append(nid)

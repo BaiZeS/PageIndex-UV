@@ -1443,3 +1443,27 @@ class TestQueryTokensReuse:
                 "q", [{"node_id": "n1", "title": "t", "summary": "s", "text": "浴血"}],
                 {}, query_tokens=["浴血"]))
         assert calls["n"] == 0  # 提供 tokens 后零内部 tokenize
+
+
+# ===========================================================================
+# 17. [S7]/[S1]① L2 正文命中上下文直通：证据渲染命中处上下文补 LLM 知识盲区
+# ===========================================================================
+
+
+class TestContentHitContexts:
+    def test_content_hit_contexts_extracts_window(self):
+        from pageindex_mutil.agentic.enhance import UnifiedNodeEnhancement
+        text = "浴血值可以通过完成日常任务获得，是帮会系统中重要的成长数值。"
+        ctxs = UnifiedNodeEnhancement._content_hit_contexts(["浴血"], text)
+        assert ctxs and "浴血值" in ctxs[0]  # 命中处上下文，而非裸 token
+
+    def test_evidence_renders_content_context(self):
+        """正文命中 → 节点证据块含命中上下文（非只裸 token），补 LLM 知识盲区。"""
+        from pageindex_mutil.agentic.enhance import UnifiedNodeEnhancement
+        enh = UnifiedNodeEnhancement("m", retrieve_model="r")
+        text = "浴血值可以通过完成日常任务获得。"
+        cand = {"node_id": "n1", "title": "t", "summary": "s", "text": text}
+        signals = {"n1": {"entities": [], "keywords": [], "tags": [], "score": 0, "pos": 0,
+                          "content_contexts": ["浴血值可以通过完成日常任务获得"]}}
+        evidence = enh._assemble_evidence(["n1"], signals, {"n1": cand})
+        assert "浴血值可以通过完成日常任务获得" in evidence
