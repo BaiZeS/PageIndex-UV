@@ -927,9 +927,10 @@ class AgenticRouter:
                 ],
             }
 
-        # Expand on medium confidence → Agentic 多轮召回循环（spec [3.5]）。
+        # Expand on medium confidence → Agentic 多轮召回循环（spec [3.5]/[S8]）。
         # 替换旧的单次 expand 分支（pages_with_text2.items() AttributeError）：
-        # 逐轮放宽召回 + verifier 判停 + 延迟/预算保护。轮 1（本次）的融合序与
+        # verifier 判停 + 延迟/预算保护。[S8] 扩召收敛——轮 ≥2 只补 verifier 点名
+        # （v.need）的 doc_id 对象，不再走融合序滑窗。轮 1（本次）的融合序与
         # 已召回文档作为排除种子传入，循环从轮 2 继续并返回最终响应。
         # fused 池已被轮 1 吃满（无更多文档可扩召）时保持原 medium 响应。
         if v.action == "expand" and len(fused) > top_k:
@@ -949,6 +950,7 @@ class AgenticRouter:
                         "pages_with_text": pages_with_text,
                     },
                     first_round_node_matches=node_matches,
+                    expand_need=getattr(v, "need", None),
                 )
             except Exception as e:
                 logging.warning("Agentic recall loop failed: %s", e)

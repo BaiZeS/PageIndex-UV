@@ -1,32 +1,27 @@
-"""T6.3 Agentic 多轮并发召回循环（spec [3.5]/[7.5]/[7.6]）。
+"""T6.3/T11 Agentic 多轮并发召回循环（spec [3.5]/[7.5]/[7.6]/[S8]）。
 
 一次性固定 top_k 的召回在多相关数据集上被上限压死，且选错一批只能认命。
-改用 agentic 多轮召回：每轮并行召回 → verifier 判停（复用 CRAG action）→
-不足则放宽召回再来一轮，直到能作答或达到上限（轮数/延迟/token 预算）。
+改用 agentic 多轮召回：每轮召回 → verifier 判停（复用 CRAG action）→
+expand 时按 verifier 点名（VerifyResult.need）补召回，直到能作答或达到上限
+（轮数/延迟/token 预算）。
 
-设计要点（对应 spec [3.5]）：
-- ① 逐轮放宽宽度：轮 1 用调用方 top_k（轻量高精），轮 ≥2 走 agentic_round_topks
-  梯度（5→10→20，precision-first → recall-expansion）；放宽轮（r ≥ 3，对应
-  round_cfg 的 relax_threshold）宽度再翻倍（fused[:top_k*2]）纳入更低排名候选；
-- ② 轮内并发（router._run_strategies / _act_tree_search 内部 asyncio.gather），
-  轮间串行；RRF 只用作进入序（entry ordering），不引入新判据；
+设计要点（[S8] 扩召收敛后）：
+- ① 轮 1 用调用方 top_k（轻量高精）；轮 ≥2 不再走融合序滑窗——改为只补
+  verifier 点名（VerifyResult.need）的 doc_id 对象。删除 `_cut_candidates` 融合序
+  滑窗与顺序回捞（回归 spec v3.2 [7.5]b "重新挑选必须 LLM 决策"原旨）；
+- ② 轮内并发（router._act_tree_search 内部 asyncio.gather），轮间串行；RRF 只用作
+  进入序（entry ordering），不引入新判据；
 - ③ LLM 判停复用 CRAGVerifier 的 answer/expand/refuse action，不自造判据；
 - ④ 增量去重：凡进入过某轮候选的文档都进 retrieved，后续轮不再召回；
-- ①b 延迟池：本轮召回宽度之外、尚未召回的融合文档按分数序跨轮携带；下一轮
-  滑窗前移自然回捞（并入候选后再受宽度切窗约束），滑窗取空时直接按序回捞，
-  不做不可逆硬丢弃（宁多勿漏）；
-- 上下文替换语义（[7.5]b）：每轮上下文在 max_context_tokens 预算内整体重建
-  （用更宽候选重新挑选预算内最相关子集），绝不追加上一轮上下文；累积文档集合
-  仅供 best_effort 使用；
-- ⑦ pool_concern（T6.4 节点级 enhance_and_select 的显式池质疑信号）经
-  retrieve() 同名参数接入，默认 False；置 True 时作用于循环首轮——该轮跳过
-  答案生成/校验直接扩召（④a），与 verifier expand 的间接扩召互补；
-- ⑧ 首轮即答快速路径：轮 1 的 answer 判定直接返回，不做任何预算/延迟记账；
-- 延迟/预算三道闸（[7.5]c）：开新轮前 elapsed + 预估 vs agentic_max_latency_ms；
+- 上下文替换语义（[7.5]b）：每轮上下文在 max_context_tokens 预算内整体重建，
+  绝不追加上一轮上下文；累积文档集合仅供 best_effort 使用；
+- ⑤ 首轮即答快速路径：轮 1 的 answer 判定直接返回，不做任何预算/延迟记账；
+- ⑥ 延迟/预算三道闸（[7.5]c）：开新轮前 elapsed + 预估 vs agentic_max_latency_ms；
   单轮 asyncio.wait_for(agentic_round_timeout_s)——超时轮降级为 best-effort
   （选择直接终止而非开下一轮：超时说明负载异常，重试大概率重蹈覆辙）；
   跨轮 token 总账（各轮上下文 + 答案 token 之和）超 agentic_max_total_tokens
-  即提前终止进 best-effort。
+  即提前终止进 best-effort；
+- ⑦ need 为空/无有效 doc_id → stop_reason="no_target" 进 best_effort（[S8]）。
 """
 
 import asyncio
@@ -69,7 +64,6 @@ class AgenticRecallLoop:
     selected_nodes/pages），仅附加 rounds_used / note 元数据（additive）。
     """
 
-    DEFAULT_ROUND_TOPKS = [5, 10, 20]
     DEFAULT_MAX_ROUNDS = 3
     DEFAULT_MAX_LATENCY_MS = 45000.0
     DEFAULT_ROUND_TIMEOUT_S = 30.0
@@ -103,7 +97,6 @@ class AgenticRecallLoop:
                 return default
             return value if value else default
 
-        self.round_topks = list(_field("agentic_round_topks", self.DEFAULT_ROUND_TOPKS, list))
         self.max_rounds = _field("agentic_max_rounds", self.DEFAULT_MAX_ROUNDS, int)
         self.max_latency_ms = _field("agentic_max_latency_ms", self.DEFAULT_MAX_LATENCY_MS, float)
         self.round_timeout_s = _field("agentic_round_timeout_s", self.DEFAULT_ROUND_TIMEOUT_S, float)
@@ -120,7 +113,7 @@ class AgenticRecallLoop:
         first_round_ctx_state: Optional[Dict] = None,
         first_round_node_matches: Optional[Dict[str, List[dict]]] = None,
         max_rounds: int = None,
-        pool_concern: bool = False,
+        expand_need: Optional[List[dict]] = None,
     ) -> Dict:
         """多轮召回主循环。
 
@@ -133,7 +126,9 @@ class AgenticRecallLoop:
           （_run_strategies 的 node_matches）；给出时承接为本循环的节点匹配，
           供续接轮（≥2）的树搜索复用——否则续接轮以空 node_matches 召回，
           节点召回弱化。默认 None ⇒ 维持独立调用方行为（自行 Route 或空）。
-        - pool_concern: ④a 显式池质疑信号（T6.4 接入前恒 False）。
+        - expand_need: [S8] 轮 1 由调用方完成时的 verifier 点名（VerifyResult.need）；
+          轮 ≥2 只补其中有效且未召回的 doc_id 对象。默认 None（独立模式：由本循环
+          轮 1 verify 后置入）。
         """
         total_rounds = max(1, int(max_rounds or self.max_rounds))
         self._node_matches = first_round_node_matches if first_round_node_matches is not None else {}
@@ -154,19 +149,21 @@ class AgenticRecallLoop:
         retrieved = set(seed)            # ④ 增量去重：已召回（含失败轮候选）
         accumulated: List[str] = list(seed)   # best_effort 输入：成功接地的候选（轮序）
         acc_set = set(seed)
-        deferred: List[Tuple[str, float]] = []  # ①b 跨轮延迟池（分数序）
         last_state = first_round_ctx_state
         last_state_docs = set(seed) if first_round_ctx_state is not None else set()
 
         round_durations: List[float] = []
         tokens_used = 0
         last_completed = start_round - 1
-        pool_concern_live = bool(pool_concern)
         stop_reason = "rounds_exhausted"
         start_ts = time.monotonic()
 
+        # [S8] 点名扩召：expand 轮候选 = 上一轮 verifier 的 need 点名对象。
+        # 轮 1 由调用方完成时承接其 need（expand_need）；否则由本循环轮 1 verify 置入。
+        pending_need = expand_need if first_round_ctx_state is not None else None
+
         for r in range(start_round, total_rounds + 1):
-            # ⑧ 闸门只拦新开轮（轮 1 豁免——首轮即答快速路径）
+            # ⑤ 闸门只拦新开轮（轮 1 豁免——首轮即答快速路径）
             if r > 1:
                 elapsed_ms = (time.monotonic() - start_ts) * 1000.0
                 if elapsed_ms + self._estimate_round_ms(round_durations) >= self.max_latency_ms:
@@ -176,14 +173,18 @@ class AgenticRecallLoop:
                     stop_reason = "token_budget"
                     break
 
-            width_topk = int(top_k) if r == 1 else self._round_topk(r)
-            candidates, deferred = self._cut_candidates(
-                fused, retrieved, deferred, width_topk, relax=(r >= 3)
-            )
+            if r == 1:
+                candidates = [doc_id for doc_id, _ in fused[: max(0, int(top_k))]]
+            else:
+                candidates = self._named_candidates(pending_need, retrieved)
+                if not candidates:
+                    # [S8] 无点名对象（need 空/无有效 doc_id/全已召回）→ 终止进 best_effort
+                    stop_reason = "no_target"
+                    break
+
             if not candidates:
-                # 滑窗与延迟池回捞都取不到新候选（零宽窗口同样落空）——
-                # 不一定整个融合池耗尽，故名 candidates_exhausted。
-                stop_reason = "candidates_exhausted"
+                # 轮 1 融合池为空：无候选可召 → best_effort
+                stop_reason = "no_target"
                 break
 
             round_start = time.monotonic()
@@ -214,15 +215,11 @@ class AgenticRecallLoop:
             ctx = outcome.get("ctx") or ""
             tokens_used += self._count_tokens(ctx)
             if not ctx:
-                # 本轮无接地上下文：不浪费答案/校验调用，直接放宽下一轮
+                # 本轮无接地上下文：不浪费答案/校验调用，直接进下一轮
+                # （点名对象已进 retrieved，下一轮无新 need → no_target 终止）
                 continue
             last_state = outcome
             last_state_docs = set(candidates)
-
-            if pool_concern_live:
-                # ④a 显式信号：跳过答案/verifier 直接下一轮
-                pool_concern_live = False
-                continue
 
             try:
                 answer = await self._generate(query, ctx)
@@ -245,11 +242,12 @@ class AgenticRecallLoop:
                 stop_reason = "verifier_error"
                 break
             if v.action == "answer":
-                # ⑧ 轮 1 快速路径：直接返回，无预算/延迟记账开销
+                # ⑤ 轮 1 快速路径：直接返回，无预算/延迟记账开销
                 return self._round_response(query, answer, "high", outcome, score_map, r)
             if v.action == "refuse":
                 return self._refuse_response(query, outcome, score_map, r)
-            # expand → 下一轮（①b 延迟池自动回捞）
+            # expand → 下一轮只补本次 need 点名对象（[S8]）
+            pending_need = getattr(v, "need", None) or []
 
         logging.info(
             "[AgenticLoop] falling back to best-effort: reason=%s rounds=%d accumulated=%d",
@@ -263,64 +261,28 @@ class AgenticRecallLoop:
     # ------------------------------------------------------------------
     # 轮机制
     # ------------------------------------------------------------------
-    def _round_topk(self, r: int) -> int:
-        """轮 r（≥2）的宽度梯度：超出列表长度取末值（⑨ 梯度可配）。"""
-        idx = min(r - 1, len(self.round_topks) - 1)
-        try:
-            return max(1, int(self.round_topks[idx]))
-        except (TypeError, ValueError):
-            return self.DEFAULT_ROUND_TOPKS[-1]
+    @staticmethod
+    def _named_candidates(need, retrieved: set) -> List[str]:
+        """[S8] 从 verifier need 点名清单提取 doc_id 子集（去重、保序、排除已召回）。
 
-    def _cut_candidates(
-        self,
-        fused: List[Tuple[str, float]],
-        retrieved: set,
-        deferred: List[Tuple[str, float]],
-        round_topk: int,
-        relax: bool,
-    ) -> Tuple[List[str], List[Tuple[str, float]]]:
-        """本轮候选切分（①/①b/④）。
-
-        与 spec `parallel_recall(query, top_k, exclude=retrieved)` 语义对齐：
-        - 召回宽度 = round_topk；放宽轮取 round_topk*2（纳入更低排名候选）；
-        - 增量去重（④）：沿融合分数序滑过 retrieved，取其后 width 篇新文档
-          （exclude=retrieved 的等价实现——融合池固定时逐轮重跑策略不改变融合序，
-          放宽体现在滑窗宽度上）；
-        - ①b 延迟池 = 滑窗外尚未召回的融合文档（分数序），跨轮携带：窗口随宽度
-          梯度前移自然将其回捞（"并入本轮候选池后再受宽度切窗约束"的等价实现，
-          宁多勿漏且不失控）；滑窗取空而延迟池仍有货时直接按序回捞（安全网）；
-        - 新延迟池 = 本轮窗外尚未召回的融合文档（分数序）。
-        顺序全程确定：融合分数序。
+        node_id 条目无文档级对象，最小实现跳过；page 字段不参与文档级补召回。
+        need 为空/非 list/无有效 doc_id → 空列表（调用方据此 no_target 终止）。
         """
-        if not fused:
-            return [], []
-        width = max(0, int(round_topk * 2 if relax else round_topk))
-        n = len(fused)
-        start = 0
-        while start < n and fused[start][0] in retrieved:
-            start += 1
+        if not need:
+            return []
+        out: List[str] = []
         seen = set()
-        candidates: List[str] = []
-        for doc_id, _score in fused[start:start + width]:
+        for item in need:
+            if not isinstance(item, dict):
+                continue
+            doc_id = item.get("doc_id")
+            if not doc_id:
+                continue
             if doc_id in retrieved or doc_id in seen:
                 continue
             seen.add(doc_id)
-            candidates.append(doc_id)
-        if not candidates and deferred:
-            # 安全网：滑窗无新候选但延迟池仍有未召回者 → 按序回捞（宁多勿漏）
-            for doc_id, _score in deferred:
-                if len(candidates) >= width:
-                    break
-                if doc_id in retrieved or doc_id in seen:
-                    continue
-                seen.add(doc_id)
-                candidates.append(doc_id)
-        new_deferred = [
-            (doc_id, score)
-            for doc_id, score in fused[start + width:]
-            if doc_id not in retrieved and doc_id not in seen
-        ]
-        return candidates, new_deferred
+            out.append(doc_id)
+        return out
 
     async def _run_round(self, query: str, candidates: List[str], node_matches=None) -> Dict:
         """轮内 Act：树搜索 + 预算内上下文构建（替换语义——每轮整体重建）。"""
@@ -339,8 +301,8 @@ class AgenticRecallLoop:
     async def _route(self, query: str) -> List[Tuple[str, float]]:
         """独立模式轮 1 的 Route：Plan → 轮内并发召回 → RRF（仅进入序）。
 
-        后续轮复用同一融合池——同查询同权重下重跑策略不会改变融合序，
-        逐轮放宽体现在对融合池的切窗宽度上（确定性、无重复 LLM 召回开销）。
+        融合池只喂轮 1 的 fused[:top_k]；后续轮候选来自 verifier 点名（need），
+        不再对融合池切窗（[S8] 删除滑窗）。
         """
         router = self.router
         try:
