@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..utils import llm_completion, extract_json, count_tokens
 
@@ -8,6 +8,9 @@ from ..utils import llm_completion, extract_json, count_tokens
 class VerifyResult:
     confidence: float
     action: str  # "answer" | "expand" | "refuse"
+    # [S8] 点名补召回需求：sufficient=false 时 verifier 指出缺哪篇文档/哪个节点的证据，
+    # 供 recall_loop（T11）按 need 补召回。默认 []（answer/refuse 或无缺项时）。
+    need: list = field(default_factory=list)
 
 
 class CRAGVerifier:
@@ -27,6 +30,9 @@ class CRAGVerifier:
     def __init__(self, model: str, retrieve_model: str = None):
         self.model = model
         self.retrieve_model = retrieve_model
+        # [S8] verifier 上下文预算（字符），替代硬编码 2000——多文档上下文下
+        # 2000 字硬截断让 evidence_quote 只能引用首 2000 字、系统性误触 expand/refuse。
+        self.ctx_budget = 8000
         self._init_from_config()
 
     def _init_from_config(self):
@@ -36,8 +42,39 @@ class CRAGVerifier:
             cfg = ConfigLoader().load(None)
             self.TAU_HIGH = getattr(cfg, "tau_high", self.TAU_HIGH)
             self.TAU_LOW = getattr(cfg, "tau_low", self.TAU_LOW)
+            self.ctx_budget = self._coerce_ctx_budget(
+                getattr(cfg, "verifier_context_chars", 8000)
+            )
         except Exception:
             pass
+
+    @staticmethod
+    def _coerce_ctx_budget(val) -> int:
+        """verifier_context_chars 规整：正整数否则回退 8000。"""
+        try:
+            v = int(val)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+        return 8000
+
+    @staticmethod
+    def _normalize_need(raw) -> list:
+        """[S8] 规整 need 输出：每项保留 doc_id/node_id/page(可选)/reason，
+        跳过非 dict 或缺对象键（doc_id 与 node_id 皆无）的条目；解析失败给 []。"""
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            if "doc_id" not in item and "node_id" not in item:
+                continue
+            entry = {k: item[k] for k in ("doc_id", "node_id", "page", "reason") if k in item}
+            entry.setdefault("reason", "")
+            out.append(entry)
+        return out
 
     def _score_retrieval(
         self, context: str, source_docs: int, covered_nodes: int
@@ -77,7 +114,7 @@ class CRAGVerifier:
 问题: {query}
 
 检索到的上下文（部分）:
-{context[:2000]}
+{context[:self.ctx_budget]}
 
 生成的答案:
 {answer}
@@ -87,10 +124,11 @@ class CRAGVerifier:
 2. sufficient: 上下文是否足以准确回答该问题？（true/false）
 3. evidence_quote: 从上下文中逐字引用一段支撑答案关键论断的证据片段；找不到可引用的实锤则返回空字符串 ""
 4. confidence: 上下文对答案的支撑度（0.0-1.0）
+5. need: 若 sufficient=false 且能指出缺哪篇文档（doc_id）或哪个节点（node_id）的证据，返回需要补充召回的 need 列表（每项含 doc_id 或 node_id 之一、可选 page、以及 reason 一句话说明缺什么）；否则返回 []
 
 判据从严：答案若引用不出上下文实锤（evidence_quote 为空），based_on_context 应为 false，且 confidence 应相应降低。宁可触发补充召回，也不放行没有上下文支撑的答案。
 
-返回JSON格式: {{"based_on_context": true, "sufficient": true, "evidence_quote": "上下文中的原文片段", "confidence": 0.85}}
+返回JSON格式: {{"based_on_context": true, "sufficient": true, "evidence_quote": "上下文中的原文片段", "confidence": 0.85, "need": []}}
 直接返回JSON，不要其他内容。
 """
         try:
@@ -109,6 +147,8 @@ class CRAGVerifier:
             based = self._to_bool(data.get("based_on_context", True))
             sufficient = self._to_bool(data.get("sufficient", True))
             evidence_quote = str(data.get("evidence_quote") or "").strip()
+            # [S8] 点名补召回需求（need 由 VerifyResult 携带，消费端为 T11）。
+            need = self._normalize_need(data.get("need", []))
             # 高置信判 answer 的必要条件：能引用出上下文实锤；引用不出视同未接地。
             if not evidence_quote:
                 based = False
@@ -118,11 +158,11 @@ class CRAGVerifier:
                 combined *= 0.5
 
             if combined >= self.TAU_HIGH:
-                return VerifyResult(confidence=combined, action="answer")
+                return VerifyResult(confidence=combined, action="answer", need=need)
             elif combined >= self.TAU_LOW:
-                return VerifyResult(confidence=combined, action="expand")
+                return VerifyResult(confidence=combined, action="expand", need=need)
             else:
-                return VerifyResult(confidence=combined, action="refuse")
+                return VerifyResult(confidence=combined, action="refuse", need=need)
         except Exception as e:
             logging.warning(f"Verification failed: {e}")
             return VerifyResult(confidence=s_ret, action="answer")

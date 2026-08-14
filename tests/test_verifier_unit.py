@@ -232,3 +232,56 @@ class TestHeuristicFallback:
         expected = v._score_retrieval(ctx, 3, 10)
         assert result.action == "answer"
         assert abs(result.confidence - expected) < 1e-9
+
+
+class TestVerifierContextBudgetAndNeed:
+    """[S8] verifier 上下文预算可配（verifier_context_chars）+ need 点名输出。"""
+
+    def test_verifier_context_budget_from_config(self, monkeypatch):
+        """预算上调（默认 8000）后，>2000 字上下文全文进 prompt，不再只给 2000 字。"""
+        v = _verifier_cls()("qwen-plus", retrieve_model="r")
+        captured = {}
+        monkeypatch.setattr(
+            _verifier_mod(), "llm_completion",
+            lambda *a, **k: captured.setdefault("p", a[1]),
+        )
+        long_ctx = "证据内容。" * 600  # 3000 字符 > 2000
+        res = v.verify("答案", long_ctx, "查询", 2, 3)
+        # 预算上调后全文不截断（旧实现 context[:2000] 会截掉后 1000 字）
+        assert long_ctx in captured["p"]
+        assert hasattr(res, "need") and res.need == []
+
+    def test_verifier_parses_need_field(self, monkeypatch):
+        """sufficient=false 且给出 need 列表 → 规整进 VerifyResult.need。"""
+        v = _verifier_cls()("qwen-plus", retrieve_model="r")
+        monkeypatch.setattr(
+            _verifier_mod(), "llm_completion",
+            lambda *a, **k: (
+                '{"based_on_context": false, "sufficient": false, '
+                '"evidence_quote": "", "confidence": 0.3, '
+                '"need": [{"doc_id": "d2", "reason": "缺该文档证据"}]}'
+            ),
+        )
+        res = v.verify("答案", "上下文", "查询", 1, 2)
+        assert res.need == [{"doc_id": "d2", "reason": "缺该文档证据"}]
+
+    def test_verifier_normalizes_need_skips_invalid_entries(self):
+        """_normalize_need：跳过非 dict / 缺对象键条目，保留 node_id/page。"""
+        norm = _verifier_cls()._normalize_need
+        raw = [
+            {"doc_id": "d1", "reason": "缺 d1"},
+            {"node_id": "n3", "page": 5},
+            {"doc_id": "d2"},
+            {"reason": "缺对象键，应跳过"},
+            "not-a-dict",
+            None,
+        ]
+        assert norm(raw) == [
+            {"doc_id": "d1", "reason": "缺 d1"},
+            {"node_id": "n3", "page": 5, "reason": ""},
+            {"doc_id": "d2", "reason": ""},
+        ]
+        # 非法整体输入 → []
+        assert norm(None) == []
+        assert norm("need") == []
+        assert norm({"doc_id": "d1"}) == []

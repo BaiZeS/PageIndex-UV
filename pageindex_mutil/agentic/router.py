@@ -346,6 +346,7 @@ class AgenticRouter:
         node_matches: Dict[str, List[Dict]] = None,
         doc_scores_out: Dict[str, float] = None,
         l1_reasons: Dict[str, str] = None,
+        evidence_bundle: Dict = None,
     ) -> Tuple[str, List[dict], int, int, Dict[str, List[int]], List[dict]]:
         """Act 阶段树搜索。doc_scores_out 非 None 时回填每篇召回成功文档的
         证据派生分数（节点召回覆盖度 (0,1]）——供调用方构造 matched_docs，
@@ -353,6 +354,11 @@ class AgenticRouter:
 
         l1_reasons: {doc_id: 一句话选中理由}（[S6]#7/[S7] L1→L2 trace 预留槽位，
         默认 None；真正注入在 T9 L1 裁定改造）。None 时不向下传理由，行为不变。
+
+        evidence_bundle: [S8] 证据束（{db_id: entry}）；非 None 时上下文组装排序
+        主键改为 derive_evidence_score（次键 L1 裁定序/candidate_docs 顺序），
+        与 matched_docs 同口径——保证支撑段可见，替代覆盖度分排序。None（v2 路径
+        无证据束）时回退既有覆盖度分排序，保持既有调用方兼容。
         """
         funcs = self._load_main_funcs()
         pages_from_nodes = funcs.get("pages_from_nodes")
@@ -390,7 +396,27 @@ class AgenticRouter:
                 logging.warning("[Act] node recall raised for doc=%s: %s: %s",
                                 doc_id, type(r).__name__, r)
 
-        doc_results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+        # [S8] 上下文组装排序：有证据束时主键证据分（derive_evidence_score）、
+        # 次键 L1 裁定序（candidate_docs 顺序）——与 matched_docs 同口径，替代
+        # 覆盖度分排序（多文档上下文下保证支撑段靠前可见，verifier 才能引用实锤）。
+        # 无证据束（v2 路径）回退既有覆盖度分排序，保持既有调用方兼容。
+        if evidence_bundle is not None:
+            from .evidence import derive_evidence_score
+            id_mapper = getattr(self.client, "_id_mapper", None)
+            if id_mapper is not None:
+                uuid_to_db = dict(id_mapper.items())
+            else:
+                uuid_to_db = getattr(self.client, "_uuid_to_db", {}) or {}
+            order = {doc_id: i for i, doc_id in enumerate(candidate_docs)}
+
+            def _ev_sort_key(r):
+                db_id = uuid_to_db.get(r.get("doc_id"))
+                score = derive_evidence_score(evidence_bundle.get(db_id))
+                return (-score, order.get(r.get("doc_id"), len(candidate_docs)))
+
+            doc_results.sort(key=_ev_sort_key)
+        else:
+            doc_results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
 
         # 证据派生分数回填（预算截断前全量记录——召回并发完成，与准入无关）
         if doc_scores_out is not None:
@@ -676,6 +702,11 @@ class AgenticRouter:
         act_kwargs = {"doc_scores_out": doc_scores}
         if l1_reasons:
             act_kwargs["l1_reasons"] = l1_reasons
+        # [S8] 上下文组装排序同口径：证据束直通 _act_tree_search（T9 已构建）。
+        # 空束（无 db/构建失败/无命中）不传——_act_tree_search 回退覆盖度分排序，
+        # 与既有调用方（v2 路径）行为一致。
+        if bundle:
+            act_kwargs["evidence_bundle"] = bundle
         try:
             ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = await self._act_tree_search(
                 query, selected_uuids, **act_kwargs
