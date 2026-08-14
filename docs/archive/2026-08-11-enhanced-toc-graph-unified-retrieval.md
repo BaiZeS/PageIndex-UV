@@ -1,6 +1,6 @@
 # PageIndex-UV 整体架构优化：增强 TOC 图谱 + 统一检索增强
 
-> 版本：v3.2（2026-08-11，修正收窄纪律 + 显式 pool_concern + 统一调用路径 + LLM 决策的 expand 重挑）
+> 版本：v3.3（2026-08-11，落地 7 项边界完备性修正）
 > 上游依据：`2026-08-04-overall-architecture-semantic-tree-navigation.md`（[S1]–[S13]）
 > 本文档是对上游 spec 的**增量优化**，不推翻其骨架：LLM TOC 推理为核心、图谱辅助、四通道预筛。
 > 决策记录（用户 2026-08-11 拍板）：①方案A（节点本地属性富集，树即图谱）②单/多文档统一增强 ③高召回 union + LLM 精挑为唯一裁剪 ④召回预算 = agentic 多轮并发召回（LLM 判停）。
@@ -8,6 +8,7 @@
 > v3 更新（实现细化）：新增 **[7] 实现细化与风险防控**，逐项回应用户 6 个工程问题（消歧轻量有效/标签稳定可控/union 效率/证据防过载/agentic 陷阱/best-effort 作答），并对齐现有代码（`disambiguate_entity`、`normalize_entities_batch`、`_extract_tags` 等已存在）。
 > v3.1 追加拍板：**verifier 取偏严取向（召回优先）+ 多轮 token 预算 + 延迟保护（总耗时/单轮超时/首轮即答快速路径）**，见 [7.5]；[6] 对应开放项已关闭。
 > v3.2 修正（回应 6 个纪律边界问题）：①通道 top_k 重定位为"召回成本上限"、区分精确/相似度通道（[1.2]①）；②超限收缩改"多信号加权"而非单档优先级（[1.2]③）；③被截候选进**延迟池**可恢复，不硬丢（[1.2]④）；④`pool_concern` 显式扩召信号（[3.2]、[3.5]要点7）；⑤新增 [3.2.1] 统一调用路径示例（语料树逐层也走 enhance_and_select，防走回老路）；⑥expand"重新挑选"必须 LLM 决策（[7.5]b）；⑦重排层默认不上维持（[1.1]）。
+> v3.3 修正（回应 7 项边界完备性）：①延迟池回捞时机显式——deferred_pool 跨轮携带、`pool_concern`/expand 时并入下一轮 candidates（[3.5]伪代码）；②`pool_concern` 判断依据告知 LLM（3 条客观判据，防无谓扩召，[3.2]④）；③多信号加权零值泛滥防护——全零信号时全量送 LLM 不随机砍（[1.2]③）；④expand 重挑的预算转成 prompt 指令（node_budget/token_budget，防选超额被迫截断，[7.5]b）；⑤Bug3 实体索引 id 事实核实（entity_mentions.doc_id=DB int，须 `_id_mapper.to_uuid` 全程转）+ P0 端到端多跳验收（实体→候选→召回→答案）；⑥新增 [7.7] 降级路径（增强组件失效时降级纯标题+摘要 TOC 推理，LLM 唯一裁剪不变）；⑦P2 验收指标具体化（Recall@k/分支选择准确率/多相关覆盖率/回归护栏，分数据集目标）。
 
 ---
 
@@ -68,7 +69,9 @@
    - **任何通道的遗漏兜底**：靠 union 冗余 + 延迟池 + `pool_concern` + agentic 扩召四重补偿（见④）。
 2. **安全上限**：默认上限设**宽松且可配**（如 60–100 节点，按语料规模标定），宁可多给。
 3. **超限收缩用"多信号加权"而非"单档优先级"**（v3.2 修正）：超上限时按**多信号命中加权分**排序取 top——`score = w_e·实体命中数 + w_t·标签命中数 + w_k·关键词命中数`（`w_e > w_t > w_k`，但**累加**）。**同时命中实体+标签+关键词的节点 > 仅命中单一档的节点**，避免旧"实体>标签>关键词"单档规则把多信号节点压掉。这只决定"谁先进 LLM 视野"，**不是相关性决策**。
+   - **零值泛滥防护（v3.3 新增）**：若 union 里**所有节点 score=0**（查询与语料实体/标签/关键词完全无交集），**禁止按 score 随机排序截断**——此时改为**不收缩、全量送 LLM**（仅受 [1.2]② 的绝对上限兜底），让 LLM 凭标题+摘要直接推理。零信号时宁可多给、绝不"随机砍"。
 4. **被挤出的候选进"延迟池"，不硬丢（v3.2 修正）**：超限被截下的候选保留为 deferred 集合；由 LLM 的 `pool_concern=true` 信号或 agentic 扩召时**优先回捞**（衔接 [3.2.1]、[3.5]）。这保证"宁多勿漏"在机制上成立——相关候选不会因一次超限而永久丢失。
+   - **回捞动作必须显式（v3.3 落地）**：agentic loop 须把 deferred 集合作为状态**跨轮携带**；`pool_concern=true` 或 verifier `expand` 时，把 deferred 候选**并入下一轮 candidates**（见 [3.5] 伪代码④a/④b）。否则延迟池形同虚设。
 
 ---
 
@@ -157,6 +160,7 @@ def enhance_and_select(query, candidate_nodes, profiles):
 - **②证据替代猜测**：把节点签名里的关键词/实体/标签命中显式摆给 LLM，让 LLM 用语料事实而非参数化知识判断。
 - **③LLM 决策不变**：仍是可变数量精挑，宁缺毋滥；但输入被"接地"了。
 - **④输出附带 `pool_concern`（v3.2 新增）**：LLM 在精挑时同时判断"当前候选池是否可能不够全"，返回 `pool_concern: true/false`。这是**显式信号**，使"扩召"不必靠答案含糊去间接推断（见 [3.5]）。
+  - **判断依据须告知 LLM（v3.3 补，防无谓扩召）**：不能只给 true/false 选项，要在 prompt 给出客观判据——`pool_concern=true` 仅当满足其一：①查询里的关键概念（实体/核心关键词）**没有**命中任何候选的证据；②命中的候选数明显偏少（如仅 1 个）且证据偏弱；③选中节点间主题互斥/矛盾，疑似漏掉真正的分支。**判据之外一律给 false**，避免 LLM 习惯性 true → 无谓多轮。
 
 ### [3.2.1] 统一调用路径必须显式化（用户 2026-08-11 精化）
 `enhance_and_select` 是**单位无关**的——它对"文档级候选"和"节点级候选"都适用，这正是单/多文档统一的落点。**实现时必须防止语料树导航绕回老路**，逐层导航也要走这个函数：
@@ -242,25 +246,29 @@ async def agentic_retrieve(query, max_rounds=3):
         2: {"top_k": 10,  "channels": [tag, keyword, entity, vector]},
         3: {"top_k": 20,  "channels": all, "relax_threshold": True},
     }
+    deferred_pool = set()            # v3.3: 跨轮携带的延迟池（超限被截下/未展示候选）
     for round in 1..max_rounds:
         cfg = round_cfg[round]
         # ① 多并发召回：四通道并行 + 跨文档节点召回并行（asyncio.gather）
         candidates = await parallel_recall(query, cfg, exclude=retrieved)
+        # ①b 把延迟池候选并入本轮候选（宁多勿漏，去重）
+        candidates = candidates ∪ deferred_pool
         # ② 高召回 union + LLM 精挑（复用 [3.2] UnifiedNodeEnhancement）
         result = await enhance_and_select(query, candidates)
         selected, pool_concern = result.selected_ids, result.pool_concern
+        deferred_pool = result.deferred      # 本轮被超限截下的候选 → 延迟池
         retrieved |= selected.doc_ids
         # ③ 组装上下文（token 预算，累积已召回）
         context = build_context(selected, budget)
-        # ④a 候选池质疑 —— 显式信号，直接强制再扩一轮（不依赖答案含糊）
-        if pool_concern:  continue   # 回捞延迟池 + 放宽召回，进下一轮
+        # ④a 候选池质疑 —— 显式信号：回捞延迟池 + 放宽召回，直接进下一轮（不经过答案/verifier）
+        if pool_concern:  continue
         # ④b LLM 作答 + 验证（复用 CRAG verifier 的 action 信号）
         answer  = generate_answer(query, context)
         verdict = verifier.verify(answer, context, query, ...)   # answer|expand|refuse
         if verdict.action == "answer":  return answer, high_conf   # 置信足 → 停
         if verdict.action == "refuse":  return refuse              # 明确无 → 停
-        # verdict.action == "expand" → 继续下一轮，放宽召回
-    return best_effort_answer(retrieved)   # 到上限：用累积证据尽力作答
+        # verdict.action == "expand" → 继续下一轮，放宽召回（下一轮 ①b 自动回捞延迟池）
+    return best_effort_answer(retrieved, deferred_pool)   # 到上限：用累积证据尽力作答
 ```
 
 **设计要点**：
@@ -294,11 +302,13 @@ async def agentic_retrieve(query, max_rounds=3):
 | 1 | `_cluster_route_boost` 把 dict 当 int 比较 → **TypeError 崩溃**（`_score_nodes` 已返回 `Dict[int, Dict]`） | super_tree.py `_cluster_route_boost` | `s.get("total_score", 0.0)` 一行改 | 一行崩溃，零耦合，先止血 |
 | 2 | ContentStrategy 命中数被当 rank 喂 RRF → **语义反转**（命中越多分越低） | router.py `_run_strategies` + `_weighted_rrf` | 命中数→真实 rank（rank+1） | 一行级，恢复 v2 融合语义 |
 | 3 | 多跳 `_get_candidate_docs` 返回 **DB 整数 id**，`_recall_nodes_for_doc` 按 **UUID** 查 → 图谱跨文档检索整链失效；且**从不调 CRAG verifier** | multi_hop.py `_get_candidate_docs` + router.py `_recall_nodes_for_doc` | 返回 UUID（经 `_id_mapper` 转换）+ 补 CRAG 验证 | 打通图谱多文档扩展的核心通道，稍重，排第三 |
+
+> **Bug3 实体索引 id 事实（v3.3 核实，durable code fact）**：`entity_mentions.doc_id` / `entity_relations.doc_id` 均为 `INTEGER REFERENCES documents(id)` = **DB 整数 id**；`db.get_entity_documents()` 经 `JOIN documents d ON d.id = em.doc_id` 返回的 `.id` 也是 DB int。故实体→文档链路**整体是 DB-int 语义**——Bug3 修复必须在 `_get_candidate_docs` 出口把 DB id 经 `PageIndexClient._id_mapper.to_uuid(db_id)` 转成 UUID，且 `_recall_nodes_for_doc`/`_act_tree_search` 后续都按 UUID。**勿只改一处**：任何消费 entity→doc 结果的下游都必须确认拿到的是 UUID，否则断层仍在（只是换个位置断）。
 | 4 | `_prefilter_nodes` 的 `if not scores: return all` 保召回守卫**不可达** → 零信号宽层被硬截 top-20 | super_tree.py `_prefilter_nodes` | 最小修：按"是否有任何通道命中"判断，全零信号则全量返回 | 最小修后在 P2 被 union 收窄重写取代（先救急不重写） |
 
 > 另：审计出的**第 5 个缺陷**——`_search_v2` expand 分支 `pages_with_text2.items()` AttributeError——**不单独立项修复**，由 P2 的 [3.5] agentic 多轮召回整体取代（正确机制本身就是修复）。
 
-**验收**：47 个现有测试全绿 + 为 Bug1/3 各补一条回归测试（中档语料树不崩、多跳候选能解析为真实文档）。
+**验收**：47 个现有测试全绿 + 为 Bug1/3 各补一条回归测试（中档语料树不崩、多跳候选能解析为真实文档）。**Bug3 额外需端到端多跳用例（v3.3 要求）**：从**实体出发**，走 `_get_candidate_docs`（返回 UUID）→ `_recall_nodes_for_doc`（按 UUID 取到 doc）→ 最终答案，端到端断言路径通畅且能取到含该实体的文档内容（防"改一处、下游仍断"）。
 
 ### P1 · 方案A：索引期节点本地属性富集
 1. `node_profiles`：实体（归属到节点）+ 显著关键词 + 标签 + 可选向量。
@@ -310,14 +320,19 @@ async def agentic_retrieve(query, max_rounds=3):
 ### P2 · 统一检索增强机制 + Agentic 多轮召回
 1. 实现 `UnifiedNodeEnhancement.enhance_and_select`（高召回 union + 证据组装 + LLM 精挑），union 效率见 **[7.3]**（纯索引查表、无 LLM、签名 O(1)）。
 2. **证据呈现格式（见 [3.2.2]+[7.4]）**：节点级格式化模板 + 单节点/跨节点证据封顶 + "语料事实、按语义关联判断而非计数"的 prompt 引导。
-3. **union 防爆收窄（见 [1.2]）**：上限 50–80、实体优先、超限按信号类型排序、保留 LLM 质疑"候选池过窄"触发扩召的兜底。
+3. **union 防爆收窄（见 [1.2]）**：上限 **60–100 可配**、多信号加权（实体>标签>关键词累加）、超限候选进**延迟池**可回捞（[1.2]③④ + [3.5]①b）、保留 LLM `pool_concern` 触发扩召。
 4. 实现 `[3.5]` agentic 多轮召回循环（逐轮放宽 top_k + CRAG verifier 判停 + 增量去重），取代 v2 expand；top_k 梯度可配以匹配语料规模。**verifier 改判据为"context 是否支撑"+固定上下文预算 replace 而非叠加（见 [7.5]）**。
 5. **best_effort_answer 接地再挑选 + 降置信 + 无证据拒答（见 [7.6]）**。
 6. **PageIndex 多范围集成（见 [3.4.1]，必做）**：核实多范围取数不丢段 + 答案跨段融合；补"答案分散在两个节点"用例。
 7. 单文档 `_search_single` 与多文档 `_recall_nodes_for_doc`/`_navigate_level` 全部接入 `enhance_and_select`。
 8. 移除 `_search_single` 的 `len(summary)` 重排与硬编码 score。
 9. 宽层收窄改为高召回 union（正式取代 Bug4 的临时修）。
-10. 验收：pageindex-paper 三个数据集（mldr_zh/t2/du）召回对比，目标 >0.5。
+10. **验收指标（v3.3 具体化，非笼统 ">0.5"）**——按 pageindex-paper 三数据集（mldr_zh/t2/du）与基线（旧实现 / BM25）对比：
+    - **主指标 · Recall@k**（相关文档被召回比例；mldr_zh 单相关、t2/du 多相关）：目标 **t2/du ≥ 0.5、mldr_zh ≥ 0.6**（基线现 0.16/0.22/0.33，提升 >2×）。
+    - **分支选择准确率**（浴血值类单文档）：增强后 LLM 精挑选中"含答案节点"的比例 ≥ 0.8（基线 0）。
+    - **多相关场景覆盖率**：t2/du 中 ≥2 相关文档的查询，召回全部相关文档的比例 ≥ 0.4。
+    - **回归护栏**：Precision 不显著掉（偏严 verifier + 多轮可能引入噪音，须监控）；总延迟 ≤ `max_latency` 上限。
+    - 具体阈值以首轮实测标定，先记录基线再定目标。
 
 ### P3 · 最佳实践增强（可选，按增益取舍）
 1. Contextual 摘要（节点摘要注入文档/父节点上下文）→ 直接治"摘要丢信息"。
@@ -393,7 +408,16 @@ async def agentic_retrieve(query, max_rounds=3):
 
 **(b) 上下文累积 token 膨胀（多轮预算）**：
 1. **固定上下文预算，expand ≠ 叠加**：每轮上下文受 `max_context_tokens` **固定预算**约束；expand 时用更宽候选**重新挑选**预算内最相关子集（**替换**低价值段，**不是**在旧上下文上继续堆）。否则轮轮累加必爆 token。
-2. **expand 的"重新挑选"必须是 LLM 决策（v3.2 修正）**：重新挑选复用 `enhance_and_select`（LLM 精挑），**不得退化成纯规则筛选**（如按实体命中数截）——否则悄悄背离"LLM 是唯一裁剪者"。实现方式：把更宽候选喂给 LLM，并告知本轮可用的节点/字数预算，让 LLM 在预算内挑；预算只是约束条件，不替 LLM 决定谁相关。（回捞 [1.2]④ 延迟池的候选也纳入本轮 LLM 视野。）
+2. **expand 的"重新挑选"必须是 LLM 决策（v3.2 修正）**：重新挑选复用 `enhance_and_select`（LLM 精挑），**不得退化成纯规则筛选**（如按实体命中数截）——否则悄悄背离"LLM 是唯一裁剪者"。实现方式：把更宽候选喂给 LLM，并**把预算转成 prompt 指令**（v3.3 落地），让 LLM 在预算内挑、避免选出超额导致组装阶段被迫截断：
+   ```
+   # expand 轮的精挑 prompt 须含明确的预算约束（示意）：
+   请在以下预算内挑选最相关的节点：
+   - 本轮最多选 {node_budget} 个节点；
+   - 所选节点的正文合计预算约 {token_budget} token；
+   - 若相关节点超出预算，优先选证据最充分的（实体>关键词>仅语义），不要选明显偏离的；
+   - 返回 {"selected_ids": [...], "pool_concern": bool}，selected_ids 个数不得超过 node_budget。
+   ```
+   `node_budget`/`token_budget` 由 `max_context_tokens` 减去已固定段（历史上下文/系统段）反推得出。**预算只是约束不替 LLM 决定谁相关**；回捞 [1.2]④ 延迟池的候选也纳入本轮 LLM 视野（见 [3.5]①b）。
 3. **轮次 token 总账（多轮预算）**：记录多轮累计 LLM token，设总成本天花板；超即提前终止进 [7.6] best-effort，防"为召回不计成本"。
 4. **轮数硬上限**：`max_rounds`（默认 2–3）兜底，绝不无限扩。
 
@@ -408,3 +432,18 @@ async def agentic_retrieve(query, max_rounds=3):
 2. **降置信 + 显式标注**：输出 `confidence="low"`（[3.5] 已有），并标注"尽力作答/证据不充分"；不让混合质量证据拼出貌似可信的错答案。
 3. **无证据则诚实拒答**：若再挑选后**没有任何节点**含查询实体/关键词/标签命中 → 返回诚实拒答（"未在语料中找到相关证据"），**不编造**。
 4. **答案须可溯源**：best-effort 答案要求注明引用的节点，避免混合证据被无声融合成"看似完整"的错误答案。
+
+### [7.7] 降级路径（韧性设计，v3.3 新增；回应用户"降级 vs 质量优先"取舍）
+选择**显式优雅降级**而非取消降级：增强层（签名/图谱/标签）是"锦上添花"，**原 PageIndex 的 LLM TOC 推理是保底**。任何增强组件缺失/失效时，系统降级到**纯"标题+摘要"的原始 TOC 推理导航**（LLM 仍是唯一决策者），保证可回答而非崩溃。
+
+逐层降级矩阵：
+| 失效组件 | 降级行为 | 依据 |
+|:---------|:---------|:-----|
+| 节点签名缺失（`node_profiles` 无该节点） | 该节点证据块为空，只用 title+summary 供 LLM 判断（等同原始 PageIndex） | 不中断流程 |
+| 实体消歧失败 / canonical 不可得 | 用原始字面实体名做匹配（不做归一）；不阻断 | 对齐"保守合并不误合" |
+| 标签体系崩溃（`closet_tags` 空/异常） | 标签通道返回空集，union 退化为关键词+实体（+向量）；若全空则按 [1.2]③ 零值防护全量送 LLM | union 冗余 |
+| 向量通道不可用（无 embedding/[vector] 未装） | 向量通道跳过（本就可选） | 无向量兜底 |
+| verifier LLM 失败 | 回退纯启发式 `s_ret` 判据（现有保留） | [7.5]a④ |
+| agentic 扩召达 max_rounds/超时/token 天花板 | 进 [7.6] best_effort_answer | [7.5]c + [7.6] |
+
+**纪律底线**：降级只影响"证据丰富度"，**不改变"LLM 唯一裁剪"**——任何降级路径最终都由 LLM 在（可能贫化的）证据上精挑。这保证质量优先的同时系统不崩。
