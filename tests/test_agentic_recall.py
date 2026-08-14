@@ -1,7 +1,7 @@
 """T6.3/T11 Agentic 多轮召回循环测试（spec [3.5]/[7.5]/[7.6]/[S8]）。
 
 覆盖：
-1. 首轮即答快速路径：verifier answer → 一轮返回，不再二次 Route；
+1. 首轮即答快速路径：verifier answer → 一轮返回（续接模式，独立 Route 已退役）；
 2. expand → 轮 2：只补 verifier 点名（need）的 doc_id 对象（[S8] 删除滑窗）；
 3. refuse → 立即拒答；
 4. max_rounds 耗尽 → best_effort：confidence low、接地再挑选、引用来源标注；
@@ -11,12 +11,12 @@
 8. token 总账上限 → best_effort；
 9. need 空/无有效对象 → no_target 终止进 best_effort；
 10. 组件容错：verifier/生成器抛错 → 降级 best_effort，不击穿；
-11. 回归：_search_v2 expand 分支不再抛 pages_with_text2.items() AttributeError，且按 need 点名委派；
-12. node_matches 续接转发：轮 1 Route 节点命中经委派传入续接轮；
-13. max_rounds=1：轮 1 expand 无处可扩 → 直接 best_effort；
-14. 续接池复用：仅给 fused（ctx_state=None）→ 以调用方池起轮 1，不重新 Route；
-15. 小工具鲁棒性：_normalize_fused 滤除非有限分数；_load_settings 容忍非法配置；
-16. 点名补召回：轮 ≥2 只补 need 点名对象（非按分数序滑窗补入其它文档）。
+11. node_matches 续接转发：轮 1 节点命中经委派传入续接轮；
+12. max_rounds=1：轮 1 expand 无处可扩 → 直接 best_effort；
+13. 续接池复用：仅给 fused（ctx_state=None）→ 以调用方池起轮 1（独立 Route 已退役）；
+14. 小工具鲁棒性：_normalize_fused 滤除非有限分数；_load_settings 容忍非法配置；
+15. 点名补召回：轮 ≥2 只补 need 点名对象（非按分数序滑窗补入其它文档）；
+16. 独立模式退役（T13）：first_round_fused=None → 优雅空响应（不抛、不自行 Route）。
 
 全部 LLM 调用均 mock —— 无真实 LLM。
 """
@@ -86,20 +86,6 @@ def _loop(router):
     return _recall_loop_mod().AgenticRecallLoop(router)
 
 
-def _setup_route(router, n_docs=12):
-    """独立模式 Route mock：metadata 单策略 → 融合序 d1..dN（分数降序）。"""
-    router._build_docs_info = MagicMock(
-        return_value=[{"doc_id": f"d{i + 1}"} for i in range(n_docs)]
-    )
-    router.planner.plan = AsyncMock(return_value=PlanResult(
-        queries=["q"], weights={"metadata": 1.0}, query_type="factual"
-    ))
-    router._run_strategies = AsyncMock(return_value=(
-        {"metadata": [(f"d{i + 1}", i + 1) for i in range(n_docs)]},
-        {},
-    ))
-
-
 def _act_outcome(ctx="ctx-data", docs=None):
     docs = docs or ["d1"]
     return (
@@ -137,20 +123,18 @@ def _fused_pool(n=12):
 class TestRoundOneFastPath:
     @pytest.mark.asyncio
     async def test_answer_verdict_returns_after_one_round(self, router):
-        _setup_route(router, n_docs=12)
         router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.9, "answer"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
-        result = await _loop(router).retrieve("q", top_k=3)
+        result = await _loop(router).retrieve("q", top_k=3, first_round_fused=_fused_pool(12))
 
         assert result["confidence"] == "high"
         assert result["answer"] == "ANS"
         assert result["rounds_used"] == 1
         assert result["mode"] == "multi"
         assert BASE_KEYS <= set(result.keys())
-        # 一次 Route（轮内并发召回）+ 一次 Act + 一次校验 —— 无第二轮开销
-        assert router._run_strategies.call_count == 1
+        # 一次 Act + 一次校验 —— 无第二轮开销（独立 Route 已退役，轮 1 融合序由调用方提供）
         assert router._act_tree_search.await_count == 1
         router.verifier.verify.assert_called_once()
 
@@ -190,12 +174,11 @@ class TestExpandNamedFetch:
     @pytest.mark.asyncio
     async def test_expand_with_empty_need_stops_no_target(self, router):
         """[S8] need 为空 → 无点名对象 → no_target 终止进 best_effort（不再滑窗扩召）。"""
-        _setup_route(router, n_docs=12)
         router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.5, "expand", need=[]))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
-        result = await _loop(router).retrieve("q", top_k=3)
+        result = await _loop(router).retrieve("q", top_k=3, first_round_fused=_fused_pool(12))
 
         assert result["confidence"] == "low"
         assert "尽力作答" in result["note"]
@@ -205,7 +188,6 @@ class TestExpandNamedFetch:
     @pytest.mark.asyncio
     async def test_expand_named_need_skips_already_retrieved(self, router):
         """[S8] 点名对象已在召回集（去重）→ 无新对象 → no_target 终止。"""
-        _setup_route(router, n_docs=12)
         act_calls = []
 
         async def fake_act(query, candidates, node_matches=None):
@@ -216,7 +198,7 @@ class TestExpandNamedFetch:
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.5, "expand"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
-        result = await _loop(router).retrieve("q", top_k=3)
+        result = await _loop(router).retrieve("q", top_k=3, first_round_fused=_fused_pool(12))
 
         assert result["confidence"] == "low"
         assert result["rounds_used"] == 1
@@ -231,12 +213,11 @@ class TestExpandNamedFetch:
 class TestRefuse:
     @pytest.mark.asyncio
     async def test_refuse_returns_immediately(self, router):
-        _setup_route(router)
         router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1"]))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.1, "refuse"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
-        result = await _loop(router).retrieve("q", top_k=3)
+        result = await _loop(router).retrieve("q", top_k=3, first_round_fused=_fused_pool())
 
         assert result["answer"] == "I don't know."
         assert result["confidence"] == "low"
@@ -251,7 +232,6 @@ class TestRefuse:
 class TestRoundsExhaustedBestEffort:
     @pytest.mark.asyncio
     async def test_best_effort_low_confidence_grounded_with_citations(self, router):
-        _setup_route(router, n_docs=30)
         act_calls = []
 
         async def fake_act(query, candidates, node_matches=None):
@@ -270,7 +250,7 @@ class TestRoundsExhaustedBestEffort:
 
         loop = _loop(router)
         loop.max_rounds = 3
-        result = await loop.retrieve("q", top_k=3)
+        result = await loop.retrieve("q", top_k=3, first_round_fused=_fused_pool(30))
 
         assert result["confidence"] == "low"
         assert result["rounds_used"] == 3
@@ -289,12 +269,11 @@ class TestRoundsExhaustedBestEffort:
     @pytest.mark.asyncio
     async def test_max_rounds_one_expands_straight_to_best_effort(self, router):
         """max_rounds=1：轮 1 expand 判定但无处可扩 → 直接 best_effort。"""
-        _setup_route(router, n_docs=12)
         router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.5, "expand"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
-        result = await _loop(router).retrieve("q", top_k=3, max_rounds=1)
+        result = await _loop(router).retrieve("q", top_k=3, first_round_fused=_fused_pool(12), max_rounds=1)
 
         assert result["confidence"] == "low"
         assert "尽力作答" in result["note"]
@@ -312,12 +291,10 @@ class TestRoundsExhaustedBestEffort:
 class TestHonestRefusalOnEmptyPool:
     @pytest.mark.asyncio
     async def test_no_evidence_honest_refusal_no_fabrication(self, router):
-        _setup_route(router, n_docs=3)
-        router._run_strategies = AsyncMock(return_value=({"metadata": []}, {}))
         gen = MagicMock(return_value="MADE-UP ANSWER")
         router._main_funcs = {"generate_answer": gen}
 
-        result = await _loop(router).retrieve("q", top_k=3)
+        result = await _loop(router).retrieve("q", top_k=3, first_round_fused=[])
 
         assert result["confidence"] == "low"
         assert "未在语料中找到相关证据" in result["answer"]
@@ -392,7 +369,6 @@ class TestRoundTimeout:
 class TestTokenLedgerCap:
     @pytest.mark.asyncio
     async def test_over_budget_stops_before_next_round(self, router):
-        _setup_route(router, n_docs=12)
         router._act_tree_search = AsyncMock(return_value=_act_outcome(
             ctx="x" * 2000, docs=["d1", "d2", "d3"],
         ))
@@ -401,7 +377,7 @@ class TestTokenLedgerCap:
 
         loop = _loop(router)
         loop.max_total_tokens = 5  # 轮 1 上下文即爆账
-        result = await loop.retrieve("q", top_k=3)
+        result = await loop.retrieve("q", top_k=3, first_round_fused=_fused_pool(12))
 
         assert result["confidence"] == "low"
         assert "尽力作答" in result["note"]
@@ -417,12 +393,11 @@ class TestTokenLedgerCap:
 class TestComponentTolerance:
     @pytest.mark.asyncio
     async def test_verifier_error_degrades_to_best_effort(self, router):
-        _setup_route(router)
         router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1"]))
         router.verifier.verify = MagicMock(side_effect=RuntimeError("verifier exploded"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
-        result = await _loop(router).retrieve("q", top_k=3)
+        result = await _loop(router).retrieve("q", top_k=3, first_round_fused=_fused_pool())
 
         assert result["confidence"] == "low"
         assert "尽力作答" in result["note"]
@@ -431,14 +406,13 @@ class TestComponentTolerance:
     @pytest.mark.asyncio
     async def test_generator_exception_contained_to_best_effort(self, router):
         """回归：生成器抛错不得击穿 retrieve()——已有接地证据时降级为形态完整的 best_effort。"""
-        _setup_route(router)
         router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.9, "answer"))
         router._main_funcs = {
             "generate_answer": MagicMock(side_effect=RuntimeError("generator exploded"))
         }
 
-        result = await _loop(router).retrieve("q", top_k=3)
+        result = await _loop(router).retrieve("q", top_k=3, first_round_fused=_fused_pool(12))
 
         assert BASE_KEYS <= set(result.keys())
         assert result["confidence"] == "low"
@@ -491,7 +465,7 @@ class TestContinuationPoolReuse:
     @pytest.mark.asyncio
     async def test_first_round_fused_without_ctx_state_starts_at_round1(self, router):
         """仅给 first_round_fused（ctx_state=None）⇒ start_round=1：
-        用调用方融合池切轮 1 候选，不自行 Plan/Route。"""
+        用调用方融合池切轮 1 候选，不自行 Plan/Route（独立模式已退役）。"""
         act_calls = []
 
         async def fake_act(query, candidates, node_matches=None):
@@ -499,8 +473,7 @@ class TestContinuationPoolReuse:
             return _act_outcome(docs=candidates[:1])
 
         router._act_tree_search = fake_act
-        # 若误走自行 Route，空 docs_info 会打空融合池 → 结果必然不是 high
-        router._build_docs_info = MagicMock(return_value=[])
+        # 独立模式已退役：retrieve 不得再自行 Plan
         router.planner.plan = AsyncMock(return_value=PlanResult(
             queries=["q"], weights={"metadata": 1.0}, query_type="factual"
         ))
@@ -513,7 +486,6 @@ class TestContinuationPoolReuse:
         assert result["rounds_used"] == 1
         assert act_calls == [["d1", "d2", "d3"]]   # 调用方 fused[:top_k]
         router.planner.plan.assert_not_awaited()
-        router._build_docs_info.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -583,103 +555,23 @@ class TestHelperRobustness:
 
 
 # ---------------------------------------------------------------------------
-# 11. 回归：_search_v2 expand 委派（旧 pages_with_text2.items() AttributeError）
+# 16. 独立模式退役（T13）：first_round_fused=None → 优雅空响应
 # ---------------------------------------------------------------------------
 
 
-class TestSearchV2ExpandIntegration:
-    async def _expand_router(self, router, n_docs=12, need=None):
-        router.planner.plan = AsyncMock(return_value=PlanResult(
-            queries=["q"], weights={"metadata": 1.0}, query_type="factual"
-        ))
-        router._build_docs_info = MagicMock(
-            return_value=[{"doc_id": f"d{i + 1}"} for i in range(n_docs)]
-        )
-        router._run_strategies = AsyncMock(return_value=(
-            {"metadata": [(f"d{i + 1}", i + 1) for i in range(n_docs)]},
-            {},
-        ))
-        router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
-        router.verifier.verify = MagicMock(return_value=VerifyResult(0.5, "expand", need=need or []))
+class TestIndependentModeRetired:
+    @pytest.mark.asyncio
+    async def test_missing_first_round_fused_returns_graceful_empty(self, router):
+        """[T13] 独立模式退役：retrieve 不再自行 Plan/Route，
+        first_round_fused=None → 优雅空响应（不抛、不触 LLM）。"""
+        router._act_tree_search = AsyncMock(return_value=_act_outcome())
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
-    @pytest.mark.asyncio
-    async def test_expand_path_executes_without_attribute_error(self, router):
-        """[S8] expand 分支按 v.need 点名委派——旧实现在此抛 pages_with_text2 AttributeError。"""
-        await self._expand_router(
-            router, n_docs=30,
-            need=[{"doc_id": "d5", "reason": "缺"}, {"doc_id": "d9", "reason": "缺"}],
-        )
-        act_calls = []
-
-        async def fake_act(query, candidates, node_matches=None):
-            act_calls.append(list(candidates))
-            return _act_outcome(docs=candidates[:1])
-
-        router._act_tree_search = fake_act
-
-        result = await router._search_v2("q", top_k=3)
+        result = await _loop(router).retrieve("q", top_k=3)
 
         assert BASE_KEYS <= set(result.keys())
-        assert result["mode"] == "multi"
-        assert result["confidence"] == "low"  # 点名耗尽 → best_effort
-        assert result["rounds_used"] == 2
-        # 轮 1 (v2) d1-d3；轮 2 只补点名 d5,d9；轮 3 无新点名 → no_target → best_effort
-        assert act_calls[0] == ["d1", "d2", "d3"]
-        assert act_calls[1] == ["d5", "d9"]
-        assert act_calls[2] == ["d1", "d2", "d3", "d5", "d9"]  # best_effort 累积池再选择
-
-    @pytest.mark.asyncio
-    async def test_expand_delegation_forwards_node_matches(self, router):
-        """Route 拿到节点命中 → expand 委派随 first_round_node_matches 传入，续接轮召回不弱化。"""
-        await self._expand_router(router, n_docs=30, need=[{"doc_id": "d5", "reason": "缺"}])
-        nm = {"d5": [{"node_id": "n5", "keyword": "kw", "context": "c"}]}
-        router._run_strategies = AsyncMock(return_value=(
-            {"metadata": [(f"d{i + 1}", i + 1) for i in range(30)]},
-            nm,
-        ))
-        seen_matches = []
-        real_act = router._act_tree_search
-
-        async def fake_act(query, candidates, node_matches=None):
-            seen_matches.append(dict(node_matches or {}))
-            return await real_act(query, candidates, node_matches=node_matches)
-
-        router._act_tree_search = fake_act
-
-        result = await router._search_v2("q", top_k=3)
-
-        assert result["rounds_used"] == 2
-        # 轮 1 Act（v2 本体）+ 循环轮 2（点名 d5）+ best_effort 接地，全部携带 node_matches
-        assert seen_matches == [nm] * 3
-
-    @pytest.mark.asyncio
-    async def test_expand_not_delegated_when_pool_exhausted(self, router):
-        """融合池已吃满（无文档可扩召）→ 保持原 medium 响应，不进循环。"""
-        await self._expand_router(router, n_docs=2)
-        result = await router._search_v2("q", top_k=3)
-        assert result["confidence"] == "medium"
-        assert result["answer"] == "ANS"
-        assert "rounds_used" not in result
-
-    @pytest.mark.asyncio
-    async def test_loop_failure_falls_back_to_round1_answer(self, router):
-        """循环自身异常不得击穿搜索——回退轮 1 medium 响应。"""
-        await self._expand_router(router)
-        boom = _recall_loop_mod().AgenticRecallLoop
-
-        class _BoomLoop(boom):
-            async def retrieve(self, *args, **kwargs):
-                raise RuntimeError("loop exploded")
-
-        import pageindex_mutil.agentic.recall_loop as rl_mod
-        router_mod = _router_mod()
-        # _search_v2 在分支内惰性 `from .recall_loop import AgenticRecallLoop`
-        rl_mod.AgenticRecallLoop = _BoomLoop
-        try:
-            result = await router._search_v2("q", top_k=3)
-        finally:
-            rl_mod.AgenticRecallLoop = boom
-
-        assert result["confidence"] == "medium"
-        assert result["answer"] == "ANS"
+        assert result["confidence"] == "low"
+        assert result["matched_docs"] == []
+        assert result["rounds_used"] == 0
+        assert "独立模式已退役" in result["note"]
+        router._act_tree_search.assert_not_awaited()

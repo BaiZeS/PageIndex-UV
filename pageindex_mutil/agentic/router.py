@@ -4,7 +4,6 @@ from typing import List, Tuple, Dict
 
 from .planner import RetrievalPlanner
 from .recall_loop import _node_payload
-from .strategies import MetadataStrategy, SemanticsStrategy, ContentStrategy, DescriptionStrategy
 from .verifier import CRAGVerifier
 from .multi_hop import MultiHopReasoner
 from ..super_tree import SuperTreeIndex
@@ -18,16 +17,9 @@ class AgenticRouter:
         self.model = model
         self.retrieve_model = retrieve_model
         self.planner = RetrievalPlanner(model, retrieve_model)
-        self.metadata_strategy = MetadataStrategy()
-        self.content_strategy = ContentStrategy(client)
-        self.semantics_strategy = None
-        self.description_strategy = DescriptionStrategy(model, retrieve_model)
         self.verifier = CRAGVerifier(model, retrieve_model)
         self.multi_hop_reasoner = MultiHopReasoner(model, retrieve_model)
         self._main_funcs = None
-
-        if hasattr(client, "closet_index") and client.closet_index:
-            self.semantics_strategy = SemanticsStrategy(client.closet_index)
 
         self.super_tree_index = None
         if hasattr(client, "super_tree_index") and client.super_tree_index:
@@ -56,139 +48,6 @@ class AgenticRouter:
             except ImportError:
                 self._main_funcs = {}
         return self._main_funcs
-
-    # ------------------------------------------------------------------
-    # Docs info
-    # ------------------------------------------------------------------
-    def _build_docs_info(self) -> List[Dict]:
-        docs_info = []
-        # Prefer db, but only include docs that are loaded in memory
-        # (Act phase needs in-memory structure/pages)
-        if hasattr(self.client, "db") and self.client.db:
-            try:
-                # Build reverse mapping: db_id -> uuid
-                id_mapper = getattr(self.client, "_id_mapper", None)
-                if id_mapper:
-                    db_to_uuid = {db: uuid for uuid, db in id_mapper.items()}
-                else:
-                    db_to_uuid = {v: k for k, v in getattr(self.client, "_uuid_to_db", {}).items()}
-                for doc in self.client.db.get_all_documents():
-                    doc_id_int = doc["id"]
-                    if doc_id_int not in db_to_uuid:
-                        continue
-                    doc_id = db_to_uuid[doc_id_int]
-                    if doc_id not in self.client.documents:
-                        continue
-                    top = self.client.db.get_top_level_nodes(doc["id"])
-                    docs_info.append(
-                        {
-                            "doc_id": doc_id,
-                            "doc_name": doc.get("pdf_name", ""),
-                            "description": doc.get("doc_description", ""),
-                            "top_level_sections": [
-                                n.get("title") for n in top if n.get("title")
-                            ],
-                        }
-                    )
-                if docs_info:
-                    return docs_info
-            except Exception:
-                pass
-
-        # Fallback to in-memory documents
-        for doc_id, doc in self.client.documents.items():
-            docs_info.append(
-                {
-                    "doc_id": doc_id,
-                    "doc_name": doc.get("doc_name", ""),
-                    "description": doc.get("doc_description", ""),
-                    "top_level_sections": [],
-                }
-            )
-        return docs_info
-
-    # ------------------------------------------------------------------
-    # RRF fusion
-    # ------------------------------------------------------------------
-    # RRF constant; see "Reciprocal Rank Fusion outperforms BM25 and Vector Search"
-    _RRF_K = 60
-
-    @staticmethod
-    def _weighted_rrf(
-        results_dict: Dict[str, List[Tuple[str, int]]],
-        weights: Dict[str, float],
-        k: int = None,
-    ) -> List[Tuple[str, float]]:
-        if k is None:
-            k = AgenticRouter._RRF_K
-        scores: Dict[str, float] = {}
-        for strategy, results in results_dict.items():
-            weight = weights.get(strategy, 1.0)
-            for doc_id, rank in results:
-                scores[doc_id] = scores.get(doc_id, 0.0) + weight * (
-                    1.0 / (k + rank)
-                )
-        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    # ------------------------------------------------------------------
-    # Route — parallel strategies
-    # ------------------------------------------------------------------
-    async def _run_strategies(
-        self, query: str, docs_info: List[Dict], weights: Dict[str, float]
-    ) -> Tuple[Dict[str, List[Tuple[str, int]]], Dict[str, List[Dict]]]:
-        """Run retrieval strategies and return results + node match info.
-
-        Returns:
-            results: {strategy_name: [(doc_id, rank)]}
-            node_matches: {doc_id: [{"node_id", "keyword", "context"}]}
-        """
-        tasks = {}
-        tasks["metadata"] = asyncio.to_thread(
-            self.metadata_strategy.search, query, docs_info
-        )
-        # Content-based search: always run (cheap, keyword-only)
-        tasks["content"] = asyncio.to_thread(
-            self.content_strategy.search, query, docs_info
-        )
-        if self.semantics_strategy and weights.get("semantics", 0) > 0:
-            tasks["semantics"] = asyncio.to_thread(
-                self.semantics_strategy.search, query, docs_info
-            )
-        if weights.get("description", 0) > 0:
-            tasks["description"] = asyncio.to_thread(
-                self.description_strategy.search, query, docs_info
-            )
-
-        results: Dict[str, List[Tuple[str, int]]] = {}
-        node_matches: Dict[str, List[Dict]] = {}
-
-        if tasks:
-            done = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            for name, res in zip(tasks.keys(), done):
-                if isinstance(res, Exception):
-                    logging.warning("Strategy %s failed: %s", name, res)
-                    results[name] = []
-                elif name == "content" and isinstance(res, list):
-                    # ContentStrategy returns (doc_id, hit_count, matched_nodes)
-                    content_results = []
-                    for item in res:
-                        if len(item) == 3:
-                            doc_id, score, matches = item
-                            content_results.append((doc_id, score))
-                            node_matches[doc_id] = matches
-                        else:
-                            content_results.append(item)
-                    # 命中数不是 rank：按命中数降序（已排序，防御性再排一次）
-                    # 转换为真实 1-based rank 后再喂 RRF，否则命中越多分越低。
-                    content_results.sort(key=lambda t: t[1], reverse=True)
-                    results[name] = [
-                        (doc_id, rank + 1)
-                        for rank, (doc_id, _count) in enumerate(content_results)
-                    ]
-                else:
-                    results[name] = res
-
-        return results, node_matches
 
     # ------------------------------------------------------------------
     # Act — tree search + context assembly (parallelized)
@@ -538,73 +397,14 @@ class AgenticRouter:
         return "\n\n".join(contexts), all_nodes, source_docs, len(all_nodes), doc_pages_map, pages_with_text
 
     # ------------------------------------------------------------------
-    # Content-based lexical fallback (robustness for structureless docs)
-    # ------------------------------------------------------------------
-    def _content_fallback(self, query: str, top_k: int) -> list:
-        """BM25 over raw document content; used when the structure-based pipeline
-        yields nothing (e.g. short/structureless passages), so search never returns
-        empty just because a document has no hierarchical structure."""
-        import math, os
-        docs = getattr(self.client, "documents", {})
-        items = []
-        for uuid_id, info in docs.items():
-            content = ""
-            try:
-                pages = info.get("pages")
-                if pages:
-                    content = "\n".join(p.get("content", "") for p in pages if isinstance(p, dict))
-            except Exception:
-                pass
-            if not content:
-                path = info.get("path")
-                if path and os.path.exists(path):
-                    try:
-                        with open(path, encoding="utf-8") as f:
-                            content = f.read()
-                    except Exception:
-                        content = ""
-            if not content:
-                content = f"{info.get('doc_name','') or ''} {info.get('doc_description','') or ''}"
-            items.append((uuid_id, content))
-        if not items:
-            return []
-        try:
-            import jieba
-            tok = lambda t: [x for x in jieba.lcut(t or "") if x.strip()]
-        except Exception:
-            tok = lambda t: (t or "").split()
-        qt = tok(query)
-        dt = [tok(c) for _, c in items]
-        lens = [len(x) for x in dt]
-        avgdl = sum(lens) / len(lens) if lens else 1
-        df = {}
-        for toks in dt:
-            for t in set(toks):
-                df[t] = df.get(t, 0) + 1
-        n = len(items); k1 = 1.5; b = 0.75
-        def idf(t):
-            return math.log((n - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5) + 1)
-        scored = []
-        for i, (uuid_id, _c) in enumerate(items):
-            tf = {}
-            for t in dt[i]:
-                tf[t] = tf.get(t, 0) + 1
-            s = sum(idf(q) * (tf.get(q, 0) * (k1 + 1)) / (tf.get(q, 0) + k1 * (1 - b + b * lens[i] / avgdl))
-                    for q in qt if tf.get(q, 0) > 0)
-            scored.append((uuid_id, s))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [{"doc_id": u, "score": float(s)} for u, s in scored[:top_k] if s > 0]
-
-    # ------------------------------------------------------------------
     # Super-Tree search
     # ------------------------------------------------------------------
     async def _search_super_tree(self, query: str, top_k: int = 3) -> Dict:
         """L0 prefilter → L1 Super-Tree selection → L2/L3 Act → Verify.
 
-        Note (T6.3): 超树路径未接入 AgenticRecallLoop——expand 判定在此仅回退为
-        medium 置信响应。原因：本路径无策略融合池（候选来自 prefilter+LLM 选择，
-        非 _run_strategies/_weighted_rrf），循环的"逐轮放宽融合切窗"无对称语义。
-        v2 路径的 expand 委派见 _search_v2（spec [3.5]）。
+        CRAG expand 判定接入 AgenticRecallLoop（[S8] 点名扩召）：以本轮 L1 选中
+        文档的证据分作为轮 1 融合序、本轮 Act 产出作为轮 1 上下文状态，续接轮只
+        补 verifier 点名（need）对象。循环失败/异常时回退原 medium 响应。
         """
         logging.info("[SuperTree] query=%r top_k=%d", query, top_k)
 
@@ -632,18 +432,6 @@ class AgenticRouter:
         logging.info("[SuperTree] L0 candidates=%d", len(candidate_db_ids))
 
         if not candidate_db_ids:
-            fallback = self._content_fallback(query, top_k)
-            if fallback:
-                logging.info("[SuperTree] prefilter empty; content fallback -> %d docs", len(fallback))
-                return {
-                    "query": query,
-                    "mode": "multi",
-                    "answer": "",
-                    "confidence": "low",
-                    "matched_docs": fallback,
-                    "selected_nodes": [],
-                    "pages": [],
-                }
             return {
                 "query": query,
                 "mode": "multi",
@@ -674,18 +462,6 @@ class AgenticRouter:
             query, candidate_db_ids, evidence_bundle=bundle)
         logging.info("[SuperTree] L1 selected=%d docs: %s", len(selected_uuids), selected_uuids)
         if not selected_uuids:
-            fallback = self._content_fallback(query, top_k)
-            if fallback:
-                logging.info("[SuperTree] L1 empty; content fallback -> %d docs", len(fallback))
-                return {
-                    "query": query,
-                    "mode": "multi",
-                    "answer": "",
-                    "confidence": "low",
-                    "matched_docs": fallback,
-                    "selected_nodes": [],
-                    "pages": [],
-                }
             return {
                 "query": query,
                 "mode": "multi",
@@ -786,171 +562,19 @@ class AgenticRouter:
                 ],
             }
 
-        conf = "high" if v.action == "answer" else "medium"
-        return {
-            "query": query,
-            "mode": "multi",
-            "answer": answer,
-            "confidence": conf,
-            "matched_docs": matched,
-            "selected_nodes": _node_payload(nodes),
-            "pages": pages_with_text,
-        }
-
-    # ------------------------------------------------------------------
-    # v2 search (Plan -> Route -> Act -> Verify)
-    # ------------------------------------------------------------------
-    async def _search_v2(self, query: str, top_k: int = 3) -> Dict:
-        logging.info("[v2] query=%r top_k=%d", query, top_k)
-        # Plan
-        plan = await self.planner.plan(query)
-        logging.info("[v2] Plan: type=%s queries=%d weights=%s",
-                    plan.query_type, len(plan.queries), plan.weights)
-
-        # Docs info
-        docs_info = self._build_docs_info()
-        if not docs_info:
-            return {
-                "query": query,
-                "mode": "multi",
-                "answer": "No documents indexed.",
-                "confidence": "unknown",
-                "matched_docs": [],
-                "selected_nodes": [],
-                "pages": [],
-            }
-
-        # Route
-        results, node_matches = await self._run_strategies(
-            plan.queries[0], docs_info, plan.weights
-        )
-
-        # Run semantics on query variants too
-        if self.semantics_strategy and len(plan.queries) > 1:
-            best_sem: Dict[str, int] = {}
-            # Seed with original semantics results
-            for doc_id, rank in results.get("semantics", []):
-                best_sem[doc_id] = rank
-            for q in plan.queries[1:]:
-                try:
-                    r = await asyncio.to_thread(
-                        self.semantics_strategy.search, q, docs_info
-                    )
-                    for doc_id, rank in r:
-                        if doc_id not in best_sem or rank < best_sem[doc_id]:
-                            best_sem[doc_id] = rank
-                except Exception:
-                    pass
-            if best_sem:
-                results["semantics"] = sorted(
-                    best_sem.items(), key=lambda x: x[1]
-                )
-
-        # RRF
-        fused = self._weighted_rrf(results, plan.weights)
-        if not fused:
-            return {
-                "query": query,
-                "mode": "multi",
-                "answer": "No relevant documents found.",
-                "confidence": "unknown",
-                "matched_docs": [],
-                "selected_nodes": [],
-                "pages": [],
-            }
-
-        candidates = [doc_id for doc_id, _ in fused[:top_k]]
-        matched = [
-            {"doc_id": doc_id, "score": round(score, 4)}
-            for doc_id, score in fused[:top_k]
-        ]
-
-        # Act (with node matches from ContentStrategy)
-        try:
-            ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = await self._act_tree_search(
-                query, candidates, node_matches=node_matches
-            )
-        except Exception as e:
-            logging.warning("Act phase failed: %s", e)
-            return {
-                "query": query,
-                "mode": "multi",
-                "answer": f"Failed to retrieve content: {e}",
-                "confidence": "unknown",
-                "matched_docs": matched,
-                "selected_nodes": [],
-                "pages": [],
-            }
-
-        if not ctx:
-            return {
-                "query": query,
-                "mode": "multi",
-                "answer": "No relevant content found.",
-                "confidence": "low",
-                "matched_docs": matched,
-                "selected_nodes": [],
-                "pages": [],
-            }
-
-        # Generate answer
-        funcs = self._load_main_funcs()
-        generate_answer = funcs.get("generate_answer")
-        if not generate_answer:
-            return {
-                "query": query,
-                "mode": "multi",
-                "answer": "Answer generation not available.",
-                "confidence": "unknown",
-                "matched_docs": matched,
-                "selected_nodes": [],
-                "pages": [],
-            }
-
-        answer = generate_answer(query, ctx)
-
-        # Verify
-        v = await asyncio.to_thread(
-            self.verifier.verify, answer, ctx, query, src_docs, cov_nodes
-        )
-        if v.action == "refuse":
-            return {
-                "query": query,
-                "mode": "multi",
-                "answer": "I don't know.",
-                "confidence": "low",
-                "matched_docs": matched,
-                "selected_nodes": _node_payload(nodes),
-                "pages": [
-                    {"doc_id": d, "pages": p}
-                    for d, p in doc_pages_map.items()
-                ],
-            }
-
-        # Expand on medium confidence → Agentic 多轮召回循环（spec [3.5]/[S8]）。
-        # 替换旧的单次 expand 分支（pages_with_text2.items() AttributeError）：
-        # verifier 判停 + 延迟/预算保护。[S8] 扩召收敛——轮 ≥2 只补 verifier 点名
-        # （v.need）的 doc_id 对象，不再走融合序滑窗。轮 1（本次）的融合序与
-        # 已召回文档作为排除种子传入，循环从轮 2 继续并返回最终响应。
-        # fused 池已被轮 1 吃满（无更多文档可扩召）时保持原 medium 响应。
-        # guard 仅防止 fused 池已被轮 1 吃满时的无谓多轮；点名对象以 need 为准，可不在此池内。
-        if v.action == "expand" and len(fused) > top_k:
+        # CRAG expand → Agentic 多轮召回循环（[S8] 点名扩召）。以本轮 L1 选中
+        # 文档的证据分作轮 1 融合序、本轮 Act 产出作轮 1 上下文状态，续接轮只补
+        # verifier 点名（need）对象。循环失败/异常回退原 medium 响应。
+        if v.action == "expand":
             try:
                 from .recall_loop import AgenticRecallLoop
                 loop = AgenticRecallLoop(self)
                 return await loop.retrieve(
-                    query,
-                    top_k=top_k,
-                    first_round_fused=fused,
-                    first_round_ctx_state={
-                        "ctx": ctx,
-                        "nodes": nodes,
-                        "src_docs": src_docs,
-                        "cov_nodes": cov_nodes,
-                        "doc_pages_map": doc_pages_map,
-                        "pages_with_text": pages_with_text,
-                    },
-                    first_round_node_matches=node_matches,
+                    query, top_k=top_k,
+                    first_round_fused=[(doc_id, float(doc_scores.get(doc_id, 0.0))) for doc_id in selected_uuids],
+                    first_round_ctx_state={"ctx": ctx, "nodes": nodes, "src_docs": src_docs,
+                                           "cov_nodes": cov_nodes, "doc_pages_map": doc_pages_map,
+                                           "pages_with_text": pages_with_text},
                     expand_need=getattr(v, "need", None),
                 )
             except Exception as e:
@@ -971,11 +595,12 @@ class AgenticRouter:
     # Public search
     # ------------------------------------------------------------------
     async def search(self, query: str, top_k: int = 3) -> Dict:
-        """Unified single chain ([S4]): direct Super-Tree search; v2 as fallback.
+        """Unified single chain ([S4]): direct Super-Tree search only.
 
-        The multi_hop pre-gate is removed — multi-hop reasoning is re-wired to
-        reuse _extract_intermediate/_guide_next_hop inside the P3 loop, not as a
-        front gate here. _search_v2 stays as the no-super-tree fallback (T13).
+        The multi_hop pre-gate and _search_v2 fallback are removed (P2 T13).
+        Without a super_tree_index (no-db / router-only), return a graceful
+        empty response — no LLM call — preserving the upstream "Router not
+        available" semantics of client.search.
         """
         # Direct Super-Tree search (single chain, no multi_hop pre-gate)
         if self.super_tree_index:
@@ -985,8 +610,13 @@ class AgenticRouter:
                             result.get("confidence"), len(result.get("matched_docs", [])))
                 return result
             except Exception as e:
-                logging.warning("Super-Tree search failed, falling back to v2: %s", e)
-        result = await self._search_v2(query, top_k)
-        logging.info("[Router] v2 confidence=%s docs=%d",
-                    result.get("confidence"), len(result.get("matched_docs", [])))
-        return result
+                logging.warning("Super-Tree search failed: %s", e)
+        return {
+            "query": query,
+            "mode": "multi",
+            "answer": "Router not available. Initialise PageIndexClient with db_path= to enable multi-document search.",
+            "confidence": "unknown",
+            "matched_docs": [],
+            "selected_nodes": [],
+            "pages": [],
+        }

@@ -241,10 +241,10 @@ async def test_single_doc_lexical_hit_end_to_end(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_single_doc_lexical_miss_goes_content_fallback(tmp_path):
-    """(T8 审查) 单文档词面未命中契约 [S4]：查询词不命中任何 doc_keywords →
-    统一链走 _content_fallback（matched_docs 由正文 BM25 兜底、answer 为空串），
-    不抛异常。"""
+async def test_single_doc_lexical_miss_returns_prefilter_empty(tmp_path):
+    """(T8 审查/T13) 单文档词面未命中契约 [S4]：查询词不命中任何 doc_keywords →
+    统一链 L0 prefilter 空 → 优雅空响应（confidence low、matched_docs 空、不抛异常）。
+    （旧 _content_fallback 正文 BM25 兜底已随 T13 删除。）"""
     client, _ = _single_doc_client(
         tmp_path, "操作手册.md", "",
         index_body=None,  # doc_keywords 只收 doc_name/description，不含正文
@@ -263,10 +263,9 @@ async def test_single_doc_lexical_miss_goes_content_fallback(tmp_path):
             "query", "mode", "answer", "confidence",
             "matched_docs", "selected_nodes", "pages",
         }
-        # [S4] 单链契约：_content_fallback 分支 answer 为空串、confidence low
-        assert result["answer"] == ""
+        # [S4]/T13 单链契约：prefilter 空 → 优雅空响应（不再走 content_fallback）
         assert result["confidence"] == "low"
-        assert result["matched_docs"]  # 正文 BM25 兜底命中该文档
-        assert result["matched_docs"][0]["doc_id"] == "d1"
+        assert result["matched_docs"] == []
+        assert result["selected_nodes"] == []
     finally:
         client.close()

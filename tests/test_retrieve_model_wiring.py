@@ -5,7 +5,7 @@ and fall back to ``model`` when retrieve_model is None/empty (NFR4).
 
 Covers two paths:
   - PageIndexClient path: ClosetIndex, SuperTreeIndex, RetrievalPlanner,
-    DescriptionStrategy, CRAGVerifier (6 call sites).
+    CRAGVerifier (5 call sites).
   - main.py path: _call_llm_json, generate_answer (2 call sites).
 """
 import asyncio
@@ -35,12 +35,10 @@ for _mod in list(sys.modules):
 import pageindex_mutil.closet_index as closet_index_mod
 import pageindex_mutil.super_tree as super_tree_mod
 import pageindex_mutil.agentic.planner as planner_mod
-import pageindex_mutil.agentic.strategies as strategies_mod
 import pageindex_mutil.agentic.verifier as verifier_mod
 from pageindex_mutil.closet_index import ClosetIndex
 from pageindex_mutil.super_tree import SuperTreeIndex
 from pageindex_mutil.agentic.planner import RetrievalPlanner
-from pageindex_mutil.agentic.strategies import DescriptionStrategy
 from pageindex_mutil.agentic.verifier import CRAGVerifier
 
 
@@ -100,22 +98,6 @@ class TestRetrieveModelWiringPageIndexClient:
         planner = RetrievalPlanner(model="m", retrieve_model=None)
         with patch.object(planner_mod, "llm_acompletion", return_value='{"query_type":"factual","hyde_answer":"","query_variants":[],"weights":{}}') as mock_llm:
             asyncio.run(planner.plan("q"))
-            assert mock_llm.call_args[0][0] == "m"
-
-    def test_description_strategy_uses_retrieve_model(self):
-        """strategies.py:87 fallback -> llm_completion(retrieve_model or model)."""
-        ds = DescriptionStrategy(model="m", retrieve_model="r-model")
-        ds._main_get_relevant = None  # force fallback branch
-        with patch.object(strategies_mod, "llm_completion", return_value='{"doc_ids":["d1"]}') as mock_llm:
-            ds.search("q", [{"doc_id": "d1", "doc_name": "n", "description": "d"}])
-            assert mock_llm.call_args[0][0] == "r-model"
-
-    def test_description_strategy_falls_back_to_model(self):
-        """NFR4: retrieve_model=None -> llm_completion(model)."""
-        ds = DescriptionStrategy(model="m", retrieve_model=None)
-        ds._main_get_relevant = None
-        with patch.object(strategies_mod, "llm_completion", return_value='{"doc_ids":["d1"]}') as mock_llm:
-            ds.search("q", [{"doc_id": "d1", "doc_name": "n", "description": "d"}])
             assert mock_llm.call_args[0][0] == "m"
 
     def test_verifier_uses_retrieve_model(self):

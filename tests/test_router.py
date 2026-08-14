@@ -72,12 +72,6 @@ planner_mod = importlib.util.module_from_spec(planner_spec)
 sys.modules["pageindex_mutil.agentic.planner"] = planner_mod
 planner_spec.loader.exec_module(planner_mod)
 
-# Pre-seed pageindex.agentic.strategies
-strategies_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.strategies", pageindex_path / "agentic" / "strategies.py")
-strategies_mod = importlib.util.module_from_spec(strategies_spec)
-sys.modules["pageindex_mutil.agentic.strategies"] = strategies_mod
-strategies_spec.loader.exec_module(strategies_mod)
-
 # Pre-seed pageindex.agentic.verifier
 verifier_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.verifier", pageindex_path / "agentic" / "verifier.py")
 verifier_mod = importlib.util.module_from_spec(verifier_spec)
@@ -98,30 +92,6 @@ router_spec.loader.exec_module(router_mod)
 AgenticRouter = router_mod.AgenticRouter
 
 
-class TestWeightedRRF:
-    def test_single_strategy(self):
-        results = {"metadata": [("doc1", 1), ("doc2", 2)]}
-        weights = {"metadata": 1.0}
-        fused = AgenticRouter._weighted_rrf(results, weights)
-        assert len(fused) == 2
-        assert fused[0][0] == "doc1"
-        assert fused[0][1] > fused[1][1]
-
-    def test_multiple_strategies(self):
-        results = {
-            "metadata": [("doc1", 1)],
-            "semantics": [("doc1", 1), ("doc2", 1)],
-        }
-        weights = {"metadata": 1.0, "semantics": 1.5}
-        fused = AgenticRouter._weighted_rrf(results, weights)
-        assert len(fused) == 2
-        # doc1 appears in both, so it should score higher
-        assert fused[0][0] == "doc1"
-
-    def test_empty_results(self):
-        assert AgenticRouter._weighted_rrf({}, {}) == []
-
-
 @pytest.fixture
 def mock_client():
     client = MagicMock()
@@ -136,49 +106,6 @@ def mock_client():
 @pytest.fixture
 def router(mock_client):
     return AgenticRouter(mock_client, model="qwen-plus")
-
-
-class TestContentRankConversion:
-    """P0-Bug2: content 策略命中数必须转换为真实 rank 后再喂 RRF。"""
-
-    @pytest.mark.asyncio
-    async def test_content_results_are_ranks_not_hit_counts(self, router):
-        router.metadata_strategy.search = MagicMock(return_value=[])
-
-        match_a = [{"node_id": "nA", "keyword": "k", "context": "ctxA"}]
-        match_b = [{"node_id": "nB", "keyword": "k", "context": "ctxB"}]
-        router.content_strategy = MagicMock()
-        # ContentStrategy 保证按命中数降序返回 (doc_id, hit_count, matches)
-        router.content_strategy.search = MagicMock(
-            return_value=[("docA", 5, match_a), ("docB", 1, match_b)]
-        )
-
-        results, node_matches = await router._run_strategies(
-            "test query", [], {"content": 1.0}
-        )
-
-        # 必须是真实的 1-based rank（最优在前），而不是原始命中数
-        assert results["content"] == [("docA", 1), ("docB", 2)]
-        # node_matches 仍按 doc_id 携带匹配节点信息
-        assert node_matches == {"docA": match_a, "docB": match_b}
-
-    @pytest.mark.asyncio
-    async def test_fusion_ranks_more_hits_higher(self, router):
-        """端到端融合断言：命中更多的文档在 RRF 融合后排名更高。"""
-        router.metadata_strategy.search = MagicMock(return_value=[])
-        router.content_strategy = MagicMock()
-        router.content_strategy.search = MagicMock(
-            return_value=[
-                ("docA", 8, [{"node_id": "a"}]),
-                ("docB", 1, [{"node_id": "b"}]),
-            ]
-        )
-
-        results, _ = await router._run_strategies(
-            "test query", [], {"content": 1.0}
-        )
-        fused = AgenticRouter._weighted_rrf(results, {"content": 1.0})
-        assert [doc_id for doc_id, _ in fused] == ["docA", "docB"]
 
 
 class TestSearchSuperTree:
@@ -330,42 +257,32 @@ class TestSearchRouting:
         assert result["answer"] == "ans"
 
     @pytest.mark.asyncio
-    async def test_fallback_to_v2_on_super_tree_failure(self, router):
+    async def test_super_tree_failure_returns_graceful_empty(self, router):
+        """单链（[S4]/T13）：super_tree 异常 → 优雅空响应（不再回退 v2）。"""
         mock_st = MagicMock()
         mock_st.prefilter.side_effect = RuntimeError("prefilter failed")
         router.super_tree_index = mock_st
 
-        router._search_v2 = AsyncMock(return_value={
-            "query": "test query",
-            "mode": "multi",
-            "answer": "v2 answer",
-            "confidence": "high",
-            "matched_docs": [],
-            "selected_nodes": [],
-            "pages": [],
-        })
-
         result = await router.search("test query", top_k=3)
-        assert result["answer"] == "v2 answer"
-        router._search_v2.assert_awaited_once_with("test query", 3)
+
+        assert result["answer"] == (
+            "Router not available. Initialise PageIndexClient with db_path= to enable multi-document search."
+        )
+        assert result["confidence"] == "unknown"
+        assert result["matched_docs"] == []
 
     @pytest.mark.asyncio
-    async def test_uses_v2_when_no_super_tree(self, router):
+    async def test_no_super_tree_returns_graceful_empty(self, router):
+        """单链（[S4]/T13）：无 super_tree_index → 优雅空响应（不再回退 v2）。"""
         router.super_tree_index = None
 
-        router._search_v2 = AsyncMock(return_value={
-            "query": "test query",
-            "mode": "multi",
-            "answer": "v2 answer",
-            "confidence": "high",
-            "matched_docs": [],
-            "selected_nodes": [],
-            "pages": [],
-        })
-
         result = await router.search("test query", top_k=3)
-        assert result["answer"] == "v2 answer"
-        router._search_v2.assert_awaited_once_with("test query", 3)
+
+        assert result["answer"] == (
+            "Router not available. Initialise PageIndexClient with db_path= to enable multi-document search."
+        )
+        assert result["confidence"] == "unknown"
+        assert result["matched_docs"] == []
 
     @pytest.mark.asyncio
     async def test_single_chain_no_multi_hop_pre_gate(self, router):

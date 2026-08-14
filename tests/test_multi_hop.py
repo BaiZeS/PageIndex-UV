@@ -59,14 +59,6 @@ planner_mod = importlib.util.module_from_spec(planner_spec)
 sys.modules["pageindex_mutil.agentic.planner"] = planner_mod
 planner_spec.loader.exec_module(planner_mod)
 
-# Pre-seed pageindex.agentic.strategies
-strategies_spec = importlib.util.spec_from_file_location(
-    "pageindex_mutil.agentic.strategies", pageindex_path / "agentic" / "strategies.py"
-)
-strategies_mod = importlib.util.module_from_spec(strategies_spec)
-sys.modules["pageindex_mutil.agentic.strategies"] = strategies_mod
-strategies_spec.loader.exec_module(strategies_mod)
-
 # Pre-seed pageindex.agentic.verifier
 verifier_spec = importlib.util.spec_from_file_location(
     "pageindex_mutil.agentic.verifier", pageindex_path / "agentic" / "verifier.py"

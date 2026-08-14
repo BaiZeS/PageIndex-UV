@@ -188,7 +188,7 @@ class TestRecallNodesForDoc:
         assert [n["node_id"] for n in result["selected"]] == ["n1"]
 
     def test_matched_info_keyword_folded_into_evidence(self):
-        """v2 词面接地保全：ContentStrategy 命中词并入该节点关键词证据。"""
+        """词面接地保全：调用方 matched_info 命中词并入该节点关键词证据。"""
         router, _ = _router_with_doc([
             _node("n1", title="玩法总览", text="……"),
             _node("n2", title="其他", text="……"),
@@ -466,36 +466,6 @@ class TestSuperTreeMatchedScores:
         result = asyncio.run(router._search_super_tree("q", top_k=3))
         assert "Failed to retrieve content" in result["answer"]
         assert result["matched_docs"] == []
-
-    def test_v2_matched_keeps_fused_round_scores(self):
-        """v2 路径：round/fused 分数可用 → matched 沿用 RRF 融合分（形状不变）。"""
-        router, client = _router_with_doc([_node("n0")])
-        client.documents = {}  # 无文档也行——只验证 matched 构造来源
-
-        fused = [("docA", 0.0164), ("docB", 0.0082)]
-        with patch.object(router, "_run_strategies",
-                          AsyncMock(return_value=({}, {}))), \
-                patch.object(_router_mod().AgenticRouter, "_weighted_rrf",
-                             return_value=fused), \
-                patch.object(router, "_act_tree_search",
-                             AsyncMock(return_value=(
-                                 "ctx", [{"node_id": "n0"}], 1, 1,
-                                 {"docA": [1]}, [{"doc_id": "docA", "page": 1}],
-                             ))), \
-                patch.object(router, "_build_docs_info",
-                             return_value=[{"doc_id": "docA"}]), \
-                patch.object(router.planner, "plan",
-                             AsyncMock(return_value=_plan_result())), \
-                patch.object(router.verifier, "verify",
-                             return_value=MagicMock(action="answer")), \
-                patch.object(router, "_load_main_funcs",
-                             return_value={"generate_answer": lambda q, c: "a"}):
-            result = asyncio.run(router._search_v2("q", top_k=2))
-
-        assert result["matched_docs"] == [
-            {"doc_id": "docA", "score": 0.0164},
-            {"doc_id": "docB", "score": 0.0082},
-        ]
 
 
 class TestActTreeSearchScoresOut:

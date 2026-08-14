@@ -5,8 +5,6 @@ main.py (CLI) and pageindex_mutil (library). Both main.py and
 client.py/router.py import from this module instead of importing main.py.
 """
 
-import json
-
 from .utils import (
     extract_json,
     count_tokens,
@@ -122,57 +120,6 @@ def spans_from_nodes(nodes):
     return {"pages": pages, "lines": lines}
 
 
-def get_relevant_nodes(question, tree_json_str):
-    """Find relevant node IDs for a question using LLM.
-
-    Supports enhanced tree format with matched_keyword and matched_context fields.
-    """
-    prompt = f"""
-        You are given a question and a tree structure of a document.
-        Each node contains a node id, node title, and a corresponding summary.
-        Your task is to find all nodes that are likely to contain the answer to the question.
-
-        IMPORTANT: Some nodes may have "matched_keyword" and "matched_context" fields.
-        These indicate that the node contains content matching the query keywords.
-        Pay special attention to these nodes - they are highly likely to contain the answer.
-
-        Question: {question}
-
-        Document tree structure:
-        {tree_json_str}
-
-        Please reply in the following JSON format:
-        {{
-            "thinking": "<Your thinking process on which nodes are relevant to the question>",
-            "node_list": ["node_id_1", "node_id_2", "..."]
-        }}
-        Directly return the final JSON structure. Do not output anything else.
-        """
-    return _call_llm_json(prompt, extract_key='node_list')
-
-
-def get_relevant_pages(question, toc_text):
-    """Find relevant page numbers from TOC using LLM."""
-    prompt = f"""
-        You are an intelligent assistant.
-        I have a document with the following Table of Contents (TOC), which may include summaries for each section:
-
-        {toc_text}
-
-        The user has asked: "{question}"
-
-        Based on the TOC and summaries, which pages are most likely to contain the answer?
-        Reasoning about which section covers the topic.
-        Then return ONLY a JSON list of physical page numbers.
-        Format: [page_num1, page_num2, ...]
-        Example: [5, 6, 7]
-
-        If you are unsure, select the most relevant sections' pages.
-        """
-    pages = _call_llm_json(prompt, expect_list=True)
-    return [int(p) for p in pages if isinstance(p, (int, str)) and str(p).isdigit()]
-
-
 def extract_text_from_db(db, doc_id, pages):
     """Extract text content from DB for given pages."""
     rows = db.get_pages_by_numbers(doc_id, pages)
@@ -234,29 +181,6 @@ def build_context_with_budget(db, doc_id, pages, doc_name, remaining_tokens):
         used += page_tokens
 
     return "".join(parts), used, truncated
-
-
-def get_relevant_documents_for_multidoc(question, docs_info):
-    """Select top-K relevant documents from a list of doc metadata."""
-    prompt = f"""
-You are given a user question and a list of documents.
-Your task is to identify which documents are most likely to contain the answer.
-Select up to 3 most relevant documents.
-
-User Question: {question}
-
-Documents:
-{json.dumps(docs_info, indent=2, ensure_ascii=False)}
-
-Please reply in the following JSON format:
-{{
-    "thinking": "<brief reasoning>",
-    "doc_ids": ["doc_id_1", "doc_id_2", ...]
-}}
-Directly return the final JSON structure. Do not output anything else.
-If no documents seem relevant, return an empty list.
-"""
-    return _call_llm_json(prompt, extract_key='doc_ids')
 
 
 def build_context_for_doc(doc, selected_nodes, pages):

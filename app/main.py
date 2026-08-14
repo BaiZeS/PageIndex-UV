@@ -23,14 +23,7 @@ from pageindex_mutil.utils import (
 )
 from pageindex_mutil.reasoning import (
     _call_llm_json,
-    pages_from_nodes,
-    get_relevant_nodes,
-    get_relevant_pages,
-    extract_text_from_db,
     generate_answer,
-    build_context_with_budget,
-    get_relevant_documents_for_multidoc,
-    MAX_CONTEXT_TOKENS,
     MODEL_NAME,
     RETRIEVE_MODEL_NAME,
 )
@@ -49,14 +42,11 @@ load_dotenv()
 # single-document QA path hit exactly this 403 "Virtual key is disabled").
 configure_llm()
 
-# MODEL_NAME / RETRIEVE_MODEL_NAME / MAX_CONTEXT_TOKENS are now resolved
-# centrally in pageindex_mutil.reasoning and imported from there.
+# MODEL_NAME / RETRIEVE_MODEL_NAME are now resolved centrally in
+# pageindex_mutil.reasoning and imported from there.
 
 if not get_llm_config()[0]:
     print("Warning: API Key not found. Please set OPENAI_API_KEY or DASHSCOPE_API_KEY environment variable.")
-
-REASONING_TREE = 'tree'
-REASONING_TOC = 'toc_fallback'
 
 # Project root is one level up from app/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -295,27 +285,6 @@ def _index_files_batch(db_path, file_paths, results_dir):
     return any_new
 
 
-def _fallback_to_toc(question, toc_text, db, doc_id, log_f, selected_pdf_name, mode, node_ids):
-    pages = get_relevant_pages(question, toc_text)
-    if not pages:
-        print("Could not find relevant pages based on TOC.")
-        write_qa_log(log_f, {
-            "timestamp": datetime.now().isoformat(),
-            "document": selected_pdf_name,
-            "question": question,
-            "mode": mode,
-            "node_ids": node_ids,
-            "pages": [],
-            "answer": "",
-            "status": "no_pages"
-        })
-        return None, None
-    print(f"Identified relevant pages: {pages}")
-    print("Reading content...")
-    context = extract_text_from_db(db, doc_id, pages)
-    return pages, context
-
-
 # ---------------------------------------------------------------------------
 # Multi-document retrieval helpers
 # ---------------------------------------------------------------------------
@@ -349,101 +318,10 @@ def _build_multidoc_context(db):
 
 def answer_multidoc(question, db, docs_info, doc_lookup, doc_tree_json, log_f):
     """Execute one multi-document Q&A. Returns (answer, status_dict) or (None, None)."""
-    # L1: Document selection
-    print("\nThinking (Selecting relevant documents)...")
-    relevant_doc_ids = get_relevant_documents_for_multidoc(question, docs_info)
-    if not relevant_doc_ids:
-        print("No relevant documents found for this question.")
-        return None, {"status": "no_docs"}
-
-    relevant_docs = [doc_lookup[int(did)] for did in relevant_doc_ids if int(did) in doc_lookup]
-    if not relevant_docs:
-        print("No valid documents found after filtering.")
-        return None, {"status": "no_valid_docs"}
-
-    print(f"Selected {len(relevant_docs)} document(s): " + ", ".join([d['pdf_name'] for d in relevant_docs]))
-
-    # L2: Per-document node recall
-    all_selected_nodes = []
-    doc_nodes_map = {}
-    for doc in relevant_docs:
-        doc_id = doc['id']
-        tree_json_str = doc_tree_json.get(doc_id)
-        if not tree_json_str:
-            print(f"Skipping {doc['pdf_name']}: no cached tree structure.")
-            continue
-
-        print(f"Thinking (Nodes in {doc['pdf_name']})...")
-        node_ids = get_relevant_nodes(question, tree_json_str)
-        if not node_ids:
-            print(f"  No relevant nodes in {doc['pdf_name']}")
-            continue
-
-        node_ids = node_ids[:5]
-        selected_nodes = db.get_nodes_by_ids(doc_id, node_ids)
-        if selected_nodes:
-            doc_nodes_map[doc_id] = selected_nodes
-            all_selected_nodes.extend(selected_nodes)
-            print(f"  Found {len(selected_nodes)} node(s) in {doc['pdf_name']}")
-
-    # L3: Context extraction with token budget
-    context_parts = []
-    remaining_tokens = MAX_CONTEXT_TOKENS
-    overall_truncated = False
-    context_log = []
-
-    for doc in relevant_docs:
-        doc_id = doc['id']
-        selected_nodes = doc_nodes_map.get(doc_id, [])
-        if not selected_nodes:
-            continue
-
-        pages = pages_from_nodes(selected_nodes)
-        seen = set(pages)
-
-        if not pages:
-            continue
-
-        ctx_text, used, truncated = build_context_with_budget(
-            db, doc_id, pages, doc['pdf_name'], remaining_tokens
-        )
-        if ctx_text:
-            context_parts.append(ctx_text)
-            remaining_tokens -= used
-            context_log.append({
-                "doc_id": doc_id,
-                "doc_name": doc['pdf_name'],
-                "pages": sorted(seen),
-                "tokens": used,
-                "truncated": truncated
-            })
-        if truncated:
-            overall_truncated = True
-
-    if not context_parts:
-        print("No relevant context found in any document.")
-        return None, {"status": "no_context"}
-
-    full_context = "\n".join(context_parts)
-    if overall_truncated:
-        full_context += "\n\n[Note: Some content was truncated to fit context budget.]"
-
-    print("Generating answer...")
-    answer = generate_answer(question, full_context)
-
-    write_qa_log(log_f, {
-        "timestamp": datetime.now().isoformat(),
-        "mode": "multidoc",
-        "question": question,
-        "relevant_docs": [d['pdf_name'] for d in relevant_docs],
-        "relevant_doc_ids": relevant_doc_ids,
-        "truncated": overall_truncated,
-        "context_details": context_log,
-        "answer": answer,
-        "status": "ok"
-    })
-
-    return answer, {"status": "ok", "truncated": overall_truncated}
+    # 旧多文档手动 RAG（get_relevant_documents_for_multidoc/get_relevant_nodes）
+    # 随 P2 T13 删除，由库内单链（AgenticRouter 超树检索）取代——CLI 问答路径降级。
+    print("Multi-document manual RAG removed; use the library single-chain search instead.")
+    return None, {"status": "legacy_removed"}
 
 
 # ---------------------------------------------------------------------------
@@ -486,60 +364,10 @@ def index_pdf(db, pdf_path, json_path, selected_pdf_name):
 
 def answer_single_doc(question, db, doc_id, tree_json_str, toc_text, selected_pdf_name, log_f):
     """Execute one single-document Q&A. Returns answer string or None."""
-    print("\nThinking (Reasoning over tree)...")
-    mode = REASONING_TREE
-    selected_nodes = []
-    node_ids = get_relevant_nodes(question, tree_json_str)
-    if not node_ids:
-        print("Node reasoning failed. Falling back to TOC pages.")
-        mode = REASONING_TOC
-        pages, context = _fallback_to_toc(
-            question, toc_text, db, doc_id, log_f,
-            selected_pdf_name, mode, []
-        )
-        if context is None:
-            return None
-    else:
-        selected_nodes = db.get_nodes_by_ids(doc_id, node_ids)
-        if not selected_nodes:
-            print("No valid nodes found. Falling back to TOC pages.")
-            mode = REASONING_TOC
-            pages, context = _fallback_to_toc(
-                question, toc_text, db, doc_id, log_f,
-                selected_pdf_name, mode, node_ids
-            )
-            if context is None:
-                return None
-        else:
-            print("Identified relevant nodes:")
-            for node in selected_nodes:
-                print(f"- {node.get('title', 'Untitled')} (Pages: {node.get('start_index', '?')}-{node.get('end_index', '?')})")
-            pages = pages_from_nodes(selected_nodes)
-            print("Reading content...")
-            context = extract_text_from_db(db, doc_id, pages)
-
-    print("Generating answer...")
-    answer = generate_answer(question, context)
-    write_qa_log(log_f, {
-        "timestamp": datetime.now().isoformat(),
-        "document": selected_pdf_name,
-        "question": question,
-        "mode": mode,
-        "node_ids": node_ids,
-        "nodes": [
-            {
-                "node_id": node.get("node_id"),
-                "title": node.get("title"),
-                "start_index": node.get("start_index"),
-                "end_index": node.get("end_index")
-            } for node in selected_nodes
-        ],
-        "pages": pages,
-        "context": context,
-        "answer": answer,
-        "status": "ok"
-    })
-    return answer
+    # 旧单文档树推理（get_relevant_nodes / get_relevant_pages TOC 兜底）
+    # 随 P2 T13 删除，由库内单链（AgenticRouter 超树检索）取代——CLI 问答路径降级。
+    print("Single-document tree reasoning removed; use the library single-chain search instead.")
+    return None
 
 
 def _print_help():

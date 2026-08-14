@@ -117,28 +117,40 @@ class AgenticRecallLoop:
     ) -> Dict:
         """多轮召回主循环。
 
-        - first_round_fused: 调用方（_search_v2 expand 委派）已完成轮 1 时传入的
-          RRF 融合序 [(doc_id, score)]；None 时循环自行跑 Plan→Route 打轮 1。
+        - first_round_fused: 调用方（_search_super_tree expand 委派）已完成轮 1 时
+          传入的融合序 [(doc_id, score)]。**独立模式已退役（T13）**：本参数必须
+          非 None（否则返回优雅空响应，不再自行 Plan→Route——该路径依赖已删除的
+          策略层）。
         - first_round_ctx_state: 调用方轮 1 的 Act 产出（同轮产出形状）；与
           first_round_fused 同时给出 ⇒ 轮 1 视为已完成，以其 fused[:top_k] 为
           排除种子，从轮 2 继续。
-        - first_round_node_matches: 调用方 Route 阶段的内容策略节点命中信息
-          （_run_strategies 的 node_matches）；给出时承接为本循环的节点匹配，
-          供续接轮（≥2）的树搜索复用——否则续接轮以空 node_matches 召回，
-          节点召回弱化。默认 None ⇒ 维持独立调用方行为（自行 Route 或空）。
+        - first_round_node_matches: 调用方 Route 阶段的节点命中信息（续接轮复用）；
+          默认 None ⇒ 维持空（节点召回弱化）。兼容保留，续接轮可复用。
         - expand_need: [S8] 轮 1 由调用方完成时的 verifier 点名（VerifyResult.need）；
-          轮 ≥2 只补其中有效且未召回的 doc_id 对象。默认 None（独立模式：由本循环
-          轮 1 verify 后置入）。
+          轮 ≥2 只补其中有效且未召回的 doc_id 对象。
         """
         total_rounds = max(1, int(max_rounds or self.max_rounds))
         self._node_matches = first_round_node_matches if first_round_node_matches is not None else {}
 
-        if first_round_fused is not None:
-            fused = self._normalize_fused(first_round_fused)
-            start_round = 2 if first_round_ctx_state is not None else 1
-        else:
-            fused = await self._route(query)
-            start_round = 1
+        if first_round_fused is None:
+            # 独立模式退役（T13）：_route 依赖已删除的策略层
+            # （_build_docs_info/_run_strategies/_weighted_rrf），循环不再自行 Route。
+            # 调用方必须提供轮 1 融合序；否则返回优雅空响应（不抛）。
+            logging.info("[AgenticLoop] independent mode retired; first_round_fused required")
+            return {
+                "query": query,
+                "mode": "multi",
+                "answer": "未在语料中找到相关证据，无法作答。",
+                "confidence": "low",
+                "matched_docs": [],
+                "selected_nodes": [],
+                "pages": [],
+                "note": "独立模式已退役：调用方须提供 first_round_fused。",
+                "rounds_used": 0,
+            }
+
+        fused = self._normalize_fused(first_round_fused)
+        start_round = 2 if first_round_ctx_state is not None else 1
         score_map = {doc_id: score for doc_id, score in fused}
 
         # 轮 1 已完成时的排除种子：v2 轮 1 候选正是 fused[:top_k]
@@ -300,37 +312,6 @@ class AgenticRecallLoop:
             "doc_pages_map": doc_pages_map,
             "pages_with_text": pages_with_text,
         }
-
-    async def _route(self, query: str) -> List[Tuple[str, float]]:
-        """独立模式轮 1 的 Route：Plan → 轮内并发召回 → RRF（仅进入序）。
-
-        融合池只喂轮 1 的 fused[:top_k]；后续轮候选来自 verifier 点名（need），
-        不再对融合池切窗（[S8] 删除滑窗）。
-        """
-        router = self.router
-        try:
-            docs_info = router._build_docs_info()
-        except Exception as e:
-            logging.warning("[AgenticLoop] docs info failed: %s", e)
-            docs_info = []
-        if not docs_info:
-            return []
-        try:
-            plan = await router.planner.plan(query)
-            weights = dict(getattr(plan, "weights", None) or {})
-            queries = getattr(plan, "queries", None) or []
-            route_query = queries[0] if queries else query
-        except Exception as e:
-            logging.warning("[AgenticLoop] planner failed, default weights: %s", e)
-            weights = {"metadata": 0.15, "content": 0.35, "semantics": 0.3, "description": 0.2}
-            route_query = query
-        try:
-            results, node_matches = await router._run_strategies(route_query, docs_info, weights)
-        except Exception as e:
-            logging.warning("[AgenticLoop] strategies failed: %s", e)
-            return []
-        self._node_matches = node_matches or {}
-        return router._weighted_rrf(results, weights)
 
     # ------------------------------------------------------------------
     # best-effort（[7.6]）
