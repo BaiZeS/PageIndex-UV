@@ -615,18 +615,24 @@ class SuperTreeIndex:
         return lines
 
     def _build_doc_entries(self, query: str, db_ids: List[int],
-                           evidence_bundle: dict = None) -> List[dict]:
+                           evidence_bundle: dict = None,
+                           all_docs: List[dict] = None) -> List[dict]:
         """L1 候选呈现单元：文档名 + doc_summary(or doc_description) + 证据行。
 
         替换 _build_super_tree 的 top-nodes 结构（_build_super_tree 函数保留至
         T13 删除）与 _doc_evidence_lines 的 node_profiles 重算（证据束直通优先）。
         doc_summary 列尚不存在（T12 落库）——读 doc.get("doc_summary") 兜底
         doc_description，T12 落库后自动生效。
+
+        all_docs 由调用方一次取好传入（map-reduce 各组共用，避免每组重查
+        get_all_documents() SELECT *）；默认 None 时内部获取一次（单次挑选
+        或直接调用路径）。
         """
-        try:
-            all_docs = self.db.get_all_documents()
-        except Exception:
-            all_docs = []
+        if all_docs is None:
+            try:
+                all_docs = self.db.get_all_documents()
+            except Exception:
+                all_docs = []
         docs_by_id = {d["id"]: d for d in all_docs if isinstance(d, dict) and "id" in d}
         db_to_uuid = self._get_db_to_uuid()
 
@@ -756,7 +762,8 @@ class SuperTreeIndex:
         return reasons
 
     async def _holistic_select(self, query: str, db_ids: list[int],
-                               keep: int = None, evidence_bundle: dict = None):
+                               keep: int = None, evidence_bundle: dict = None,
+                               all_docs: List[dict] = None):
         """推理式整体挑选：LLM 从 db_ids 中挑选最相关的文档（可变数量，宁缺毋滥）。
 
         与独立打分不同，这里让 LLM 横向比较后"挑选"，只返回真正可能相关的文档，
@@ -772,7 +779,7 @@ class SuperTreeIndex:
         keep = keep or self._L1_SELECT_KEEP
         kb_identity = self.kb_identity.get_identity()
 
-        entries = self._build_doc_entries(query, db_ids, evidence_bundle)
+        entries = self._build_doc_entries(query, db_ids, evidence_bundle, all_docs=all_docs)
         entries = self._fit_budget(entries, kb_identity, query)
         doc_block = self._render_doc_block(entries)
 
@@ -847,9 +854,16 @@ class SuperTreeIndex:
         if not truncated:
             return [], {}
 
+        # 文档列表一次取好（map-reduce 各组共用，避免每组重查 get_all_documents()
+        # SELECT *；单次 select_documents 内只查一次）。
+        try:
+            all_docs = self.db.get_all_documents()
+        except Exception:
+            all_docs = []
+
         if len(truncated) <= self._REASON_GROUP_SIZE:
             selected_dbids, reasons = await self._holistic_select(
-                query, truncated, evidence_bundle=evidence_bundle)
+                query, truncated, evidence_bundle=evidence_bundle, all_docs=all_docs)
         else:
             groups = [
                 truncated[i:i + self._REASON_GROUP_SIZE]
@@ -857,26 +871,37 @@ class SuperTreeIndex:
             ]
             map_tasks = [
                 self._holistic_select(query, g, keep=self._REASON_KEEP_PER_GROUP,
-                                      evidence_bundle=evidence_bundle)
+                                      evidence_bundle=evidence_bundle,
+                                      all_docs=all_docs)
                 for g in groups
             ]
             map_results = await asyncio.gather(*map_tasks, return_exceptions=True)
             winners = []
+            merged_reasons: Dict[str, str] = {}
             for r in map_results:
+                selected, group_reasons = [], {}
                 if isinstance(r, tuple):
-                    r = r[0]
-                if isinstance(r, list):
-                    for db_id in r:
+                    selected, group_reasons = r
+                elif isinstance(r, list):
+                    selected = r
+                if isinstance(selected, list):
+                    for db_id in selected:
                         if db_id not in winners:
                             winners.append(db_id)
+                if isinstance(group_reasons, dict):
+                    merged_reasons.update(group_reasons)
             if not winners:
                 return [], {}
             if len(winners) <= self._L1_SELECT_KEEP:
                 selected_dbids = winners
-                reasons = {}
+                # 中间档位（2–3 组 ⇒ winners ≤ keep）无 reduce：聚合各组 reasons
+                # （仅 winners 内条目，键规范化复用 _normalize_reasons），
+                # 保住 L1→L2 trace（[S6]#7）。
+                reasons = self._normalize_reasons(merged_reasons, winners)
             else:
                 selected_dbids, reasons = await self._holistic_select(
-                    query, winners, evidence_bundle=evidence_bundle)
+                    query, winners, evidence_bundle=evidence_bundle,
+                    all_docs=all_docs)
 
         db_to_uuid = self._get_db_to_uuid()
         selected_uuids = [db_to_uuid[d] for d in selected_dbids if d in db_to_uuid]

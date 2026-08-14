@@ -697,6 +697,52 @@ class TestReasonsNormalization:
         assert selected == [1]
         assert reasons == {"uuid-a": "理由A"}  # uuid 键原样；未选的 uuid-b 被过滤
 
+    @pytest.mark.asyncio
+    async def test_map_reduce_mid_tier_reasons_aggregated(self, super_tree_index):
+        """[S6]#7：11+ 候选 map-reduce 中间档位（winners ≤ keep、无 reduce）
+        各组 reasons 必须聚合下传，绝不因 no-reduce 路径丢失 L1→L2 trace。"""
+        st, db, client = super_tree_index
+        st._REASON_GROUP_SIZE = 4  # 11 候选 → 3 组 [4,4,3]，每组 3 winners ≤ 10 → no-reduce
+        docs = {f"uuid-{i}": i for i in range(1, 12)}
+        client.documents = {u: {"id": u} for u in docs}
+        client._uuid_to_db = dict(docs)
+        for i in range(1, 12):
+            db.insert_document(f"doc{i}.pdf", f"/tmp/{i}.pdf")
+
+        # mock LLM 按 prompt 子串识别组别，各自返回 doc_ids + reasons（并发下
+        # 与组序解耦，避免 side_effect 列表依赖 gather 调度顺序）。识别键取各组
+        # 末位候选的 doc_id uuid：既不出现在 prompt 结尾示例 JSON（占位 uuid-1/
+        # uuid-2），也不出现在 kb_identity（只列文档名，不含 uuid）。
+        def _group_response(prompt):
+            if "uuid-4" in prompt:
+                return json.dumps({"doc_ids": ["uuid-1", "uuid-2"],
+                                   "reasons": {"uuid-1": "理由1", "uuid-2": "理由2"}})
+            if "uuid-8" in prompt:
+                return json.dumps({"doc_ids": ["uuid-5"],
+                                   "reasons": {"uuid-5": "理由5"}})
+            if "uuid-11" in prompt:
+                return json.dumps({"doc_ids": ["uuid-9", "uuid-10"],
+                                   "reasons": {"uuid-9": "理由9", "uuid-10": "理由10"}})
+            return json.dumps({"doc_ids": []})
+
+        async def fake_llm(model, prompt, **kw):
+            return _group_response(prompt)
+
+        # sys.modules stub 陷阱：test_router.py 导入期会再次 clobber
+        # sys.modules["pageindex_mutil.super_tree"] 为它自己的 stub 模块，故不能按
+        # sys.modules[Cls.__module__] 反查（会拿到错误模块对象打空）。须直接打在本
+        # 文件持有的 super_tree_mod（类方法 globals 真正所属的模块）上。
+        with patch.object(super_tree_mod, "llm_acompletion", side_effect=fake_llm):
+            result, reasons = await st.select_documents(
+                "test", {i: 1.0 for i in range(1, 12)})
+
+        assert set(result) == {"uuid-1", "uuid-2", "uuid-5", "uuid-9", "uuid-10"}
+        # 中间档位 no-reduce：各组 reasons 聚合，键已规范化 uuid，只含 winners 条目
+        assert reasons == {
+            "uuid-1": "理由1", "uuid-2": "理由2", "uuid-5": "理由5",
+            "uuid-9": "理由9", "uuid-10": "理由10",
+        }
+
 
 # ---------------------------------------------------------------------------
 # P2-Fix5: tag casefold consistency
