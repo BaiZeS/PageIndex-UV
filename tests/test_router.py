@@ -84,12 +84,51 @@ multi_hop_mod = importlib.util.module_from_spec(multi_hop_spec)
 sys.modules["pageindex_mutil.agentic.multi_hop"] = multi_hop_mod
 multi_hop_spec.loader.exec_module(multi_hop_mod)
 
+# Pre-seed pageindex.agentic.evidence（router._search_super_tree 惰性 `from .evidence import ...`）。
+# evidence.py 顶层仅 import logging，可安全 spec 加载（同 test_super_tree.py 的预置手法）。
+if "pageindex_mutil.agentic.evidence" not in sys.modules:
+    evidence_spec = importlib.util.spec_from_file_location(
+        "pageindex_mutil.agentic.evidence", pageindex_path / "agentic" / "evidence.py"
+    )
+    evidence_mod = importlib.util.module_from_spec(evidence_spec)
+    sys.modules["pageindex_mutil.agentic.evidence"] = evidence_mod
+    evidence_spec.loader.exec_module(evidence_mod)
+
 # Now load the router
 router_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.router", pageindex_path / "agentic" / "router.py")
 router_mod = importlib.util.module_from_spec(router_spec)
 sys.modules["pageindex_mutil.agentic.router"] = router_mod
 router_spec.loader.exec_module(router_mod)
 AgenticRouter = router_mod.AgenticRouter
+
+
+def _evidence_mod():
+    """返回当前 sys.modules 中的证据模块（跨测试文件重载后仍一致）。"""
+    m = sys.modules.get("pageindex_mutil.agentic.evidence")
+    if m is None:
+        evidence_spec = importlib.util.spec_from_file_location(
+            "pageindex_mutil.agentic.evidence", pageindex_path / "agentic" / "evidence.py"
+        )
+        m = importlib.util.module_from_spec(evidence_spec)
+        sys.modules["pageindex_mutil.agentic.evidence"] = m
+        evidence_spec.loader.exec_module(m)
+    return m
+
+
+def _bundle(entries):
+    """构造证据束 + 空 ctx（build_evidence_bundle patch 返回值）。"""
+    return (entries, {"tokens": [], "query_entities": []})
+
+
+@pytest.fixture(autouse=True)
+def _ensure_utils_configloader():
+    """test_super_tree.py 收集期会把 sys.modules['pageindex_mutil.utils'] 换成无
+    ConfigLoader 的 stub——router._search_super_tree 惰性 `from ..utils import
+    ConfigLoader`（db 非 None 用例）需要它。运行期兜底注入真实 ConfigLoader。"""
+    utils_mod = sys.modules.get("pageindex_mutil.utils")
+    if utils_mod is not None and not hasattr(utils_mod, "ConfigLoader"):
+        utils_mod.ConfigLoader = _real_utils_mod.ConfigLoader
+    yield
 
 
 @pytest.fixture
@@ -110,45 +149,69 @@ def router(mock_client):
 
 class TestSearchSuperTree:
     @pytest.mark.asyncio
-    async def test_prefilter_returns_empty(self, router):
+    async def test_empty_bundle_returns_graceful_empty(self, router):
+        """L0 证据束空 → 候选集空 → 优雅空响应（替代 prefilter 空语义）。"""
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {}
+        mock_st.select_documents = AsyncMock(return_value=([], {}))
         router.super_tree_index = mock_st
-
         result = await router._search_super_tree("test query", top_k=3)
-        assert result["answer"] == "No relevant documents found in prefilter."
+        assert result["answer"] == "No relevant documents found."
         assert result["confidence"] == "low"
-        mock_st.prefilter.assert_called_once_with("test query")
+
+    @pytest.mark.asyncio
+    async def test_candidate_set_derived_from_bundle(self, router):
+        """候选集 = bundle.keys() 派生（derive_evidence_score 作标量），不再走 prefilter。"""
+        mock_st = MagicMock()
+        mock_st.select_documents = AsyncMock(return_value=([], {}))
+        router.super_tree_index = mock_st
+        router.client.db = MagicMock()
+        router.client._id_mapper = None
+        router.client._uuid_to_db = {"u1": 1, "u2": 2}
+        bundle = {
+            1: {"channels": {"keyword": [{"token": "a"}], "tag": [], "entity": [], "vector": []}, "graph": {}},
+            2: {"channels": {"keyword": [], "tag": [{"text": "t"}], "entity": [], "vector": []}, "graph": {}},
+        }
+        with patch.object(_evidence_mod(), "build_evidence_bundle",
+                          return_value=_bundle(bundle)):
+            result = await router._search_super_tree("test query", top_k=3)
+        mock_st.select_documents.assert_awaited_once_with(
+            "test query", {1: 1.0, 2: 2.0}, evidence_bundle=bundle)
 
     @pytest.mark.asyncio
     async def test_select_documents_returns_empty(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {1: 2.0, 2: 1.0}
         mock_st.select_documents = AsyncMock(return_value=([], {}))
         router.super_tree_index = mock_st
-
-        result = await router._search_super_tree("test query", top_k=3)
+        router.client.db = MagicMock()
+        router.client._id_mapper = None
+        router.client._uuid_to_db = {"u1": 1, "u2": 2}
+        bundle = {
+            1: {"channels": {"keyword": [{"token": "a"}, {"token": "b"}], "tag": [], "entity": [], "vector": []}, "graph": {}},
+            2: {"channels": {"keyword": [], "tag": [{"text": "t"}], "entity": [], "vector": []}, "graph": {}},
+        }
+        with patch.object(_evidence_mod(), "build_evidence_bundle",
+                          return_value=_bundle(bundle)):
+            result = await router._search_super_tree("test query", top_k=3)
         assert result["answer"] == "Super-Tree selection returned no documents."
         assert result["confidence"] == "low"
-        mock_st.prefilter.assert_called_once_with("test query")
         mock_st.select_documents.assert_awaited_once_with(
-            "test query", {1: 2.0, 2: 1.0}, evidence_bundle={})
+            "test query", {1: 2.0, 2: 2.0}, evidence_bundle=bundle)
 
     @pytest.mark.asyncio
     async def test_full_super_tree_path(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {1: 1.0}
         mock_st.select_documents = AsyncMock(return_value=(["uuid-1"], {}))
         router.super_tree_index = mock_st
-
-        # Mock planner to avoid LLM call for HyDE
-        from pageindex_mutil.agentic.planner import PlanResult
-        router.planner.plan = AsyncMock(return_value=PlanResult(
-            queries=["test query"], weights={}, query_type="factual"
-        ))
+        router.client.db = MagicMock()
+        router.client._id_mapper = None
+        router.client._uuid_to_db = {"uuid-1": 1}
+        bundle = {
+            1: {"channels": {"keyword": [], "tag": [], "entity": [], "vector": []}, "graph": {}},
+        }
 
         # Mock _act_tree_search to return context（T6.4：回填证据派生分数）
-        async def fake_act(query, docs, node_matches=None, doc_scores_out=None):
+        async def fake_act(query, docs, node_matches=None, doc_scores_out=None,
+                           evidence_bundle=None, evidence_ctx=None):
             if doc_scores_out is not None:
                 # 节点召回覆盖度（evidence-derived，(0,1]）
                 doc_scores_out["uuid-1"] = 1.0
@@ -171,12 +234,13 @@ class TestSearchSuperTree:
         # Mock _load_main_funcs
         with patch.object(router, '_load_main_funcs', return_value={
             "generate_answer": lambda q, ctx: "test answer"
-        }):
+        }), patch.object(_evidence_mod(), "build_evidence_bundle",
+                         return_value=_bundle(bundle)):
             result = await router._search_super_tree("test query", top_k=3)
 
         assert result["answer"] == "test answer"
         assert result["confidence"] == "high"
-        # matched_docs score = 证据分（无 bundle 条目给 0），不再硬编码/覆盖度
+        # matched_docs score = 证据分（无命中给 0），不再硬编码/覆盖度
         assert result["matched_docs"] == [{"doc_id": "uuid-1", "score": 0.0}]
         assert len(result["selected_nodes"]) == 1
         assert result["selected_nodes"][0]["node_id"] == "n1"
@@ -187,13 +251,20 @@ class TestSearchSuperTree:
     @pytest.mark.asyncio
     async def test_act_phase_failure(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {1: 1.0}
         mock_st.select_documents = AsyncMock(return_value=(["uuid-1"], {}))
         router.super_tree_index = mock_st
+        router.client.db = MagicMock()
+        router.client._id_mapper = None
+        router.client._uuid_to_db = {"uuid-1": 1}
+        bundle = {
+            1: {"channels": {"keyword": [], "tag": [], "entity": [], "vector": []}, "graph": {}},
+        }
 
         router._act_tree_search = AsyncMock(side_effect=RuntimeError("boom"))
 
-        result = await router._search_super_tree("test query", top_k=3)
+        with patch.object(_evidence_mod(), "build_evidence_bundle",
+                          return_value=_bundle(bundle)):
+            result = await router._search_super_tree("test query", top_k=3)
         assert "Failed to retrieve content" in result["answer"]
         assert result["confidence"] == "unknown"
         # T6.4 score 语义统一：Act 失败无节点级证据接地 → 不虚报匹配
@@ -202,15 +273,14 @@ class TestSearchSuperTree:
     @pytest.mark.asyncio
     async def test_verifier_refuse(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {1: 1.0}
         mock_st.select_documents = AsyncMock(return_value=(["uuid-1"], {}))
         router.super_tree_index = mock_st
-
-        # Mock planner to avoid LLM call for HyDE
-        from pageindex_mutil.agentic.planner import PlanResult
-        router.planner.plan = AsyncMock(return_value=PlanResult(
-            queries=["test query"], weights={}, query_type="factual"
-        ))
+        router.client.db = MagicMock()
+        router.client._id_mapper = None
+        router.client._uuid_to_db = {"uuid-1": 1}
+        bundle = {
+            1: {"channels": {"keyword": [], "tag": [], "entity": [], "vector": []}, "graph": {}},
+        }
 
         router._act_tree_search = AsyncMock(return_value=(
             "some context",
@@ -225,7 +295,8 @@ class TestSearchSuperTree:
 
         with patch.object(router, '_load_main_funcs', return_value={
             "generate_answer": lambda q, ctx: "test answer"
-        }):
+        }), patch.object(_evidence_mod(), "build_evidence_bundle",
+                         return_value=_bundle(bundle)):
             result = await router._search_super_tree("test query", top_k=3)
 
         assert result["answer"] == "I don't know."
@@ -236,9 +307,14 @@ class TestSearchRouting:
     @pytest.mark.asyncio
     async def test_uses_super_tree_when_available(self, router):
         mock_st = MagicMock()
-        mock_st.prefilter.return_value = {1: 1.0}
         mock_st.select_documents = AsyncMock(return_value=(["uuid-1"], {}))
         router.super_tree_index = mock_st
+        router.client.db = MagicMock()
+        router.client._id_mapper = None
+        router.client._uuid_to_db = {"uuid-1": 1}
+        bundle = {
+            1: {"channels": {"keyword": [], "tag": [], "entity": [], "vector": []}, "graph": {}},
+        }
 
         router._act_tree_search = AsyncMock(return_value=(
             "ctx", [{"node_id": "n1", "title": "T"}], 1, 1, {"uuid-1": [1]},
@@ -251,7 +327,8 @@ class TestSearchRouting:
 
         with patch.object(router, '_load_main_funcs', return_value={
             "generate_answer": lambda q, ctx: "ans"
-        }):
+        }), patch.object(_evidence_mod(), "build_evidence_bundle",
+                         return_value=_bundle(bundle)):
             result = await router.search("test query", top_k=3)
 
         assert result["answer"] == "ans"
@@ -260,10 +337,18 @@ class TestSearchRouting:
     async def test_super_tree_failure_returns_graceful_empty(self, router):
         """单链（[S4]/T13）：super_tree 异常 → 优雅空响应（不再回退 v2）。"""
         mock_st = MagicMock()
-        mock_st.prefilter.side_effect = RuntimeError("prefilter failed")
+        mock_st.select_documents = AsyncMock(side_effect=RuntimeError("selection failed"))
         router.super_tree_index = mock_st
+        router.client.db = MagicMock()
+        router.client._id_mapper = None
+        router.client._uuid_to_db = {"uuid-1": 1}
+        bundle = {
+            1: {"channels": {"keyword": [], "tag": [], "entity": [], "vector": []}, "graph": {}},
+        }
 
-        result = await router.search("test query", top_k=3)
+        with patch.object(_evidence_mod(), "build_evidence_bundle",
+                          return_value=_bundle(bundle)):
+            result = await router.search("test query", top_k=3)
 
         assert result["answer"] == (
             "Router not available. Initialise PageIndexClient with db_path= to enable multi-document search."

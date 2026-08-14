@@ -243,7 +243,7 @@ async def test_single_doc_lexical_hit_end_to_end(tmp_path):
 @pytest.mark.asyncio
 async def test_single_doc_lexical_miss_returns_prefilter_empty(tmp_path):
     """(T8 审查/T13) 单文档词面未命中契约 [S4]：查询词不命中任何 doc_keywords →
-    统一链 L0 prefilter 空 → 优雅空响应（confidence low、matched_docs 空、不抛异常）。
+    统一链 L0 证据束空 → 优雅空响应（confidence low、matched_docs 空、不抛异常）。
     （旧 _content_fallback 正文 BM25 兜底已随 T13 删除。）"""
     client, _ = _single_doc_client(
         tmp_path, "操作手册.md", "",
@@ -263,7 +263,7 @@ async def test_single_doc_lexical_miss_returns_prefilter_empty(tmp_path):
             "query", "mode", "answer", "confidence",
             "matched_docs", "selected_nodes", "pages",
         }
-        # [S4]/T13 单链契约：prefilter 空 → 优雅空响应（不再走 content_fallback）
+        # [S4]/T13 单链契约：证据束空 → 优雅空响应（不再走 content_fallback）
         assert result["confidence"] == "low"
         assert result["matched_docs"] == []
         assert result["selected_nodes"] == []

@@ -118,7 +118,6 @@ def _make_mock_client(db=None):
     client._id_mapper = {}
     client._uuid_to_db = {}
     client.super_tree_index = MagicMock()
-    client.super_tree_index.prefilter.return_value = {}
     client.super_tree_index.select_documents = AsyncMock(return_value=[])
     return client
 

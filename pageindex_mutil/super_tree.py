@@ -133,7 +133,7 @@ import asyncio
 from .utils import llm_acompletion, count_tokens, extract_json
 
 class SuperTreeIndex:
-    """L0 dual-channel prefilter + L1 Super-Tree document selection."""
+    """L0 evidence bundle（见 agentic/evidence.py）+ L1 Super-Tree document selection."""
 
     # Defaults (overridden by config.yaml via _init_from_config)
     _MAX_CANDIDATE_DOCS = 50
@@ -212,71 +212,6 @@ class SuperTreeIndex:
     def on_document_removed(self, db_doc_id: int) -> None:
         self.keyword_index.remove_document(db_doc_id)
         self.kb_identity.invalidate()
-
-    # ------------------------------------------------------------------
-    # L0: Dual-channel prefilter
-    # ------------------------------------------------------------------
-    def prefilter(self, query: str) -> Dict[int, float]:
-        """Return candidate doc_ids with cumulative channel scores.
-
-        Channels:
-          A: ClosetIndex semantic tag matching
-          B: KeywordIndex inverted index
-          C: Vector search via ChromaDB — explicit opt-in enhancement only
-             ([S10]): NOT part of the tree-navigation main path, which is
-             strictly vectorless (jieba + closet_tags inverted). Active only
-             when a vector search_backend is configured (SEARCH_BACKEND=
-             hybrid/chroma; deployed default is keyword).
-          D: Entity graph matching
-        """
-        scores: Dict[int, float] = {}
-        topk = self._L0_CHANNEL_TOPK
-
-        # Channel A: tag matching (ClosetIndex)
-        if hasattr(self.client, "closet_index") and self.client.closet_index:
-            try:
-                tag_results = self.client.closet_index.search(query, top_k=topk)
-                for doc_id, score in tag_results:
-                    scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(score)
-            except Exception as e:
-                logging.warning("Tag matching failed: %s", e)
-
-        # Channel B: keyword inverted index
-        try:
-            keyword_results = self.keyword_index.search(query, top_k=topk)
-            for doc_id, score in keyword_results:
-                scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(score)
-        except Exception as e:
-            logging.warning("Keyword search failed: %s", e)
-
-        # Channel C: vector search (ChromaDB)
-        if hasattr(self.client, "search_backend") and self.client.search_backend:
-            try:
-                vector_results = self.client.search_backend.search(query, top_k=topk)
-                for doc_id, score in vector_results:
-                    # Weight vector results higher for semantic understanding
-                    scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(score) * 1.5
-            except Exception as e:
-                logging.warning("Vector search failed in prefilter: %s", e)
-
-        # Channel D: entity graph matching
-        if hasattr(self.client, "db") and self.client.db:
-            try:
-                entities = self.client.db.search_entities(query, limit=topk)
-                for entity in entities:
-                    entity_id = entity.get("id")
-                    if entity_id:
-                        # Find documents mentioning this entity
-                        mentions = self.client.db.get_entity_documents(entity_id)
-                        for mention in mentions:
-                            doc_id = mention.get("id")
-                            if doc_id:
-                                mention_conf = mention.get("confidence", 0.5)
-                                scores[int(doc_id)] = scores.get(int(doc_id), 0.0) + float(mention_conf)
-            except Exception as e:
-                logging.warning("Entity graph search failed in prefilter: %s", e)
-
-        return scores
 
     def _truncate_candidates(self, scores: Dict[int, float]) -> list[int]:
         if len(scores) <= self._MAX_CANDIDATE_DOCS:

@@ -184,19 +184,6 @@ def super_tree_index():
 
 
 class TestSuperTreeIndex:
-    def test_prefilter_empty_db(self, super_tree_index):
-        st, db, client = super_tree_index
-        result = st.prefilter("前端")
-        assert result == {}
-
-    def test_prefilter_with_keyword_match(self, super_tree_index):
-        st, db, client = super_tree_index
-        doc_id = db.insert_document("前端脚本.pdf", "/tmp/test.pdf",
-                                     doc_description="前端开发指南")
-        st.on_document_added(doc_id)
-        result = st.prefilter("前端")
-        assert doc_id in result
-
     def test_on_document_added_updates_keyword_index(self, super_tree_index):
         st, db, client = super_tree_index
         doc_id = db.insert_document("test.pdf", "/tmp/test.pdf")

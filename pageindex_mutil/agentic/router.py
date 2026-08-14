@@ -198,6 +198,7 @@ class AgenticRouter:
         doc_scores_out: Dict[str, float] = None,
         l1_reasons: Dict[str, str] = None,
         evidence_bundle: Dict = None,
+        evidence_ctx: Dict = None,
     ) -> Tuple[str, List[dict], int, int, Dict[str, List[int]], List[dict]]:
         """Act 阶段树搜索。doc_scores_out 非 None 时回填每篇召回成功文档的
         证据派生分数（节点召回覆盖度 (0,1]）——供调用方构造 matched_docs，
@@ -210,6 +211,10 @@ class AgenticRouter:
         主键改为 derive_evidence_score（次键 L1 裁定序/candidate_docs 顺序），
         与 matched_docs 同口径——保证支撑段可见，替代覆盖度分排序。None（v2 路径
         无证据束）时回退既有覆盖度分排序，保持既有调用方兼容。
+
+        evidence_ctx: [S5] 证据束上下文（{"tokens", "query_entities"}）。本任务只
+        留槽位、不消费（T3 才在方法体内提取并下传），避免 **act_kwargs 传入抛
+        TypeError。
         """
         funcs = self._load_main_funcs()
         spans_from_nodes = funcs.get("spans_from_nodes")
@@ -392,7 +397,7 @@ class AgenticRouter:
     # Super-Tree search
     # ------------------------------------------------------------------
     async def _search_super_tree(self, query: str, top_k: int = 3) -> Dict:
-        """L0 prefilter → L1 Super-Tree selection → L2/L3 Act → Verify.
+        """L0 证据束 → L1 Super-Tree selection → L2/L3 Act → Verify.
 
         CRAG expand 判定接入 AgenticRecallLoop（[S8] 点名扩召）：以本轮 L1 选中
         文档的证据分作为轮 1 融合序、本轮 Act 产出作为轮 1 上下文状态，续接轮只
@@ -400,56 +405,43 @@ class AgenticRouter:
         """
         logging.info("[SuperTree] query=%r top_k=%d", query, top_k)
 
-        # HyDE: generate hypothetical answer for query expansion
-        hyde_answer = None
-        try:
-            plan = await self.planner.plan(query)
-            if plan.queries and len(plan.queries) > 1:
-                hyde_answer = plan.queries[1]  # First variant after original query
-                logging.info("[SuperTree] HyDE answer=%r", hyde_answer)
-        except Exception as e:
-            logging.warning("[SuperTree] HyDE planning failed: %s", e)
+        # L0 = 证据束（[S5] prefilter 改造）：build_evidence_bundle 是唯一召回源，
+        # query tokens/entities/图谱距离一次计算全链引用。候选集 = bundle.keys()
+        # 派生（derive_evidence_score 作排序标量），替代独立 prefilter 四通道打分。
+        # HyDE 前置调用随 prefilter 一并移除（[S11]#1 / P2 审查 FOLLOWUP④）。
+        from .evidence import build_evidence_bundle, derive_evidence_score
+        db = getattr(self.client, "db", None)
+        bundle: dict = {}
+        evidence_ctx = None
+        if db is not None:
+            try:
+                from ..utils import ConfigLoader
+                cfg = ConfigLoader().load(None)
+                bundle, evidence_ctx = build_evidence_bundle(
+                    self.client, db, query,
+                    topk=getattr(cfg, "l0_channel_topk", 30),
+                )
+            except Exception as e:
+                logging.warning("[SuperTree] evidence bundle build failed: %s", e)
 
-        # L0: Dual-channel prefilter (with optional HyDE query expansion)
-        candidate_db_ids = self.super_tree_index.prefilter(query)
-
-        # If HyDE generated a different query, also run prefilter on it
-        if hyde_answer and hyde_answer != query:
-            hyde_scores = self.super_tree_index.prefilter(hyde_answer)
-            for doc_id, score in hyde_scores.items():
-                # Boost docs that match both original and HyDE queries
-                existing = candidate_db_ids.get(doc_id, 0.0)
-                candidate_db_ids[doc_id] = existing + score * 0.5
-
+        candidate_db_ids = {
+            db_id: derive_evidence_score(entry)
+            for db_id, entry in bundle.items()
+        }
         logging.info("[SuperTree] L0 candidates=%d", len(candidate_db_ids))
 
         if not candidate_db_ids:
             return {
                 "query": query,
                 "mode": "multi",
-                "answer": "No relevant documents found in prefilter.",
+                "answer": "No relevant documents found.",
                 "confidence": "low",
                 "matched_docs": [],
                 "selected_nodes": [],
                 "pages": [],
             }
 
-        # L1: Super-Tree LLM selection（证据束生产端接线，[S6]#2）——build_evidence_bundle
-        # 消费 config cte_max_hop（evidence.py 内部读）/l0_channel_topk；bundle 直通
-        # select_documents → _select_documents_reasoning → _holistic_select。
-        bundle = {}
-        db = getattr(self.client, "db", None)
-        if db is not None:
-            try:
-                from .evidence import build_evidence_bundle
-                from ..utils import ConfigLoader
-                cfg = ConfigLoader().load(None)
-                bundle, _ = build_evidence_bundle(
-                    self.client, db, query,
-                    topk=getattr(cfg, "l0_channel_topk", 30),
-                )
-            except Exception as e:
-                logging.warning("[SuperTree] evidence bundle build failed: %s", e)
+        # L1: Super-Tree LLM selection——证据束直通（[S6]#2）。
         selected_uuids, l1_reasons = await self.super_tree_index.select_documents(
             query, candidate_db_ids, evidence_bundle=bundle)
         logging.info("[SuperTree] L1 selected=%d docs: %s", len(selected_uuids), selected_uuids)
@@ -475,6 +467,8 @@ class AgenticRouter:
         # 与既有调用方（v2 路径）行为一致。
         if bundle:
             act_kwargs["evidence_bundle"] = bundle
+        if evidence_ctx:
+            act_kwargs["evidence_ctx"] = evidence_ctx
         try:
             ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = await self._act_tree_search(
                 query, selected_uuids, **act_kwargs
