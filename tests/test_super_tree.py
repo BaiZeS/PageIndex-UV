@@ -395,7 +395,7 @@ class TestL1SelectKeep:
             mock_llm.return_value = json.dumps({"doc_ids": ["uuid-1"]})
             await st.select_documents("test", {i: 1.0 for i in range(1, 6)})
         prompt = mock_llm.call_args[0][1]
-        assert "最多 3 篇" in prompt  # keep 上限来自 l1_select_keep（非旧 _SELECT_TOP_K=5）
+        assert "最多 3 篇" in prompt  # keep 上限来自 l1_select_keep
 
 
 class TestBudgetNoPop:

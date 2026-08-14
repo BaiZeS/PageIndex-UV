@@ -136,27 +136,14 @@ class SuperTreeIndex:
     """L0 dual-channel prefilter + L1 Super-Tree document selection."""
 
     # Defaults (overridden by config.yaml via _init_from_config)
-    _MAX_TOP_NODES_PER_DOC = 8
     _MAX_CANDIDATE_DOCS = 50
     _MAX_SUPER_TREE_TOKENS = 6000
-    _SUMMARY_MAX_LEN = 100
-    _RANK_K = 12
-    _SELECT_TOP_K = 5
     _L1_SELECT_KEEP = 10  # L1 终选 keep 上限（对齐评测 R@10 口径，[S6]#6）
-    _SCORE_RATIO = 0.5
     # 三层重构-选择层：map-reduce 推理选择参数
     _REASON_GROUP_SIZE = 10   # 候选 <= 该值走单次整体挑选；否则分组 map-reduce
     _REASON_KEEP_PER_GROUP = 3  # map 阶段每组保留的篇数
     # 三层重构-L0：各通道召回 top-k（并集召回，宁多勿漏，精排交给选择层）
     _L0_CHANNEL_TOPK = 30
-    # 三层重构-层级：集合标签匹配的软路由加权（加性提升，绝不硬删候选）
-    _HIERARCHY_BOOST_WEIGHT = 1.0
-    # P2 量级自适应（[S5]）：档位文档数阈值（标定目标，可配置覆盖）
-    _SMALL_MAX_DOCS = 50     # 文档数 < 该值 → 小语料直连（跳过层级遍历）
-    _MASSIVE_MIN_DOCS = 500  # 文档数 >= 该值 → 海量层级树导航
-    # P2 语义树导航（[S6]）
-    _NARROW_LAYER_MAX = 16      # 兄弟数 <= 该值视为窄层：跳过信号排序直接进精挑
-    _ENTITY_BOOST_WEIGHT = 1.0  # 实体命中加权强度（图谱信号，[S6]②）
     # L1 预算守卫（[S6]#4）：先截短 doc_summary（最短 _DOC_SUMMARY_MIN_LEN），
     # 仍超才退化弱候选为一行"名称 + 证据摘要"（证据摘要截断上限）。
     _DOC_SUMMARY_MIN_LEN = 50
@@ -177,22 +164,12 @@ class SuperTreeIndex:
         try:
             from .utils import ConfigLoader
             cfg = ConfigLoader().load(None)
-            self._MAX_TOP_NODES_PER_DOC = getattr(cfg, "max_top_nodes_per_doc", self._MAX_TOP_NODES_PER_DOC)
             self._MAX_CANDIDATE_DOCS = getattr(cfg, "max_candidate_docs", self._MAX_CANDIDATE_DOCS)
             self._MAX_SUPER_TREE_TOKENS = getattr(cfg, "max_super_tree_tokens", self._MAX_SUPER_TREE_TOKENS)
-            self._SUMMARY_MAX_LEN = getattr(cfg, "summary_max_len", self._SUMMARY_MAX_LEN)
-            self._RANK_K = getattr(cfg, "rank_k", self._RANK_K)
-            self._SELECT_TOP_K = getattr(cfg, "select_top_k", self._SELECT_TOP_K)
             self._L1_SELECT_KEEP = getattr(cfg, "l1_select_keep", self._L1_SELECT_KEEP)
-            self._SCORE_RATIO = getattr(cfg, "score_ratio", self._SCORE_RATIO)
             self._REASON_GROUP_SIZE = getattr(cfg, "reason_group_size", self._REASON_GROUP_SIZE)
             self._REASON_KEEP_PER_GROUP = getattr(cfg, "reason_keep_per_group", self._REASON_KEEP_PER_GROUP)
             self._L0_CHANNEL_TOPK = getattr(cfg, "l0_channel_topk", self._L0_CHANNEL_TOPK)
-            self._HIERARCHY_BOOST_WEIGHT = getattr(cfg, "hierarchy_boost_weight", self._HIERARCHY_BOOST_WEIGHT)
-            self._SMALL_MAX_DOCS = getattr(cfg, "scale_small_max_docs", self._SMALL_MAX_DOCS)
-            self._MASSIVE_MIN_DOCS = getattr(cfg, "scale_massive_min_docs", self._MASSIVE_MIN_DOCS)
-            self._NARROW_LAYER_MAX = getattr(cfg, "narrow_layer_max", self._NARROW_LAYER_MAX)
-            self._ENTITY_BOOST_WEIGHT = getattr(cfg, "entity_boost_weight", self._ENTITY_BOOST_WEIGHT)
         except Exception:
             pass
 
