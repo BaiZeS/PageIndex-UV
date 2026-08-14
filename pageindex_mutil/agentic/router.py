@@ -933,6 +933,7 @@ class AgenticRouter:
         # （v.need）的 doc_id 对象，不再走融合序滑窗。轮 1（本次）的融合序与
         # 已召回文档作为排除种子传入，循环从轮 2 继续并返回最终响应。
         # fused 池已被轮 1 吃满（无更多文档可扩召）时保持原 medium 响应。
+        # guard 仅防止 fused 池已被轮 1 吃满时的无谓多轮；点名对象以 need 为准，可不在此池内。
         if v.action == "expand" and len(fused) > top_k:
             try:
                 from .recall_loop import AgenticRecallLoop

@@ -177,13 +177,10 @@ class AgenticRecallLoop:
                 candidates = [doc_id for doc_id, _ in fused[: max(0, int(top_k))]]
             else:
                 candidates = self._named_candidates(pending_need, retrieved)
-                if not candidates:
-                    # [S8] 无点名对象（need 空/无有效 doc_id/全已召回）→ 终止进 best_effort
-                    stop_reason = "no_target"
-                    break
 
+            # 无候选可召 → 终止进 best_effort。两种空窗：轮 1 融合池为空；
+            # 轮 ≥2 无点名对象（need 空/无有效 doc_id/全已召回，[S8]）。
             if not candidates:
-                # 轮 1 融合池为空：无候选可召 → best_effort
                 stop_reason = "no_target"
                 break
 
@@ -276,6 +273,12 @@ class AgenticRecallLoop:
             if not isinstance(item, dict):
                 continue
             doc_id = item.get("doc_id")
+            if not doc_id:
+                continue
+            # [Fix] verifier 的 _normalize_need 保留 doc_id 原样——LLM 可能回数字
+            # （如 "doc_id": 5），若不强转字符串，int 永不命中 str 集合 `retrieved`
+            # → 已召回文档被重复拉取，且 int 流入 _act_tree_search（List[str]）。
+            doc_id = str(doc_id)
             if not doc_id:
                 continue
             if doc_id in retrieved or doc_id in seen:

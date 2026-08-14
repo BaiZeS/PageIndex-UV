@@ -544,6 +544,20 @@ class TestHelperRobustness:
         ]
         assert named(need, retrieved={"d1"}) == ["d2", "d4"]
 
+    def test_named_candidates_coerces_numeric_doc_id_to_str(self):
+        """[Fix] LLM 回数字 doc_id（如 5）→ 强转字符串，避免 int 流入 List[str]，
+        且数字版与其字符串版（"5"）判重不重复召回。"""
+        named = _recall_loop_mod().AgenticRecallLoop._named_candidates
+        need = [
+            {"doc_id": 5, "reason": "缺该文档"},           # 数字 doc_id
+            {"doc_id": "5", "reason": "同一文档字符串版"},  # 强转后与上条判重
+            {"doc_id": "d7", "reason": "缺"},
+            {"doc_id": "", "reason": "空串跳过"},           # 空串跳过
+        ]
+        out = named(need, retrieved={"d1"})
+        assert out == ["5", "d7"]
+        assert all(isinstance(x, str) for x in out)
+
     def test_load_settings_tolerates_malformed_values(self, monkeypatch):
         """非法配置值逐字段回退默认——回归：不得从 __init__ 抛出。"""
         import pageindex_mutil.utils as utils_mod
