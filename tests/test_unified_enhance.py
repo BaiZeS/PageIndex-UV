@@ -1467,3 +1467,27 @@ class TestContentHitContexts:
                           "content_contexts": ["浴血值可以通过完成日常任务获得"]}}
         evidence = enh._assemble_evidence(["n1"], signals, {"n1": cand})
         assert "浴血值可以通过完成日常任务获得" in evidence
+
+    def test_enhance_wires_content_contexts_into_signals(self, monkeypatch):
+        """claim(b) 接线回归：正文命中 → node_signals 落 content_contexts（删接线即断特性）。"""
+        from pageindex_mutil.agentic import enhance as emod
+        enh = emod.UnifiedNodeEnhancement("m", retrieve_model="r")
+        captured = {}
+        real_assemble = enh._assemble_evidence
+
+        def spy_assemble(union, node_signals, cand_by_id):
+            captured["signals"] = node_signals
+            return real_assemble(union, node_signals, cand_by_id)
+
+        monkeypatch.setattr(enh, "_assemble_evidence", spy_assemble)
+        monkeypatch.setattr(
+            emod, "llm_completion",
+            lambda *a, **k: '{"selected_ids": ["n1"], "pool_concern": false, "concern_reason": ""}',
+        )
+        import asyncio
+        asyncio.run(enh.enhance_and_select(
+            "浴血",
+            [{"node_id": "n1", "title": "t", "summary": "s",
+              "text": "浴血值可以通过完成日常任务获得。"}],
+            {}, query_tokens=["浴血"]))
+        assert captured["signals"]["n1"].get("content_contexts")

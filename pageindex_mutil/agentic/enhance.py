@@ -284,7 +284,7 @@ class UnifiedNodeEnhancement:
             if m["tags"]:
                 lines.append("标签命中：" + "、".join(str(t) for t in m["tags"]))
             if m.get("content_contexts"):
-                lines.append("正文命中: " + "；".join(
+                lines.append("正文命中：" + "；".join(
                     c[:120] for c in m["content_contexts"][:2]
                 ))
             lines.append(f"摘要：{summary}")
