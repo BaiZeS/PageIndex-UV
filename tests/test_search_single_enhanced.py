@@ -23,7 +23,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 
 import pytest
 
@@ -571,16 +571,35 @@ class TestNFR4AndShape:
         assert ctor_calls == [("m-model", "r-model")]
 
     def test_response_shape_keys_unchanged_via_search_dispatch(self):
-        """[S4] 单链入口：client.search 不再为单文档短路 _search_single——
-        无 router 时返回 Router not available 兜底，响应形状键不变。"""
+        """[S4] 单链入口：client.search 单文档也走统一 router 链（super_tree 单链，
+        mock LLM），真实搜索返回的响应形状键完整（不再只测无 router 兜底）。"""
+        from pageindex_mutil.agentic.router import AgenticRouter
+        from pageindex_mutil.agentic.planner import PlanResult
+
         client = _client()
         _add_doc(client, [_node("n0", start_index=0, end_index=1)])
-        result = asyncio.run(client.search("q"))  # 单文档 → 统一链（无 router 兜底）
+
+        router = AgenticRouter(client, "m-model", retrieve_model="r-model")
+        router.super_tree_index = MagicMock()
+        router.super_tree_index.prefilter.return_value = {1: 1.0}
+        router.super_tree_index.select_documents = AsyncMock(return_value=["doc1"])
+        router.planner.plan = AsyncMock(return_value=PlanResult(
+            queries=["q"], weights={}, query_type="factual",
+        ))
+        router.verifier.verify = MagicMock(return_value=MagicMock(action="answer"))
+        client.router = router
+
+        with _patch_enhance_llm(return_value=_select_json(["n0"])), \
+                _patch_generate_answer("ANSWER"):
+            result = asyncio.run(client.search("q"))  # 单文档 → 统一 router 链
+
         assert set(result.keys()) == {
             "query", "mode", "answer", "confidence",
             "matched_docs", "selected_nodes", "pages",
         }
         assert result["mode"] == "multi"
+        assert result["answer"] == "ANSWER"
+        assert result["matched_docs"] == [{"doc_id": "doc1", "score": 1.0}]
 
 
 # ---------------------------------------------------------------------------

@@ -35,15 +35,24 @@ _real_utils_mod = importlib.util.module_from_spec(_real_utils_spec)
 _real_utils_spec.loader.exec_module(_real_utils_mod)
 utils_mod.strip_markdown_fence = _real_utils_mod.strip_markdown_fence
 
-# 补齐 page_index.py / page_index_md.py 等模块从 utils 导入的其余符号（stub 缺
-# generate_summaries_for_structure 等，触发 pageindex_mutil/__init__ 链导入时报
-# ImportError）。已 stub 的 llm_* / count_tokens / extract_json / strip_markdown_fence
+# 补齐 page_index.py / page_index_md.py / retrieve.py / client.py 等模块从 utils
+# 导入的其余符号（stub 缺 generate_summaries_for_structure 等，触发
+# pageindex_mutil/__init__ 链导入时报 ImportError）。显式逐名 setattr——不遍历
+# dir(_real_utils_mod)（那会把 logging/json/PyPDF2/openai 等导入的子模块一并拷进
+# stub，过宽）。已 stub 的 llm_* / count_tokens / extract_json / strip_markdown_fence
 # 保留不覆盖。
-for _name in dir(_real_utils_mod):
-    if _name.startswith("_"):
-        continue
-    if not hasattr(utils_mod, _name):
-        setattr(utils_mod, _name, getattr(_real_utils_mod, _name))
+for _name in (
+    "ConfigLoader", "JsonLogger",
+    "add_node_text", "add_preface_if_needed", "configure_llm",
+    "convert_page_to_int", "convert_physical_index_to_int",
+    "create_clean_structure_for_description", "create_node_mapping",
+    "format_structure", "generate_doc_description", "generate_node_summary",
+    "generate_summaries_for_structure", "get_json_content",
+    "get_number_of_pages", "get_page_tokens", "get_pdf_name",
+    "post_processing", "print_json", "print_toc",
+    "remove_fields", "remove_structure_text", "structure_to_list", "write_node_id",
+):
+    setattr(utils_mod, _name, getattr(_real_utils_mod, _name))
 
 # Pre-seed pageindex.closet_index for _STOPWORDS
 closet_spec = importlib.util.spec_from_file_location("pageindex_mutil.closet_index", pageindex_path / "closet_index.py")

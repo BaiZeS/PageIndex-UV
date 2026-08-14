@@ -319,6 +319,12 @@ class AgenticRouter:
         # page 跨度与 line 跨度皆空（无任何 locator）→ 无法接地取文本 → 拦截；
         # 有任一跨度即放行（PDF 凭 page、MD 凭 line，节点 text 直接组装）。
         if not spans["pages"] and not spans["lines"]:
+            # 零跨度可诊断痕迹：旧索引（T7 前落库、无 line_num/end_line）的 MD 文档
+            # 会被静默排除——落告警以便排查"选中了文档却无任何 locator"。
+            logging.warning(
+                "[Recall] doc=%s selected nodes yield no spans (legacy index?); dropped",
+                doc_id,
+            )
             return None
 
         # 相关度 = 召回覆盖度（selected / 全部候选节点），确定性 (0,1]，
