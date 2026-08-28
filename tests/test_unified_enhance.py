@@ -1491,3 +1491,85 @@ class TestContentHitContexts:
               "text": "浴血值可以通过完成日常任务获得。"}],
             {}, query_tokens=["浴血"]))
         assert captured["signals"]["n1"].get("content_contexts")
+
+
+# ===========================================================================
+# 18. T31.1 密度优先窗口：判别性证据段（多 token 密集）优先于泛化词首现位置
+# ===========================================================================
+
+
+class TestContentHitContextDensity:
+    """_content_hit_contexts 密度优先（#5/#8 诊断根因①修复）：
+    旧实现按 query token 顺序取前 2 个命中的 ±60 窗口——永远渲染最泛化词
+    （提升/自身）的窗口，判别性答案段（灭世双头龙/丸带句）从未进入证据。"""
+
+    def test_dense_window_beats_generic_first_position(self):
+        """泛化词早处散布、判别句晚处密集 → 第一段必须落判别句窗口。"""
+        tokens = ["提升", "自身", "攻击力", "灭世", "双头"]
+        generic = "提升自身属性的方式有很多，日常任务、帮会活动都可以提升自身能力。" * 3
+        dense = "某技能在攻击回合中会大幅提升攻击力，据说能够一次秒杀一头灭世双头龙。"
+        filler = "。" + "无关内容填充" * 40 + "。"
+        text = generic + filler + dense
+        ctxs = UnifiedNodeEnhancement._content_hit_contexts(tokens, text)
+        assert ctxs, "应至少返回一个窗口"
+        # 密集判别句含 灭世/双头（泛化词窗口不含）——密度优先的判别力所在
+        assert "灭世" in ctxs[0] and "双头" in ctxs[0], (
+            f"第一段应落判别句窗口，实际：{ctxs[0][:80]}"
+        )
+
+    def test_tie_break_longest_token_wins(self):
+        """同 distinct 数的平分窗口：锚点 token 最长者优先（稀有度代理，
+        防泛化短词堆密度）。"""
+        text = ("ab 出现一次。" + "填充" * 60 + "。cdef 也出现一次。更多填充内容" * 5)
+        ctxs = UnifiedNodeEnhancement._content_hit_contexts(["ab", "cdef"], text)
+        assert ctxs
+        assert "cdef" in ctxs[0], "平分时长 token 窗口应优先"
+
+    def test_tie_break_leftmost_when_equal(self):
+        """distinct 与最长 token 均平分 → 起点最左窗口优先（确定性）。"""
+        text = ("LEFT marker ab here。" + "填充" * 60 + "。RIGHT marker ab there。" + "尾部" * 40)
+        ctxs = UnifiedNodeEnhancement._content_hit_contexts(["ab"], text)
+        assert ctxs
+        assert "LEFT" in ctxs[0], "完全平分时最左窗口优先"
+
+    def test_second_window_disjoint_from_first(self):
+        """两个密集簇相距足够远 → 两段分别落两簇（保持 max_hits=2 上限）。"""
+        cluster1 = "alpha beta gamma 同现于第一簇"
+        cluster2 = "alpha beta gamma 同现于第二簇"
+        gap = "。" + "间隔填充" * 80 + "。"
+        text = cluster1 + gap + cluster2
+        ctxs = UnifiedNodeEnhancement._content_hit_contexts(
+            ["alpha", "beta", "gamma"], text)
+        assert 1 <= len(ctxs) <= 2
+        if len(ctxs) == 2:
+            # 第二段必须与第一段字符区间不重叠（各自含自己的簇标记）
+            assert "第一簇" in ctxs[0]
+            assert "第二簇" in ctxs[1]
+
+    def test_short_text_yields_single_window(self):
+        """所有命中都在一个窗口范围内 → 只出 1 段（无合法不重叠第二窗口）。"""
+        text = "甲乙丙丁 alpha beta gamma 戊己庚辛"
+        ctxs = UnifiedNodeEnhancement._content_hit_contexts(
+            ["alpha", "beta", "gamma"], text)
+        assert len(ctxs) == 1
+        assert "alpha" in ctxs[0]
+
+    def test_many_occurrences_bounded(self):
+        """锚点护栏：token 大量重复出现不失控（≤max_hits 段、不抛出）。"""
+        text = "重复token到处都是 " * 200 + "尾部 uniqueword 出现一次"
+        ctxs = UnifiedNodeEnhancement._content_hit_contexts(
+            ["token", "uniqueword"], text)
+        assert len(ctxs) <= 2
+
+    def test_casefold_length_mismatch_safe(self):
+        """casefold 长度漂移（ß→ss）不得因下标错位抛出/错切——回退安全匹配。"""
+        text = "前缀填充内容若干 " * 5 + "straße 灭世双头龙 结尾"
+        ctxs = UnifiedNodeEnhancement._content_hit_contexts(["灭世", "双头"], text)
+        assert ctxs and "灭世" in ctxs[0]
+
+    def test_defensive_inputs(self):
+        assert UnifiedNodeEnhancement._content_hit_contexts(["x"], None) == []
+        assert UnifiedNodeEnhancement._content_hit_contexts(["x"], "") == []
+        assert UnifiedNodeEnhancement._content_hit_contexts([], "text") == []
+        assert UnifiedNodeEnhancement._content_hit_contexts(["不存在词"], "文本内容") == []
+        assert UnifiedNodeEnhancement._content_hit_contexts(["a"], "a text") == []  # len<2 token

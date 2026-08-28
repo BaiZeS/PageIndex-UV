@@ -16,6 +16,7 @@ LLM 失效时不做启发式裁剪——放行证据（union 候选即选中）�
 import asyncio
 import json
 import logging
+from bisect import bisect_left, bisect_right
 
 from ..utils import llm_completion, extract_json
 from ..super_tree import KeywordIndex
@@ -43,10 +44,12 @@ _DEFAULT_EVIDENCE_MAX_CHARS = 6000
 # union 自然回池，该参数只抬高上限让延迟池节点重新可被 LLM 精挑。
 # 延迟分支与 force-all 全池分支共用该倍数：force-all 不放宽 cap 时，零信号候选
 # 会在全量准入后按分降序垫底、再次被截——全池重选退化为 pass-1，判据①救不到
-# 任何节点。单文档 _search_single / 多文档 _recall_nodes_for_doc 经
-# retry_on_pool_concern 共享；语料树逐层 _navigate_level 只用延迟分支
-# （簇节点无正文通道）。
+# 任何节点。多文档 _recall_nodes_for_doc 经 retry_on_pool_concern 使用
+# （语料树聚类构建已删，_navigate_level 不复存在）。
 POOL_CONCERN_RETRY_CAP_MULTIPLIER = 2
+
+# T31.1 密度优先窗口锚点护栏：单 token 最多收集的命中位置数（长章节成本上限）
+_MAX_ANCHORS_PER_TOKEN = 50
 
 
 def _coerce_cap(value):
@@ -150,22 +153,74 @@ class UnifiedNodeEnhancement:
 
     @staticmethod
     def _content_hit_contexts(query_tokens, text, window=60, max_hits=2):
-        """命中处上下文：query token 命中正文时取 ±window 字符窗口（casefold 定位，
-        首尾省略号），供 L2 证据渲染补知识盲区。防御：非字符串/空 → []。"""
+        """命中处上下文（token 密度优先，T31.1）：扫描全部命中锚点，选包含
+        **最多不同 query token** 的 ±window 字符窗口——判别性证据段（多 token
+        密集，如逐句匹配答案处）优先于泛化词首次命中位置。修复 #5/#8 判空
+        根因①：旧实现按 query token 顺序取前 2 个命中的首现窗口，渲染的永远
+        是最泛化词（提升/自身）的碎片，判别性窗口从未进入证据。
+
+        tie-break（确定性）：不同 token 数 > 窗口内最长锚点 token（稀有度
+        代理，防泛化 bigram 堆密度胜真句）> 起点最左。第 2 段与第 1 段字符
+        区间不重叠；无合法第二窗口则只出 1 段（max_hits 上限保持）。
+        护栏：单 token 命中位置数上限 _MAX_ANCHORS_PER_TOKEN（长章节成本）。
+        防御：非字符串/空/无命中 → []；casefold 长度漂移（ß→ss）回退大小写
+        敏感匹配，绝不因下标错位切片错位。
+        """
         if not isinstance(text, str) or not text or not query_tokens:
             return []
         t = text.casefold()
-        out = []
+        fold = len(t) == len(text)
+        if not fold:
+            # casefold 改变长度（ß→ss 等）：casefold 下标无法映射回原文，
+            # 回退大小写敏感匹配（罕见路径，宁少勿错）
+            t = text
+        # ① 收集锚点（每 token 上限 _MAX_ANCHORS_PER_TOKEN；find 自左向右，位置升序）
+        anchors = []  # (pos, token, end)
         for qt in query_tokens:
+            if not isinstance(qt, str) or len(qt) < 2:
+                continue
+            needle = qt.casefold() if fold else qt
+            start = 0
+            n = 0
+            while n < _MAX_ANCHORS_PER_TOKEN:
+                i = t.find(needle, start)
+                if i < 0:
+                    break
+                anchors.append((i, qt, i + len(needle)))
+                n += 1
+                start = i + 1
+        if not anchors:
+            return []
+        anchors.sort(key=lambda a: a[0])
+        positions = [a[0] for a in anchors]
+        # ② 逐锚点窗口密度：窗口 [pos-window, end+window]，锚点位置落入即计入
+        # （distinct 天然去重——嵌套 token 同 span 只按不同 token 计一次）
+        records = []  # (distinct, max_tok_len, pos, lo, hi)
+        for pos, _qt, end in anchors:
+            lo_a = bisect_left(positions, pos - window)
+            hi_a = bisect_right(positions, end + window)
+            distinct = set()
+            longest = 0
+            for j in range(lo_a, hi_a):
+                tok = anchors[j][1]
+                distinct.add(tok)
+                if len(tok) > longest:
+                    longest = len(tok)
+            records.append((
+                len(distinct), longest, pos,
+                max(0, pos - window), min(len(text), end + window),
+            ))
+        # ③ 排名：distinct 降序 > 最长 token 降序 > 起点最左（确定性）
+        records.sort(key=lambda r: (-r[0], -r[1], r[2]))
+        # ④ 选取互不重叠的前 max_hits 段（首尾省略号格式与旧实现一致）
+        out = []
+        chosen = []  # 已选区间 (lo, hi)
+        for _distinct, _longest, _pos, lo, hi in records:
             if len(out) >= max_hits:
                 break
-            if len(qt) < 2:
+            if any(lo < h and l < hi for l, h in chosen):
                 continue
-            i = t.find(qt)
-            if i < 0:
-                continue
-            lo = max(0, i - window)
-            hi = min(len(text), i + len(qt) + window)
+            chosen.append((lo, hi))
             s = text[lo:hi]
             prefix = "…" if lo > 0 else ""
             suffix = "…" if hi < len(text) else ""
