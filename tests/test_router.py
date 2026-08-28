@@ -371,16 +371,16 @@ class TestSearchRouting:
 
     @pytest.mark.asyncio
     async def test_single_chain_no_multi_hop_pre_gate(self, router):
-        """单链（[S4]）：search 不再走 multi_hop 前置门——super_tree_index 存在时
-        直接 _search_super_tree，multi_hop_reasoner.execute 不得被调用。"""
+        """单链（[S4]/T13/T31.3）：search 不走 multi_hop 前置门——super_tree_index
+        存在时直接 _search_super_tree；MultiHopReasoner 死实例化已删（结构性保证，
+        不再有 multi_hop_reasoner 属性可被误调）。"""
         router.super_tree_index = MagicMock()  # truthy → 走 super_tree 单链
-        router.multi_hop_reasoner.execute = AsyncMock(return_value={"answer": "hop"})
+        assert not hasattr(router, "multi_hop_reasoner")  # T31.3 死实例化删除守卫
         router._search_super_tree = AsyncMock(return_value={"answer": "super"})
 
         result = await router.search("q", top_k=3)
 
         assert result["answer"] == "super"
-        router.multi_hop_reasoner.execute.assert_not_awaited()
         router._search_super_tree.assert_awaited_once_with("q", 3)
 
 

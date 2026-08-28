@@ -5,7 +5,6 @@ from typing import List, Tuple, Dict
 from .planner import RetrievalPlanner
 from .recall_loop import _node_payload
 from .verifier import CRAGVerifier
-from .multi_hop import MultiHopReasoner
 from ..super_tree import SuperTreeIndex
 
 
@@ -18,7 +17,6 @@ class AgenticRouter:
         self.retrieve_model = retrieve_model
         self.planner = RetrievalPlanner(model, retrieve_model)
         self.verifier = CRAGVerifier(model, retrieve_model)
-        self.multi_hop_reasoner = MultiHopReasoner(model, retrieve_model)
         self._main_funcs = None
 
         self.super_tree_index = None
@@ -97,6 +95,8 @@ class AgenticRouter:
             resolve_query_entities,
             resolve_node_profiles,
             retry_on_pool_concern,
+            EMPTY_SELECTION_FALLBACK,
+            SELECTION_OFF_UNION,
         )
 
         mapping = create_node_mapping(structure)
@@ -159,9 +159,13 @@ class AgenticRouter:
         # [3.2.1] pool_concern 重选（至多一次，二选一分支）走共享助手：
         # ① 有被截候选 → 放宽 union 上限重选；② 无被截候选 → force-all 全池
         # 直通重选（同样放宽 cap，防零信号候选垫底再截）。详见 retry_on_pool_concern。
+        # T31.3：query_tokens/node_entities 与首选调用同源透传——重选路径不再
+        # 重复分词/实体回退 node_profiles。
         result = await retry_on_pool_concern(
             enhancer, result, query, candidates, profiles,
             query_entities=query_entities,
+            query_tokens=query_tokens,
+            node_entities=node_entities,
         )
 
         selected_ids = result["selected_ids"]
@@ -205,6 +209,10 @@ class AgenticRouter:
             "pages": pages,
             "lines": lines,
             "relevance_score": relevance_score,
+            # [S13] 空选保底（T31.2）诊断标记：本篇 L2 经保底放行（union 信号
+            # 最强子集）而非 LLM 精挑——消费方可观测、评测可统计。
+            "l2_fallback": result.get("concern_reason") in (
+                EMPTY_SELECTION_FALLBACK, SELECTION_OFF_UNION),
         }
 
     async def _act_tree_search(
@@ -548,7 +556,9 @@ class AgenticRouter:
 
         # matched_docs score = 证据分（derive_evidence_score，通道命中加权标量；
         # 无 bundle 条目给 0），同分按 selected_uuids 顺序（L1 裁定序）排列（[S6]#8）。
-        # 召回无果（LLM 精挑为空）的文档不进 matched（不虚报匹配，语义保持）。
+        # 召回无果（精挑选空且无保底——零信号护栏拦截 / pool_concern 重试后仍空）
+        # 的文档不进 matched（不虚报匹配）；[S13] 空选保底放行的文档进 matched
+        # （带证据分，l2_fallback 标记可观测）。
         id_mapper = getattr(self.client, "_id_mapper", None)
         if id_mapper is not None:
             uuid_to_db = dict(id_mapper.items())

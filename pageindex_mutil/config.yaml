@@ -52,6 +52,7 @@ node_keyword_topk: 5        # 节点签名显著词个数（TF-IDF top-K，[2.1]
 # P2 统一检索增强（UnifiedNodeEnhancement，[3.2]/[1.2]/[7.4]）
 union_max_candidates: 80    # union 候选安全上限（宽松可配 60–100，宁多勿漏）；超限多信号加权收缩，被截进延迟池
 evidence_max_chars: 6000    # 跨节点证据总字符预算；超限按证据强度退化最弱候选为"标题+摘要"一行
+empty_fallback_topk: 8      # [S13] 空选保底（局部复归）：合法空选放行 union 信号最强 top-k（对齐 l1_select_keep/R@10 口径）
 l1_select_keep: 10            # L1 终选 keep 上限（对齐评测 R@10 口径）
 verifier_context_chars: 8000  # verifier 上下文预算（字符），替代硬编码 2000
 cte_max_hop: 3                # 图谱递归 CTE 最大跳数

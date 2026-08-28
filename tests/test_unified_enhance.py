@@ -524,8 +524,9 @@ class TestSelectParsing:
         # 去重 + 未知 id 过滤，保留 LLM 给出的相对顺序
         assert result["selected_ids"] == ["n1", "n0"]
 
-    def test_empty_selection_is_valid_not_degradation(self):
-        """宁缺毋滥：LLM 明确一个都不选是合法结果，不是失效降级。"""
+    def test_empty_selection_falls_back_to_union(self):
+        """[S13] 空选保底（局部复归，T31.2）：LLM 显式 [] 且无 pool_concern →
+        放行 union 信号最强子集作召回下限，不再是"合法空选丢弃整篇文档"。"""
         candidates = [_cand("n0")]
         profiles = {"n0": {"entities": [], "keywords": ["浴血"], "tags": []}}
         enh = _enhancer()
@@ -536,9 +537,9 @@ class TestSelectParsing:
             candidates=candidates,
             profiles=profiles,
         )
-        assert result["selected_ids"] == []
+        assert result["selected_ids"] == ["n0"]  # union 信号子集放行
         assert result["pool_concern"] is False
-        assert result["concern_reason"] == ""  # 不是 llm_unavailable
+        assert result["concern_reason"] == "empty_selection_fallback"  # 过裁标记（非 llm_unavailable）
 
     def test_empty_candidates_short_circuits(self):
         enh = _enhancer()
@@ -1278,11 +1279,13 @@ class TestRetryOnPoolConcern:
 
         async def fake_select(query, candidates, profiles, query_entities=None,
                               node_budget=None, token_budget=None, max_candidates=None,
-                              force_all_candidates=False):
+                              force_all_candidates=False, l1_reasons=None,
+                              query_tokens=None, node_entities=None):
             calls.append({
                 "query": query, "candidates": candidates, "profiles": profiles,
                 "query_entities": query_entities, "max_candidates": max_candidates,
                 "force_all_candidates": force_all_candidates,
+                "query_tokens": query_tokens, "node_entities": node_entities,
             })
             return canned[len(calls) - 1]
 
@@ -1573,3 +1576,158 @@ class TestContentHitContextDensity:
         assert UnifiedNodeEnhancement._content_hit_contexts([], "text") == []
         assert UnifiedNodeEnhancement._content_hit_contexts(["不存在词"], "文本内容") == []
         assert UnifiedNodeEnhancement._content_hit_contexts(["a"], "a text") == []  # len<2 token
+
+
+# ===========================================================================
+# 19. T31.2 [S13] 空选保底（局部复归）：合法空选放行 union 信号最强子集
+# ===========================================================================
+
+
+class TestEmptySelectionFallback:
+    """修复 B：合法空选（selected 最终为空且 pool_concern=False）→ 放行 union
+    按 (score 降序, pos 升序) top-k 作召回下限。区分两种空因；零信号护栏。"""
+
+    def _profiles(self):
+        return {
+            "n1": {"entities": [], "keywords": ["浴血"], "tags": []},      # score 1
+            "n2": {"entities": [{"name": "张三", "type": "person"}], "keywords": [], "tags": []},  # 3
+            "n3": {"entities": [], "keywords": [], "tags": ["游戏机制"]},  # 2
+        }
+
+    def test_explicit_empty_falls_back_score_ordered(self):
+        """LLM 显式 [] → union 按分数降序放行，concern_reason=empty_selection_fallback。"""
+        enh = _enhancer()
+        result, _ = _select_call(
+            enh,
+            return_value=_resp([]),
+            query="浴血 游戏机制",
+            candidates=[_cand("n1"), _cand("n2"), _cand("n3")],
+            profiles=self._profiles(),
+            query_entities=["张三"],
+        )
+        assert result["selected_ids"] == ["n2", "n3", "n1"]  # 3.0 > 2.0 > 1.0
+        assert result["concern_reason"] == "empty_selection_fallback"
+        assert result["pool_concern"] is False
+
+    def test_fallback_topk_respects_config(self):
+        """empty_fallback_topk 截断：10 节点 union 只放行信号最强 top-3。"""
+        candidates = [_cand(f"n{i}") for i in range(10)]
+        profiles = {
+            f"n{i}": {"entities": [], "keywords": ["浴血"], "tags": []}
+            for i in range(10)
+        }
+        enh = _enhancer()
+        enh.empty_fallback_topk = 3
+        result, _ = _select_call(
+            enh,
+            return_value=_resp([]),
+            query="浴血",
+            candidates=candidates,
+            profiles=profiles,
+        )
+        assert result["selected_ids"] == ["n0", "n1", "n2"]  # 命中同分按输入序，截 3
+
+    def test_off_union_selection_distinct_marker(self):
+        """LLM 选了但全被 union 过滤（键位漂移）→ selection_off_union 标记。"""
+        enh = _enhancer()
+        result, _ = _select_call(
+            enh,
+            return_value=_resp(["ghost", "phantom"]),  # 全在 union 外
+            query="浴血 游戏机制",
+            candidates=[_cand("n1"), _cand("n2")],
+            profiles={
+                "n1": {"entities": [], "keywords": ["浴血"], "tags": []},      # 1
+                "n2": {"entities": [], "keywords": [], "tags": ["游戏机制"]},  # 2
+            },
+        )
+        assert result["selected_ids"] == ["n2", "n1"]  # 分数降序放行
+        assert result["concern_reason"] == "selection_off_union"
+
+    def test_zero_signal_union_keeps_empty(self):
+        """护栏：union 全零信号（零值泛滥直通）→ 维持空选——LLM 判空与零证据
+        互证，放行=注入无接地的目录头部节点，与保底初衷背离。"""
+        enh = _enhancer()
+        result, _ = _select_call(
+            enh,
+            return_value=_resp([]),
+            query="完全无关查询",  # 零信号：union=全量候选，全零分
+            candidates=[_cand("n0"), _cand("n1")],
+            profiles={},
+        )
+        assert result["selected_ids"] == []
+        assert result["concern_reason"] == ""  # 无 fallback 标记
+        assert result["pool_concern"] is False
+
+    def test_pool_concern_true_empty_not_fallback(self):
+        """pool_concern=True 的空选不经保底（retry_on_pool_concern 链路管）。"""
+        enh = _enhancer()
+        result, _ = _select_call(
+            enh,
+            return_value=_resp([], pool_concern=True, concern_reason="池子过窄"),
+            query="浴血",
+            candidates=[_cand("n0")],
+            profiles={"n0": {"entities": [], "keywords": ["浴血"], "tags": []}},
+        )
+        assert result["selected_ids"] == []
+        assert result["pool_concern"] is True
+        assert result["concern_reason"] == "池子过窄"
+
+
+# ===========================================================================
+# 20. T31.3 retry_on_pool_concern 透传 query 共享物（罕见路径不再重复分词/实体回退）
+# ===========================================================================
+
+
+class TestRetryForwardsQueryArtifacts:
+    def _spy_enhancer(self, captured):
+        from pageindex_mutil.agentic import enhance as emod
+        enh = emod.UnifiedNodeEnhancement("m", retrieve_model="r")
+
+        async def fake_eas(query, candidates, profiles, query_entities=None,
+                           query_tokens=None, node_budget=None, token_budget=None,
+                           max_candidates=None, force_all_candidates=False,
+                           l1_reasons=None, node_entities=None):
+            captured.append({
+                "query_tokens": query_tokens,
+                "node_entities": node_entities,
+                "max_candidates": max_candidates,
+                "force_all": force_all_candidates,
+            })
+            return {"selected_ids": ["n1"], "pool_concern": False,
+                    "concern_reason": "", "deferred": []}
+
+        enh.enhance_and_select = fake_eas
+        return enh
+
+    def test_retry_deferred_branch_forwards_artifacts(self):
+        from pageindex_mutil.agentic.enhance import retry_on_pool_concern
+        captured = []
+        enh = self._spy_enhancer(captured)
+        result = asyncio.run(retry_on_pool_concern(
+            enh,
+            {"selected_ids": [], "pool_concern": True, "concern_reason": "r",
+             "deferred": ["n2"]},
+            "查询", [_cand("n1")], {},
+            query_entities=["张三"], query_tokens=["查询", "词"],
+            node_entities={"n1": [{"name": "张三", "type": "person"}]},
+        ))
+        assert captured, "deferred 分支应触发重选"
+        assert captured[0]["query_tokens"] == ["查询", "词"]
+        assert captured[0]["node_entities"] == {"n1": [{"name": "张三", "type": "person"}]}
+        assert result["selected_ids"] == ["n1"]
+
+    def test_retry_force_all_branch_forwards_artifacts(self):
+        from pageindex_mutil.agentic.enhance import retry_on_pool_concern
+        captured = []
+        enh = self._spy_enhancer(captured)
+        asyncio.run(retry_on_pool_concern(
+            enh,
+            {"selected_ids": [], "pool_concern": True, "concern_reason": "r",
+             "deferred": []},
+            "查询", [_cand("n1")], {},
+            query_entities=["张三"], query_tokens=["查询", "词"],
+            node_entities={"n1": [{"name": "张三", "type": "person"}]},
+        ))
+        assert captured and captured[0]["force_all"] is True
+        assert captured[0]["query_tokens"] == ["查询", "词"]
+        assert captured[0]["node_entities"] == {"n1": [{"name": "张三", "type": "person"}]}

@@ -244,18 +244,19 @@ class TestRecallNodesForDoc:
         assert [n["node_id"] for n in result["selected"]] == ["n_rel"]
         assert result["selected"][0]["text"] == "浴血值可以通过日常任务获得。"
 
-    def test_keyword_fallback_removed_llm_sole_pruner(self):
-        """旧启发式关键词兜底已移除：LLM 精挑为空即无召回。
-
-        节点正文含查询词（旧 _keyword_select_nodes 会兜底选中），但签名零信号
-        全量送 LLM 后 LLM 判空 → None（LLM 唯一裁剪者，[7.7]）。
-        """
+    def test_llm_empty_selection_falls_back_to_union_floor(self):
+        """[S13] 空选保底（局部复归，T31.2）：旧启发式关键词兜底仍已移除（放行的
+        是 union 信号子集，非启发式选择），但 LLM 判空不再丢弃整篇文档——节点
+        正文含查询词（body_hits 有信号）时保底放行 union 召回下限（#5/#8 判空
+        根因②修复），l2_fallback 标记可观测。"""
         router, _ = _router_with_doc([
             _node("n1", title="无关节点", text="浴血值在这里出现但签名无记录。"),
         ])
         with _patch_enhance_llm(return_value=_select_json([])):
             result = asyncio.run(router._recall_nodes_for_doc("浴血值怎么获得", "doc1"))
-        assert result is None
+        assert result is not None  # 保底放行，不再 None
+        assert [n["node_id"] for n in result["selected"]] == ["n1"]  # union 信号子集
+        assert result["l2_fallback"] is True  # 保底标记（诊断可观测）
 
     def test_missing_doc_or_structure_returns_none(self):
         router, client = _router_with_doc([_node("n1")])

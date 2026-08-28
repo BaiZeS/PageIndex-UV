@@ -48,6 +48,10 @@ _DEFAULT_EVIDENCE_MAX_CHARS = 6000
 # （语料树聚类构建已删，_navigate_level 不复存在）。
 POOL_CONCERN_RETRY_CAP_MULTIPLIER = 2
 
+# [S13] 空选保底（局部复归，T31.2）：合法空选放行 union 时的 concern_reason 词汇
+EMPTY_SELECTION_FALLBACK = "empty_selection_fallback"  # LLM 显式 []（过裁）
+SELECTION_OFF_UNION = "selection_off_union"            # 选了但全被 union 过滤（键位漂移）
+_DEFAULT_EMPTY_FALLBACK_TOPK = 8
 # T31.1 密度优先窗口锚点护栏：单 token 最多收集的命中位置数（长章节成本上限）
 _MAX_ANCHORS_PER_TOKEN = 50
 
@@ -80,11 +84,13 @@ class UnifiedNodeEnhancement:
         self.retrieve_model = retrieve_model
         self.union_max_candidates = _DEFAULT_UNION_MAX_CANDIDATES
         self.evidence_max_chars = _DEFAULT_EVIDENCE_MAX_CHARS
+        self.empty_fallback_topk = _DEFAULT_EMPTY_FALLBACK_TOPK
         try:
             from ..utils import ConfigLoader
             cfg = ConfigLoader().load(None)
             self.union_max_candidates = int(getattr(cfg, "union_max_candidates", self.union_max_candidates))
             self.evidence_max_chars = int(getattr(cfg, "evidence_max_chars", self.evidence_max_chars))
+            self.empty_fallback_topk = int(getattr(cfg, "empty_fallback_topk", self.empty_fallback_topk))
         except Exception:
             pass
 
@@ -596,9 +602,39 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
             if sid in union_ids and sid not in seen:
                 seen.add(sid)
                 selected.append(sid)
+
+        pool_concern = self._to_bool(data.get("pool_concern", False))
+
+        # [S13] 空选保底（局部复归，T31.2）：合法空选（selected 最终为空且无
+        # pool_concern）不再让整篇文档被静默丢弃（#5/#8 判空根因②：退化空响应
+        # 零恢复）——放行 union 信号最强子集作召回下限。区分两种空因：LLM 显式
+        # []（过裁）vs 选了但全被 union 过滤（键位/格式漂移，更近 llm_unavailable
+        # 语义）。护栏：union 全零信号（零值泛滥直通场景）→ 维持空选——LLM 判空
+        # 与零证据互证，放行只会注入无接地的目录头部节点。pool_concern=True 的
+        # 空选不经此（retry_on_pool_concern 链路管，两分支互斥无循环）。
+        if not selected and not pool_concern and union:
+            if any(node_signals[nid]["score"] > 0 for nid in union):
+                topk = _coerce_cap(getattr(self, "empty_fallback_topk", None)) \
+                    or _DEFAULT_EMPTY_FALLBACK_TOPK
+                ordered = sorted(
+                    union,
+                    key=lambda nid: (-node_signals[nid]["score"],
+                                     node_signals[nid]["pos"]),
+                )
+                return {
+                    "selected_ids": ordered[:topk],
+                    "pool_concern": False,
+                    "concern_reason": (
+                        EMPTY_SELECTION_FALLBACK
+                        if not data["selected_ids"]
+                        else SELECTION_OFF_UNION
+                    ),
+                    "deferred": deferred,
+                }
+
         return {
             "selected_ids": selected,
-            "pool_concern": self._to_bool(data.get("pool_concern", False)),
+            "pool_concern": pool_concern,
             "concern_reason": str(data.get("concern_reason") or ""),
             "deferred": deferred,
         }
@@ -704,7 +740,8 @@ def resolve_node_profiles(db, db_doc_id, mapping) -> dict:
 
 
 async def retry_on_pool_concern(enhancer, result, query, candidates, profiles,
-                                query_entities=None) -> dict:
+                                query_entities=None, query_tokens=None,
+                                node_entities=None) -> dict:
     """[3.2.1] pool_concern 重选共享助手：至多一次重试，二选一互斥分支，杜绝循环。
 
     ① 存在被截候选 → 放宽 union 上限重选（候选/签名不变，被截候选经 union
@@ -716,8 +753,11 @@ async def retry_on_pool_concern(enhancer, result, query, candidates, profiles,
 
     无 pool_concern → 原样返回（零额外 LLM 调用）。重选后仍 pool_concern 也直接
     返回（接受结果，medium 语义由调用方决定）。候选/签名对象不做拷贝，与首选调用
-    保持同一引用。语料树逐层 _navigate_level 只用延迟分支（簇节点无正文通道），
-    不经本助手。
+    保持同一引用。
+
+    query_tokens/node_entities: [S7]/[S5] L0 证据束共享物（T31.3 透传）——与
+    首选调用同源，重选不再重复分词/实体回退 node_profiles；None 时行为与
+    之前完全一致。
     """
     if not result["pool_concern"]:
         return result
@@ -725,13 +765,15 @@ async def retry_on_pool_concern(enhancer, result, query, candidates, profiles,
         max(1, int(enhancer.union_max_candidates))
         * POOL_CONCERN_RETRY_CAP_MULTIPLIER
     )
+    common = dict(query_entities=query_entities, query_tokens=query_tokens,
+                  node_entities=node_entities)
     if result["deferred"]:
         return await enhancer.enhance_and_select(
-            query, candidates, profiles, query_entities=query_entities,
-            max_candidates=widened_cap,
+            query, candidates, profiles,
+            max_candidates=widened_cap, **common,
         )
     return await enhancer.enhance_and_select(
-        query, candidates, profiles, query_entities=query_entities,
+        query, candidates, profiles,
         max_candidates=widened_cap,
-        force_all_candidates=True,
+        force_all_candidates=True, **common,
     )
