@@ -178,7 +178,7 @@ search(query)
 **config 键迁移清单**：
 - 删除：`rank_k`、`score_ratio`、`select_top_k`（仅死代码 `_score_candidates`/终选 keep 使用，前者删除、后者被 `l1_select_keep` 取代）、`hierarchy_boost_weight`、`scale_small_max_docs`、`scale_massive_min_docs`、`narrow_layer_max`、`entity_boost_weight`（随 tier/navigate 删除）、`max_top_nodes_per_doc`、`summary_max_len`（仅 top-nodes 结构消费）。
 - 保留：`reason_group_size`、`reason_keep_per_group`、`l0_channel_topk`、`union_max_candidates`、`evidence_max_chars`、`agentic_*`（三道闸）、`node_keyword_topk`、`tau_*`；`max_super_tree_tokens` **重定义**为 L1 呈现预算（doc_summary + 证据块，[S6]#4 的 token 上限概念沿用此键）。
-- 新增：`l1_select_keep`（默认 10）、`verifier_context_chars`（默认 8000）、`cte_max_hop`（默认 3）。
+- 新增：`l1_select_keep`（默认 10）、`verifier_context_chars`（默认 8000）、`cte_max_hop`（默认 3）、`empty_fallback_topk`（默认 8，[S13] 局部复归空选保底放行上限，2026-08-28 P3.1）。
 
 ## [S11] 性能优化
 
@@ -203,6 +203,7 @@ search(query)
 ## [S13] 边界与未决
 
 - **决策契约**：只直通不约束。若 P2 评测数字不动（e4f919a 先例），重开契约讨论（保底席位/判空回退）。
+  - **[S13] 局部复归（2026-08-28，P3.1 baf3e26）**：P2 最终评测 mldr R@10=0.667 达标解除重开，但 #5/#8 判空诊断实证"退化空响应零恢复"（L0 rank1 + L1 命中 + L2 合法空选 → 整篇静默丢弃）。局部复归范围 = **仅 L2 合法空选保底**：LLM 返回合法 JSON 但 selected 为空且无 pool_concern 时，放行 union 信号最强 top-k（`empty_fallback_topk`，默认 8）作召回下限；双空因区分（`empty_selection_fallback` 显式过裁 / `selection_off_union` 键位漂移）+ 零信号护栏（union 全零分维持空选——LLM 判空与零证据互证）+ `l2_fallback` 独立布尔标记可观测。**不是全局保底约束**：L1 选档、L2 证据组装、verifier 裁决均维持"只直通"；pool_concern=True 的空选仍走 retry 链路不经保底。评测验证（P3.1 轮）：mldr R@10 88.9 / 空检索 2→0（判据 ≥5/6 实际 6/6 且全为 LLM 主动精挑，保底未触发——修复 A 密度优先窗口即已解案）。
 - **no-db 模式**：单链依赖 db（doc_keywords/实体图 CTE）；无 db 的 workspace-only 多文档维持现状（"Router not available"），不在本 spec 范围。
 - 方向6（骨架立即可搜 + 后台增强）撞 2026-08-10 "全量索引质量优先"拍板，未重拍，不在本 spec。
 - 方向9（CRAG/用户反馈回流索引）降级为观测回流，未定稿，不在本 spec。

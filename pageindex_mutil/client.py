@@ -215,9 +215,6 @@ class PageIndexClient:
         self._id_mapper = DocIdMapper()
         self._pending_enrichment: set[int] = set()
 
-        if self.workspace:
-            self._load_workspace()
-
         if db_path and PageIndexDB:
             self.db = PageIndexDB(db_path)
             self.closet_index = ClosetIndex(self.db, self.model, self.retrieve_model)
@@ -227,6 +224,15 @@ class PageIndexClient:
 
             # Initialize search backends (ChromaDB hybrid is required)
             self._init_search_backends(search_backend, vector_db_path)
+
+        # Warm start (index-cache enablement): load the existing workspace AFTER
+        # self.db is set. _load_workspace's db branch registers uuid<->db_id
+        # mappings (cfce7d4) and reloads tree_json — previously this ran BEFORE
+        # self.db assignment, leaving the mapping branch dead code: a reused
+        # workspace/db restarted into an empty id_mapper and every search
+        # returned "Super-Tree selection returned no documents".
+        if self.workspace:
+            self._load_workspace()
 
     @property
     def _uuid_to_db(self):

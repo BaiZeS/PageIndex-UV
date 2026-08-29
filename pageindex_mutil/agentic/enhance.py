@@ -16,7 +16,7 @@ LLM 失效时不做启发式裁剪——放行证据（union 候选即选中）�
 import asyncio
 import json
 import logging
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 
 from ..utils import llm_completion, extract_json
 from ..super_tree import KeywordIndex
@@ -203,8 +203,12 @@ class UnifiedNodeEnhancement:
         # （distinct 天然去重——嵌套 token 同 span 只按不同 token 计一次）
         records = []  # (distinct, max_tok_len, pos, lo, hi)
         for pos, _qt, end in anchors:
+            # 窗口 [pos-window, end+window)，锚点 pos 落入即计入。hi 侧用
+            # bisect_left（排他）：起点恰在 end+window 的锚点不在渲染切片
+            # text[lo:hi) 内，不得参与 distinct/tie-break（审查 Minor-3：
+            # 隐形 token 虚增密度）。
             lo_a = bisect_left(positions, pos - window)
-            hi_a = bisect_right(positions, end + window)
+            hi_a = bisect_left(positions, end + window)
             distinct = set()
             longest = 0
             for j in range(lo_a, hi_a):
@@ -621,6 +625,8 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
                     key=lambda nid: (-node_signals[nid]["score"],
                                      node_signals[nid]["pos"]),
                 )
+                # selection_fallback = 独立布尔标记（审查 Minor-2：concern_reason
+                # 原样透传模型文本，词汇判定可被 LLM 复述误标真实精挑）。
                 return {
                     "selected_ids": ordered[:topk],
                     "pool_concern": False,
@@ -630,6 +636,7 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
                         else SELECTION_OFF_UNION
                     ),
                     "deferred": deferred,
+                    "selection_fallback": True,
                 }
 
         return {
@@ -637,6 +644,7 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
             "pool_concern": pool_concern,
             "concern_reason": str(data.get("concern_reason") or ""),
             "deferred": deferred,
+            "selection_fallback": False,
         }
 
 

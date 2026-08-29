@@ -658,7 +658,9 @@ class TestAsyncAPIAndConfig:
             result = asyncio.run(
                 enh.enhance_and_select("q", [_cand("n0")], {})
             )
-        assert set(result.keys()) == {"selected_ids", "pool_concern", "concern_reason", "deferred"}
+        assert set(result.keys()) == {"selected_ids", "pool_concern",
+                                      "concern_reason", "deferred",
+                                      "selection_fallback"}
 
 
 # ===========================================================================
@@ -1570,6 +1572,22 @@ class TestContentHitContextDensity:
         ctxs = UnifiedNodeEnhancement._content_hit_contexts(["灭世", "双头"], text)
         assert ctxs and "灭世" in ctxs[0]
 
+    def test_boundary_anchor_not_counted_in_window(self):
+        """off-by-one 回归（审查 Minor-3）：起点恰在窗口右缘 end+window 的锚点
+        不在渲染切片 text[lo:hi) 内，不得参与 distinct/tie-break——否则隐形
+        token 虚增密度、可翻转窗口胜者。"""
+        # 甲乙@0（窗口 [0,62)）；丙丁@62 恰在边界（旧实现计入甲乙窗口 distinct）
+        head = "甲乙" + " filler " * 8  # 2 + 56 = 58 字符
+        pad = "x" * (62 - len(head))   # 补齐到 丙丁@62
+        far_cluster = "y" * 60 + "壬癸子丑"  # 远处真双 token 簇
+        text = head + pad + "丙丁" + far_cluster
+        ctxs = UnifiedNodeEnhancement._content_hit_contexts(
+            ["甲乙", "丙丁", "壬癸", "子丑"], text)
+        assert ctxs
+        # 修复后：甲乙窗 distinct=1（丙丁不越界计入）；远处 {壬癸,子丑} 簇
+        # distinct=2 胜出——第一段必须落远处簇而非被虚增的甲乙窗。
+        assert "壬癸" in ctxs[0], "边界锚点不得虚增甲乙窗密度改变胜者"
+
     def test_defensive_inputs(self):
         assert UnifiedNodeEnhancement._content_hit_contexts(["x"], None) == []
         assert UnifiedNodeEnhancement._content_hit_contexts(["x"], "") == []
@@ -1608,6 +1626,7 @@ class TestEmptySelectionFallback:
         assert result["selected_ids"] == ["n2", "n3", "n1"]  # 3.0 > 2.0 > 1.0
         assert result["concern_reason"] == "empty_selection_fallback"
         assert result["pool_concern"] is False
+        assert result["selection_fallback"] is True  # 独立布尔标记（Minor-2）
 
     def test_fallback_topk_respects_config(self):
         """empty_fallback_topk 截断：10 节点 union 只放行信号最强 top-3。"""

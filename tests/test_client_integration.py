@@ -43,6 +43,41 @@ class TestPageIndexClientSuperTree:
         assert client.super_tree_index is None
         assert client.router is None
 
+    def test_warm_restart_registers_uuid_db_mappings(self, tmp_path):
+        """Warm start（索引缓存使能前提）：既有 workspace+db 二次构造 PageIndexClient
+        必须注册 uuid↔db 映射并回载 tree_json——修复前 _load_workspace 先于 self.db
+        赋值执行，映射注册分支是死代码，重启后 L1 的 db_to_uuid 为空 → 检索恒返回
+        "Super-Tree selection returned no documents"（cfce7d4 意图被构造顺序废掉）。"""
+        sys.modules["PyPDF2"] = MagicMock()
+        from pageindex_mutil.client import PageIndexClient, META_INDEX
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        db_path = str(tmp_path / "pageindex.db")
+
+        # 造一个已索引状态：db 行（含 tree_json）+ workspace _meta.json 同名匹配
+        db = PageIndexDB(db_path)
+        db_doc_id = db.insert_document(pdf_name="warm.md", pdf_path="/tmp/warm.md")
+        tree = [{"node_id": "0000", "title": "章节", "nodes": []}]
+        db.update_document_tree(db_doc_id, json.dumps(tree, ensure_ascii=False))
+        doc_uuid = "11111111-2222-3333-4444-555555555555"
+        (workspace / META_INDEX).write_text(json.dumps({
+            doc_uuid: {"type": "md", "path": "/tmp/warm.md",
+                       "doc_name": "warm.md", "doc_description": "d"},
+        }, ensure_ascii=False), encoding="utf-8")
+
+        client = PageIndexClient(workspace=str(workspace), db_path=db_path)
+        try:
+            # 根因断言：uuid↔db 映射已注册（修复前为空）
+            assert client._id_mapper.to_db(doc_uuid) == db_doc_id
+            assert client.super_tree_index._get_db_to_uuid().get(db_doc_id) == doc_uuid
+            # tree_json 回载：结构就绪，检索链无需重建索引
+            doc = client.documents.get(doc_uuid)
+            assert doc is not None and doc.get("structure") == tree
+        finally:
+            client.close()
+            db.close()
+
     def test_on_document_added_called_during_index(self):
         """index() should call super_tree_index.on_document_added after DB insert."""
         sys.modules["PyPDF2"] = MagicMock()

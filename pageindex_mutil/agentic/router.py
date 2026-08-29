@@ -95,8 +95,6 @@ class AgenticRouter:
             resolve_query_entities,
             resolve_node_profiles,
             retry_on_pool_concern,
-            EMPTY_SELECTION_FALLBACK,
-            SELECTION_OFF_UNION,
         )
 
         mapping = create_node_mapping(structure)
@@ -210,9 +208,9 @@ class AgenticRouter:
             "lines": lines,
             "relevance_score": relevance_score,
             # [S13] 空选保底（T31.2）诊断标记：本篇 L2 经保底放行（union 信号
-            # 最强子集）而非 LLM 精挑——消费方可观测、评测可统计。
-            "l2_fallback": result.get("concern_reason") in (
-                EMPTY_SELECTION_FALLBACK, SELECTION_OFF_UNION),
+            # 最强子集）而非 LLM 精挑——消费方可观测、评测可统计。读 enhance 的
+            # 独立布尔（审查 Minor-2：不词汇判定 concern_reason，防模型复述误标）。
+            "l2_fallback": bool(result.get("selection_fallback")),
         }
 
     async def _act_tree_search(
