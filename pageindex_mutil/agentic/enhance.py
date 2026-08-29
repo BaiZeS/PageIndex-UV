@@ -473,9 +473,13 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
                     node_entities.get(raw_id/nid)（替代 prof["entities"] 重读）；
                     keywords/tags 仍来自 prof。None 时行为与之前完全一致。
         返回: {"selected_ids": [...], "pool_concern": bool,
-               "concern_reason": str, "deferred": [node_ids]}
+               "concern_reason": str, "deferred": [node_ids],
+               "selection_fallback": bool}
         """
-        empty = {"selected_ids": [], "pool_concern": False, "concern_reason": "", "deferred": []}
+        # selection_fallback 全路径统一 schema（快审 Minor-2）：仅 [S13] 空选
+        # 保底放行为 True；llm_unavailable 降级/无候选/正常精挑均 False。
+        empty = {"selected_ids": [], "pool_concern": False, "concern_reason": "",
+                 "deferred": [], "selection_fallback": False}
         if not candidates:
             return empty
         profiles = profiles or {}
@@ -590,12 +594,15 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
 
         data = extract_json(response) if isinstance(response, str) and response.strip() else {}
         if not isinstance(data, dict) or not isinstance(data.get("selected_ids"), list):
-            # [7.7] 降级：不做启发式裁剪，放行证据（union 候选即选中）
+            # [7.7] 降级：不做启发式裁剪，放行证据（union 候选即选中）。
+            # selection_fallback=False：这是 LLM 故障兜底（union 全放行），
+            # 非 [S13] 空选保底语义（concern_reason 词汇另行可观测）。
             return {
                 "selected_ids": list(union),
                 "pool_concern": False,
                 "concern_reason": "llm_unavailable",
                 "deferred": deferred,
+                "selection_fallback": False,
             }
 
         union_ids = set(union)

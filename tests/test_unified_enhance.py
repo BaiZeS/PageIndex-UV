@@ -546,7 +546,8 @@ class TestSelectParsing:
         with patch.object(enhance_mod, "llm_completion") as mock_llm:
             result = asyncio.run(enh.enhance_and_select("q", [], {}))
         assert result == {"selected_ids": [], "pool_concern": False,
-                          "concern_reason": "", "deferred": []}
+                          "concern_reason": "", "deferred": [],
+                          "selection_fallback": False}
         mock_llm.assert_not_called()  # 无候选不调 LLM
 
 
@@ -1573,14 +1574,15 @@ class TestContentHitContextDensity:
         assert ctxs and "灭世" in ctxs[0]
 
     def test_boundary_anchor_not_counted_in_window(self):
-        """off-by-one 回归（审查 Minor-3）：起点恰在窗口右缘 end+window 的锚点
-        不在渲染切片 text[lo:hi) 内，不得参与 distinct/tie-break——否则隐形
-        token 虚增密度、可翻转窗口胜者。"""
-        # 甲乙@0（窗口 [0,62)）；丙丁@62 恰在边界（旧实现计入甲乙窗口 distinct）
-        head = "甲乙" + " filler " * 8  # 2 + 56 = 58 字符
-        pad = "x" * (62 - len(head))   # 补齐到 丙丁@62
-        far_cluster = "y" * 60 + "壬癸子丑"  # 远处真双 token 簇
-        text = head + pad + "丙丁" + far_cluster
+        """off-by-one 回归（审查 Minor-3，快审复核构造）：起点恰在窗口右缘
+        end+window 的锚点不在渲染切片 text[lo:hi) 内，不得参与 distinct/
+        tie-break——否则隐形 token 虚增密度、可翻转窗口胜者。
+        构造（精确字符算术）：head = "甲乙"+"f"*60 → 长 62；甲乙@0 窗 [0,62)；
+        丙丁@62 **恰在右缘**（不在切片内）；壬癸@124（62+2+60）。
+        旧实现（bisect_right）：丙丁@62 计入甲乙窗（distinct 虚增 2），且壬癸@124
+        计入丙丁窗（distinct 3）→ ctx[0] 落丙丁窗（不含壬癸，错）；
+        新实现：甲乙/丙丁窗 distinct=1，壬癸窗含 {壬癸,子丑} distinct=2 胜出。"""
+        text = "甲乙" + "f" * 60 + "丙丁" + "y" * 60 + "壬癸子丑"
         ctxs = UnifiedNodeEnhancement._content_hit_contexts(
             ["甲乙", "丙丁", "壬癸", "子丑"], text)
         assert ctxs
