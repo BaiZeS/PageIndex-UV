@@ -19,19 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# NOTE: test_router.py (collected in the same full-suite run) pre-seeds
-# sys.modules with stub pageindex_mutil.* modules whose llm_completion/
-# llm_acompletion are no-op lambdas. We purge any pre-seeded pageindex_mutil
-# stubs at import time so our `from pageindex_mutil... import ...` resolves the
-# REAL modules. We then hold module-object references and patch via
-# `patch.object(module, ...)` (NOT string paths) so the patch always targets
-# the same module object the class under test references, regardless of any
-# later sys.modules mutation by other test files. This is a test-isolation guard
-# scoped to THIS file only.
-for _mod in list(sys.modules):
-    if _mod == "pageindex_mutil" or _mod.startswith("pageindex_mutil."):
-        del sys.modules[_mod]
-
+# T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
 import pageindex_mutil.closet_index as closet_index_mod
 import pageindex_mutil.super_tree as super_tree_mod
 import pageindex_mutil.agentic.planner as planner_mod

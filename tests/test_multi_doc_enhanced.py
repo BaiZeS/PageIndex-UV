@@ -24,12 +24,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# 测试隔离守卫（与 test_search_single_enhanced 同理）：收集期清理预置 stub 并
-# 干净加载；运行期由 _real_modules fixture 保证真实模块在场；patch 一律
-# patch.object(module, ...)（模块对象经惰性访问器取）。
-for _mod in list(sys.modules):
-    if _mod == "pageindex_mutil" or _mod.startswith("pageindex_mutil."):
-        del sys.modules[_mod]
+# T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
 sys.modules.setdefault("PyPDF2", MagicMock())  # client 链顶层导入 PyPDF2
 
 import pageindex_mutil.client  # noqa: F401  首次干净加载
@@ -37,14 +32,7 @@ import pageindex_mutil.client  # noqa: F401  首次干净加载
 
 @pytest.fixture(autouse=True)
 def _real_modules():
-    for _m in list(sys.modules):
-        if _m == "pageindex_mutil" or _m.startswith("pageindex_mutil."):
-            del sys.modules[_m]
-    import pageindex_mutil.client  # noqa: F401
-    import pageindex_mutil.agentic.enhance  # noqa: F401
-    import pageindex_mutil.agentic.router  # noqa: F401
-    import pageindex_mutil.agentic.multi_hop  # noqa: F401
-    import pageindex_mutil.reasoning  # noqa: F401
+    # T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
     yield
 
 

@@ -10,50 +10,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest
 from db import PageIndexDB
 
-# Avoid triggering __init__.py imports that pull in heavy deps like PyPDF2.
-super_tree_path = Path(__file__).parent.parent / "pageindex_mutil"
-sys.path.insert(0, str(super_tree_path))
+# T32.1 真实 import：包 __init__ 已 PEP 562 惰性化，`import pageindex_mutil` 零重依赖。
+# 历史的 spec_from_file_location 预置桩机器（utils stub + closet + super_tree
+# 逐个 spec 加载——正是它把 sys.modules['pageindex_mutil.utils'] 换成 stub、
+# 污染其他测试文件，迫使 test_router 等长出 _ensure_utils_configloader 等
+# 规避手法）整体退役。
+import pageindex_mutil.super_tree as super_tree_mod
 
-# Make relative import in super_tree.py work by creating a fake package context.
-import importlib.util
-
-# Pre-seed pageindex.utils so closet_index.py won't fail on its own relative import.
-utils_spec = importlib.util.spec_from_file_location("pageindex_mutil.utils", super_tree_path / "utils.py")
-utils_mod = importlib.util.module_from_spec(utils_spec)
-sys.modules["pageindex_mutil.utils"] = utils_mod
-# utils.py may also have missing deps; stub out the names closet_index needs.
-utils_mod.llm_completion = lambda *a, **k: None
-async def _mock_llm_acompletion(*a, **k):
-    return None
-utils_mod.llm_acompletion = _mock_llm_acompletion
-utils_mod.count_tokens = lambda text, model=None: len(text or "") // 4
-def _mock_extract_json(text):
-    import json
-    try:
-        return json.loads(text)
-    except Exception:
-        return None
-utils_mod.extract_json = _mock_extract_json
-# Load the REAL strip_markdown_fence from utils.py source so FR3 tests exercise
-# the actual production logic (the function is pure, no heavy deps).
-_real_utils_spec = importlib.util.spec_from_file_location(
-    "_real_utils_strip", super_tree_path / "utils.py"
-)
-_real_utils_mod = importlib.util.module_from_spec(_real_utils_spec)
-_real_utils_spec.loader.exec_module(_real_utils_mod)
-utils_mod.strip_markdown_fence = _real_utils_mod.strip_markdown_fence
-
-# Also need pageindex.closet_index for the _STOPWORDS import.
-closet_spec = importlib.util.spec_from_file_location("pageindex_mutil.closet_index", super_tree_path / "closet_index.py")
-closet_mod = importlib.util.module_from_spec(closet_spec)
-sys.modules["pageindex_mutil.closet_index"] = closet_mod
-closet_spec.loader.exec_module(closet_mod)
-
-spec = importlib.util.spec_from_file_location("pageindex_mutil.super_tree", super_tree_path / "super_tree.py")
-super_tree_mod = importlib.util.module_from_spec(spec)
-sys.modules["pageindex_mutil.super_tree"] = super_tree_mod
-spec.loader.exec_module(super_tree_mod)
 KeywordIndex = super_tree_mod.KeywordIndex
+
 
 
 @pytest.fixture
@@ -260,16 +225,8 @@ class TestSuperTreeIndex:
 # L1 文档级证据接地（evidence_bundle 直通 → prompt 证据块）
 # ---------------------------------------------------------------------------
 
-# _build_doc_entries 经 super_tree 内惰性导入解析 `from .agentic.evidence import
-# ...`——standalone 收集时 spec 加载 evidence 预置 sys.modules；全量套件运行时
-# 复用已加载的模块对象。
-if "pageindex_mutil.agentic.evidence" not in sys.modules:
-    _ev_spec = importlib.util.spec_from_file_location(
-        "pageindex_mutil.agentic.evidence", super_tree_path / "agentic" / "evidence.py"
-    )
-    _ev_mod = importlib.util.module_from_spec(_ev_spec)
-    sys.modules["pageindex_mutil.agentic.evidence"] = _ev_mod
-    _ev_spec.loader.exec_module(_ev_mod)
+# T32.1：evidence 预置桩退役——super_tree._build_doc_entries 的惰性
+# `from .agentic.evidence import ...` 在真实包导入下自动解析。
 
 
 def _seed_matching_docs(st, db, client):

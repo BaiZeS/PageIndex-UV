@@ -792,6 +792,43 @@ def create_clean_structure_for_description(structure):
         return structure
 
 
+def structure_for_persistence(structure):
+    """documents.tree_json 落库持久化专用的 structure 白名单序列化。
+
+    与 create_clean_structure_for_description 同构（递归、防御非 dict），
+    但白名单更宽——**仅用于落库写入路径**（update_document_tree），不影响
+    description/doc_summary 生成入参（那两处继续用窄白名单，prompt 语义不变）。
+
+    保留字段（热启动回载契约，T32.1 收尾发现）：
+    - span_kind / line_num / end_line / start_index / end_index：server 重启 /
+      评测缓存 HIT 后由 tree_json 回载 documents[...]['structure']，
+      reasoning.spans_from_nodes 依赖 span 字段按 kind 分派页/行跨度；缺失则
+      router._recall_nodes_for_doc 报 "selected nodes yield no spans
+      (legacy index?); dropped" → 检索为空。
+    - text：检索链正文内容通道（agentic/enhance.enhance_and_select 候选携带
+      text，query token 命中正文即准入 union）；落库丢失则热启动后通道关闭。
+    - title / node_id / summary / prefix_summary：节点定位与语义证据基础字段。
+    """
+    if isinstance(structure, dict):
+        clean_node = {}
+        # 热启动检索链所需的全字段白名单（span + text + 语义字段）
+        for key in ['title', 'node_id', 'summary', 'prefix_summary',
+                    'span_kind', 'line_num', 'end_line',
+                    'start_index', 'end_index', 'text']:
+            if key in structure:
+                clean_node[key] = structure[key]
+
+        # Recursively process child nodes
+        if 'nodes' in structure and structure['nodes']:
+            clean_node['nodes'] = structure_for_persistence(structure['nodes'])
+
+        return clean_node
+    elif isinstance(structure, list):
+        return [structure_for_persistence(item) for item in structure]
+    else:
+        return structure
+
+
 def generate_doc_description(structure, model=None):
     prompt = f"""Your are an expert in generating descriptions for a document.
     You are given a structure of a document. Your task is to generate a one-sentence description for the document, which makes it easy to distinguish the document from other documents.

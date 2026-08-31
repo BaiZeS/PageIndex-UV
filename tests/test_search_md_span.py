@@ -11,13 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# 测试隔离守卫（与 test_multi_doc_enhanced 同理）：收集期清理其他测试文件预置的
-# pageindex_mutil.* stub，干净加载真实模块，避免 import 到缺失 spans_from_nodes
-# 的 stub 副本。
-for _mod in list(sys.modules):
-    if _mod == "pageindex_mutil" or _mod.startswith("pageindex_mutil."):
-        del sys.modules[_mod]
-
+# T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
 from pageindex_mutil.page_index_md import extract_node_text_content
 from pageindex_mutil.reasoning import spans_from_nodes
 

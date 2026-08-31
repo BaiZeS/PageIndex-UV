@@ -18,16 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# NOTE: test_router.py pre-seeds sys.modules with stub pageindex_mutil.* modules,
-# and test_retrieve_model_wiring.py purges + re-imports them at collection time
-# (creating fresh module objects). Purge stubs, import the REAL modules once
-# here, and hold module/class references — all patching uses patch.object on
-# these references so patches always target the same module object the classes
-# under test use, regardless of later sys.modules mutation by other test files.
-for _mod in list(sys.modules):
-    if _mod == "pageindex_mutil" or _mod.startswith("pageindex_mutil."):
-        del sys.modules[_mod]
-
+# T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
 import pageindex_mutil.client as client_mod
 import pageindex_mutil.entity_extractor as entity_extractor_mod
 from db import PageIndexDB

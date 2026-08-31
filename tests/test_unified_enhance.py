@@ -35,14 +35,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# 测试隔离守卫（与 test_retrieve_model_wiring / test_entity_disambiguation 同理）：
-# test_router 等会在运行期向 sys.modules 预置 pageindex_mutil.* stub 模块；此处
-# 清理预置 stub、导入真实模块并持有模块对象引用，patch 一律用 patch.object(module, ...)，
-# 保证命中被测类实际引用的模块。
-for _mod in list(sys.modules):
-    if _mod == "pageindex_mutil" or _mod.startswith("pageindex_mutil."):
-        del sys.modules[_mod]
-
+# T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
 import pageindex_mutil.agentic.enhance as enhance_mod
 from pageindex_mutil.agentic.enhance import (
     UnifiedNodeEnhancement,

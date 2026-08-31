@@ -13,122 +13,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 pageindex_path = Path(__file__).parent.parent / "pageindex_mutil"
 sys.path.insert(0, str(pageindex_path))
 
-import importlib.util
+# T32.1 真实 import（包 __init__ 已 PEP 562 惰性化，重依赖只在属性访问时加载）：
+# 历史的 spec_from_file_location 预置桩机器（utils stub/closet/super_tree/planner/
+# verifier/multi_hop/evidence/router 逐个 spec 加载 + evidence_module/
+# _ensure_utils_configloader 两套规避手法）整体退役——那套机器的存在前提是
+# `import pageindex_mutil` 触发重依赖链，现已不成立。
+import pageindex_mutil.agentic.router as router_mod
+from pageindex_mutil.agentic import evidence as evidence_module
 
-# Pre-seed pageindex.utils so imports won't fail
-utils_spec = importlib.util.spec_from_file_location("pageindex_mutil.utils", pageindex_path / "utils.py")
-utils_mod = importlib.util.module_from_spec(utils_spec)
-sys.modules["pageindex_mutil.utils"] = utils_mod
-utils_mod.llm_completion = lambda *a, **k: None
-async def _mock_llm_acompletion(*a, **k):
-    return None
-utils_mod.llm_acompletion = _mock_llm_acompletion
-utils_mod.count_tokens = lambda text, model=None: len(text or "") // 4
-utils_mod.extract_json = lambda *a, **k: None
-# Load the REAL strip_markdown_fence from utils.py source so super_tree.py's
-# `from .utils import ..., strip_markdown_fence` resolves (W2 FR3). The function
-# is pure, no heavy deps.
-_real_utils_spec = importlib.util.spec_from_file_location(
-    "_real_utils_strip_rt", pageindex_path / "utils.py"
-)
-_real_utils_mod = importlib.util.module_from_spec(_real_utils_spec)
-_real_utils_spec.loader.exec_module(_real_utils_mod)
-utils_mod.strip_markdown_fence = _real_utils_mod.strip_markdown_fence
-
-# 补齐 page_index.py / page_index_md.py / retrieve.py / client.py 等模块从 utils
-# 导入的其余符号（stub 缺 generate_summaries_for_structure 等，触发
-# pageindex_mutil/__init__ 链导入时报 ImportError）。显式逐名 setattr——不遍历
-# dir(_real_utils_mod)（那会把 logging/json/PyPDF2/openai 等导入的子模块一并拷进
-# stub，过宽）。已 stub 的 llm_* / count_tokens / extract_json / strip_markdown_fence
-# 保留不覆盖。
-for _name in (
-    "ConfigLoader", "JsonLogger",
-    "add_node_text", "add_preface_if_needed", "configure_llm",
-    "convert_page_to_int", "convert_physical_index_to_int",
-    "create_clean_structure_for_description", "create_node_mapping",
-    "format_structure", "generate_doc_description", "generate_node_summary",
-    "generate_summaries_for_structure", "get_json_content",
-    "get_number_of_pages", "get_page_tokens", "get_pdf_name",
-    "post_processing", "print_json", "print_toc",
-    "remove_fields", "remove_structure_text", "structure_to_list", "write_node_id",
-):
-    setattr(utils_mod, _name, getattr(_real_utils_mod, _name))
-
-# Pre-seed pageindex.closet_index for _STOPWORDS
-closet_spec = importlib.util.spec_from_file_location("pageindex_mutil.closet_index", pageindex_path / "closet_index.py")
-closet_mod = importlib.util.module_from_spec(closet_spec)
-sys.modules["pageindex_mutil.closet_index"] = closet_mod
-closet_spec.loader.exec_module(closet_mod)
-
-# Pre-seed pageindex.super_tree
-super_tree_spec = importlib.util.spec_from_file_location("pageindex_mutil.super_tree", pageindex_path / "super_tree.py")
-super_tree_mod = importlib.util.module_from_spec(super_tree_spec)
-sys.modules["pageindex_mutil.super_tree"] = super_tree_mod
-super_tree_spec.loader.exec_module(super_tree_mod)
-
-# Pre-seed pageindex.agentic.planner
-planner_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.planner", pageindex_path / "agentic" / "planner.py")
-planner_mod = importlib.util.module_from_spec(planner_spec)
-sys.modules["pageindex_mutil.agentic.planner"] = planner_mod
-planner_spec.loader.exec_module(planner_mod)
-
-# Pre-seed pageindex.agentic.verifier
-verifier_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.verifier", pageindex_path / "agentic" / "verifier.py")
-verifier_mod = importlib.util.module_from_spec(verifier_spec)
-sys.modules["pageindex_mutil.agentic.verifier"] = verifier_mod
-verifier_spec.loader.exec_module(verifier_mod)
-
-# Pre-seed pageindex.agentic.multi_hop (router imports it at module level)
-multi_hop_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.multi_hop", pageindex_path / "agentic" / "multi_hop.py")
-multi_hop_mod = importlib.util.module_from_spec(multi_hop_spec)
-sys.modules["pageindex_mutil.agentic.multi_hop"] = multi_hop_mod
-multi_hop_spec.loader.exec_module(multi_hop_mod)
-
-# Pre-seed pageindex.agentic.evidence（router._search_super_tree 惰性 `from .evidence import ...`）。
-# evidence.py 顶层仅 import logging，可安全 spec 加载（同 test_super_tree.py 的预置手法）。
-if "pageindex_mutil.agentic.evidence" not in sys.modules:
-    evidence_spec = importlib.util.spec_from_file_location(
-        "pageindex_mutil.agentic.evidence", pageindex_path / "agentic" / "evidence.py"
-    )
-    evidence_mod = importlib.util.module_from_spec(evidence_spec)
-    sys.modules["pageindex_mutil.agentic.evidence"] = evidence_mod
-    evidence_spec.loader.exec_module(evidence_mod)
-
-# Now load the router
-router_spec = importlib.util.spec_from_file_location("pageindex_mutil.agentic.router", pageindex_path / "agentic" / "router.py")
-router_mod = importlib.util.module_from_spec(router_spec)
-sys.modules["pageindex_mutil.agentic.router"] = router_mod
-router_spec.loader.exec_module(router_mod)
 AgenticRouter = router_mod.AgenticRouter
-
-
-def _evidence_mod():
-    """返回当前 sys.modules 中的证据模块（跨测试文件重载后仍一致）。"""
-    m = sys.modules.get("pageindex_mutil.agentic.evidence")
-    if m is None:
-        evidence_spec = importlib.util.spec_from_file_location(
-            "pageindex_mutil.agentic.evidence", pageindex_path / "agentic" / "evidence.py"
-        )
-        m = importlib.util.module_from_spec(evidence_spec)
-        sys.modules["pageindex_mutil.agentic.evidence"] = m
-        evidence_spec.loader.exec_module(m)
-    return m
 
 
 def _bundle(entries):
     """构造证据束 + 空 ctx（build_evidence_bundle patch 返回值）。"""
     return (entries, {"tokens": [], "query_entities": []})
-
-
-@pytest.fixture(autouse=True)
-def _ensure_utils_configloader():
-    """test_super_tree.py 收集期会把 sys.modules['pageindex_mutil.utils'] 换成无
-    ConfigLoader 的 stub——router._search_super_tree 惰性 `from ..utils import
-    ConfigLoader`（db 非 None 用例）需要它。运行期兜底注入真实 ConfigLoader。"""
-    utils_mod = sys.modules.get("pageindex_mutil.utils")
-    if utils_mod is not None and not hasattr(utils_mod, "ConfigLoader"):
-        utils_mod.ConfigLoader = _real_utils_mod.ConfigLoader
-    yield
 
 
 @pytest.fixture
@@ -171,7 +69,7 @@ class TestSearchSuperTree:
             1: {"channels": {"keyword": [{"token": "a"}], "tag": [], "entity": [], "vector": []}, "graph": {}},
             2: {"channels": {"keyword": [], "tag": [{"text": "t"}], "entity": [], "vector": []}, "graph": {}},
         }
-        with patch.object(_evidence_mod(), "build_evidence_bundle",
+        with patch.object(evidence_module, "build_evidence_bundle",
                           return_value=_bundle(bundle)):
             result = await router._search_super_tree("test query", top_k=3)
         mock_st.select_documents.assert_awaited_once_with(
@@ -189,7 +87,7 @@ class TestSearchSuperTree:
             1: {"channels": {"keyword": [{"token": "a"}, {"token": "b"}], "tag": [], "entity": [], "vector": []}, "graph": {}},
             2: {"channels": {"keyword": [], "tag": [{"text": "t"}], "entity": [], "vector": []}, "graph": {}},
         }
-        with patch.object(_evidence_mod(), "build_evidence_bundle",
+        with patch.object(evidence_module, "build_evidence_bundle",
                           return_value=_bundle(bundle)):
             result = await router._search_super_tree("test query", top_k=3)
         assert result["answer"] == "Super-Tree selection returned no documents."
@@ -234,7 +132,7 @@ class TestSearchSuperTree:
         # Mock _load_main_funcs
         with patch.object(router, '_load_main_funcs', return_value={
             "generate_answer": lambda q, ctx: "test answer"
-        }), patch.object(_evidence_mod(), "build_evidence_bundle",
+        }), patch.object(evidence_module, "build_evidence_bundle",
                          return_value=_bundle(bundle)):
             result = await router._search_super_tree("test query", top_k=3)
 
@@ -262,7 +160,7 @@ class TestSearchSuperTree:
 
         router._act_tree_search = AsyncMock(side_effect=RuntimeError("boom"))
 
-        with patch.object(_evidence_mod(), "build_evidence_bundle",
+        with patch.object(evidence_module, "build_evidence_bundle",
                           return_value=_bundle(bundle)):
             result = await router._search_super_tree("test query", top_k=3)
         assert "Failed to retrieve content" in result["answer"]
@@ -295,7 +193,7 @@ class TestSearchSuperTree:
 
         with patch.object(router, '_load_main_funcs', return_value={
             "generate_answer": lambda q, ctx: "test answer"
-        }), patch.object(_evidence_mod(), "build_evidence_bundle",
+        }), patch.object(evidence_module, "build_evidence_bundle",
                          return_value=_bundle(bundle)):
             result = await router._search_super_tree("test query", top_k=3)
 
@@ -327,7 +225,7 @@ class TestSearchRouting:
 
         with patch.object(router, '_load_main_funcs', return_value={
             "generate_answer": lambda q, ctx: "ans"
-        }), patch.object(_evidence_mod(), "build_evidence_bundle",
+        }), patch.object(evidence_module, "build_evidence_bundle",
                          return_value=_bundle(bundle)):
             result = await router.search("test query", top_k=3)
 
@@ -346,7 +244,7 @@ class TestSearchRouting:
             1: {"channels": {"keyword": [], "tag": [], "entity": [], "vector": []}, "graph": {}},
         }
 
-        with patch.object(_evidence_mod(), "build_evidence_bundle",
+        with patch.object(evidence_module, "build_evidence_bundle",
                           return_value=_bundle(bundle)):
             result = await router.search("test query", top_k=3)
 
@@ -405,7 +303,9 @@ class TestActTreeSearchBudget:
         # 预算设 150 → 只容得下 1 篇，第 2 篇会超 → 被预算截停
         reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
         reasoning_stub._get_max_context_tokens = lambda: 150
-        sys.modules["pageindex_mutil.reasoning"] = reasoning_stub
+        # T32.1：monkeypatch.setitem 自动还原——直接赋值会残留 stub 污染后续
+        # 文件（此前被防御性 purge 掩盖，purge 退役后裸奔成顺序性污染源）。
+        monkeypatch.setitem(sys.modules, "pageindex_mutil.reasoning", reasoning_stub)
 
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
@@ -443,7 +343,9 @@ class TestActTreeSearchBudget:
         )
         reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
         reasoning_stub._get_max_context_tokens = lambda: 150
-        sys.modules["pageindex_mutil.reasoning"] = reasoning_stub
+        # T32.1：monkeypatch.setitem 自动还原——直接赋值会残留 stub 污染后续
+        # 文件（此前被防御性 purge 掩盖，purge 退役后裸奔成顺序性污染源）。
+        monkeypatch.setitem(sys.modules, "pageindex_mutil.reasoning", reasoning_stub)
 
         # d1 = 800 字符 = 200 token（单篇即超预算 150）；d2 = 400 字符 = 100 token
         build_ctx = MagicMock(
@@ -487,7 +389,9 @@ class TestActTreeSearchBudget:
         )
         reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
         reasoning_stub._get_max_context_tokens = lambda: 250
-        sys.modules["pageindex_mutil.reasoning"] = reasoning_stub
+        # T32.1：monkeypatch.setitem 自动还原——直接赋值会残留 stub 污染后续
+        # 文件（此前被防御性 purge 掩盖，purge 退役后裸奔成顺序性污染源）。
+        monkeypatch.setitem(sys.modules, "pageindex_mutil.reasoning", reasoning_stub)
 
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
@@ -523,7 +427,9 @@ class TestActTreeSearchBudget:
         )
         reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
         reasoning_stub._get_max_context_tokens = lambda: 150
-        sys.modules["pageindex_mutil.reasoning"] = reasoning_stub
+        # T32.1：monkeypatch.setitem 自动还原——直接赋值会残留 stub 污染后续
+        # 文件（此前被防御性 purge 掩盖，purge 退役后裸奔成顺序性污染源）。
+        monkeypatch.setitem(sys.modules, "pageindex_mutil.reasoning", reasoning_stub)
 
         # 单篇 400 字符 = 100 token → 余量仅 50 token
         router._main_funcs = {
@@ -569,7 +475,9 @@ class TestActTreeSearchBudget:
         )
         reasoning_stub = types.ModuleType("pageindex_mutil.reasoning")
         reasoning_stub._get_max_context_tokens = lambda: 2000
-        sys.modules["pageindex_mutil.reasoning"] = reasoning_stub
+        # T32.1：monkeypatch.setitem 自动还原——直接赋值会残留 stub 污染后续
+        # 文件（此前被防御性 purge 掩盖，purge 退役后裸奔成顺序性污染源）。
+        monkeypatch.setitem(sys.modules, "pageindex_mutil.reasoning", reasoning_stub)
 
         router._main_funcs = {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,

@@ -11,8 +11,7 @@
 另覆盖确定性抽取的 K 上限（_MAX_TAGS_PER_DOC=5）与 retrieve_model 接线（NFR4）。
 
 全部 LLM 调用均 mock，真实 SQLite。与 test_node_profiles.py 相同模式：
-purge stubs → import 真模块并持有引用 → 一律 patch.object（不串 patch 路径），
-避免其他测试文件 re-seed sys.modules 造成 patch 目标漂移。
+真实 import（T32.1）并持有模块引用 → 一律 patch.object（不串 patch 路径）。
 """
 import json
 import sys
@@ -24,10 +23,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-for _mod in list(sys.modules):
-    if _mod == "pageindex_mutil" or _mod.startswith("pageindex_mutil."):
-        del sys.modules[_mod]
-
+# T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
 import pageindex_mutil.closet_index as closet_mod
 import pageindex_mutil.corpus_tree as corpus_tree_mod
 from db import PageIndexDB
@@ -78,8 +74,8 @@ def _live_corpus_tree():
     """The corpus_tree module object ``ClosetIndex._anchor_tags`` resolves at
     call time via its lazy ``from .corpus_tree import ...``.
 
-    Other test files re-seed ``sys.modules`` during collection, so the live
-    module may differ from the ``corpus_tree_mod`` captured at import time.
+    T32.1：purge 退役后 sys.modules 中模块常驻单例，与 ``corpus_tree_mod``
+    为同一对象；经 import_module 取用作双保险。
     """
     import importlib
     return importlib.import_module("pageindex_mutil.corpus_tree")

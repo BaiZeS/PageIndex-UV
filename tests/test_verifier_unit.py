@@ -9,31 +9,22 @@
 5. LLM 失败/沉默/坏 JSON → 纯启发式 s_ret 回退（既有行为保留）；
 6. NFR4：verifier 的 LLM 调用走 retrieve_model or model。
 
-隔离说明：其他测试模块（test_router.py / test_agentic_recall.py）会在运行期
-purge 并重新 import pageindex_mutil.*，收集期绑定的类会过期。因此本文件一律
-经惰性访问器（_verifier_mod/_verifier_cls）取当前生效模块与类，patch 目标同理。
+隔离说明（T32.1：防御性 purge 退役，真实 import 后 pageindex_mutil.* 为
+sys.modules 常驻单例）：本文件仍一律经惰性访问器（_verifier_mod/_verifier_cls）
+取生效模块与类，patch 目标同理。
 """
 
 import json
-import sys
 
 import pytest
 
-# 收集期清理跨文件残留 stub，干净加载真实模块。
-for _mod_name in list(sys.modules):
-    if _mod_name == "pageindex_mutil" or _mod_name.startswith("pageindex_mutil."):
-        del sys.modules[_mod_name]
-
+# T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
 import pageindex_mutil.agentic.verifier  # noqa: F401  首次干净加载
 
 
 @pytest.fixture(autouse=True)
 def _fresh_verifier_module():
-    """每个用例前 purge 残留模块并重新加载，保证 patch 与断言命中同一对象。"""
-    for _m in list(sys.modules):
-        if _m == "pageindex_mutil" or _m.startswith("pageindex_mutil."):
-            del sys.modules[_m]
-    import pageindex_mutil.agentic.verifier  # noqa: F401
+    # T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
     yield
 
 

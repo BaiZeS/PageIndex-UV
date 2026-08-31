@@ -27,61 +27,12 @@ sys.path.insert(0, str(pageindex_path))
 
 import importlib.util
 
-# Pre-seed pageindex.utils so imports won't fail
-utils_spec = importlib.util.spec_from_file_location(
-    "pageindex_mutil.utils", pageindex_path / "utils.py"
-)
-utils_mod = importlib.util.module_from_spec(utils_spec)
-sys.modules["pageindex_mutil.utils"] = utils_mod
-utils_spec.loader.exec_module(utils_mod)
+# T32.1 真实 import（包 __init__ PEP 562 惰性化，重依赖零触发）：
+# 历史的 spec_from_file_location 预置桩机器（utils/closet/super_tree/planner/
+# verifier/router/multi_hop 逐个 spec 加载）整体退役。
+import pageindex_mutil.agentic.router as router_mod
+import pageindex_mutil.agentic.multi_hop as multi_hop_mod
 
-# Pre-seed pageindex.closet_index
-closet_spec = importlib.util.spec_from_file_location(
-    "pageindex_mutil.closet_index", pageindex_path / "closet_index.py"
-)
-closet_mod = importlib.util.module_from_spec(closet_spec)
-sys.modules["pageindex_mutil.closet_index"] = closet_mod
-closet_spec.loader.exec_module(closet_mod)
-
-# Pre-seed pageindex.super_tree
-super_tree_spec = importlib.util.spec_from_file_location(
-    "pageindex_mutil.super_tree", pageindex_path / "super_tree.py"
-)
-super_tree_mod = importlib.util.module_from_spec(super_tree_spec)
-sys.modules["pageindex_mutil.super_tree"] = super_tree_mod
-super_tree_spec.loader.exec_module(super_tree_mod)
-
-# Pre-seed pageindex.agentic.planner
-planner_spec = importlib.util.spec_from_file_location(
-    "pageindex_mutil.agentic.planner", pageindex_path / "agentic" / "planner.py"
-)
-planner_mod = importlib.util.module_from_spec(planner_spec)
-sys.modules["pageindex_mutil.agentic.planner"] = planner_mod
-planner_spec.loader.exec_module(planner_mod)
-
-# Pre-seed pageindex.agentic.verifier
-verifier_spec = importlib.util.spec_from_file_location(
-    "pageindex_mutil.agentic.verifier", pageindex_path / "agentic" / "verifier.py"
-)
-verifier_mod = importlib.util.module_from_spec(verifier_spec)
-sys.modules["pageindex_mutil.agentic.verifier"] = verifier_mod
-verifier_spec.loader.exec_module(verifier_mod)
-
-# Pre-seed pageindex.agentic.router
-router_spec = importlib.util.spec_from_file_location(
-    "pageindex_mutil.agentic.router", pageindex_path / "agentic" / "router.py"
-)
-router_mod = importlib.util.module_from_spec(router_spec)
-sys.modules["pageindex_mutil.agentic.router"] = router_mod
-router_spec.loader.exec_module(router_mod)
-
-# Now load multi_hop
-multi_hop_spec = importlib.util.spec_from_file_location(
-    "pageindex_mutil.agentic.multi_hop", pageindex_path / "agentic" / "multi_hop.py"
-)
-multi_hop_mod = importlib.util.module_from_spec(multi_hop_spec)
-sys.modules["pageindex_mutil.agentic.multi_hop"] = multi_hop_mod
-multi_hop_spec.loader.exec_module(multi_hop_mod)
 MultiHopReasoner = multi_hop_mod.MultiHopReasoner
 
 AgenticRouter = router_mod.AgenticRouter
@@ -900,116 +851,100 @@ class TestMultiHopEntityToDocE2E:
         # test files). Snapshot every pageindex_mutil* entry and restore it in
         # finally so this test stays sys.modules-neutral regardless of
         # collection order — even if the test itself fails.
-        _saved_modules = {
-            name: mod for name, mod in sys.modules.items()
-            if name.startswith("pageindex_mutil")
+        # with a stub lacking create_node_mapping (collection order);
+        # restore the real helper so the real router chain also works in
+        # combined runs. count_tokens must be attached too: the real
+        # _act_tree_search imports it at router.py:334 OUTSIDE any
+        # try/except, so a stub without it aborts the test.
+
+        client = _make_mock_client()
+
+        # Entity→document ids are DB integers; the mapper knows only 10→uuid.
+        db = client.db
+        db.search_entities.return_value = [{"id": 1, "name": "Alpha"}]
+        db.get_entity_relations.return_value = []
+        db.get_entity_documents.return_value = [{"id": 10, "pdf_name": "doc_A.pdf"}]
+
+        # In-memory documents are keyed by UUID (as in PageIndexClient).
+        client._id_mapper = _FakeIdMapper({10: "uuid-doc-10"})
+        client.documents = {
+            "uuid-doc-10": {
+                "doc_name": "doc_A.pdf",
+                "type": "md",
+                "structure": [{
+                    "node_id": "n1",
+                    "title": "Alpha",
+                    "text": "Alpha 实体内容 ENTITY_CONTENT_MARKER",
+                    "start_index": 0,
+                    "end_index": 0,
+                }],
+            }
         }
-        try:
-            # test_router.py may re-seed sys.modules["pageindex_mutil.utils"]
-            # with a stub lacking create_node_mapping (collection order);
-            # restore the real helper so the real router chain also works in
-            # combined runs. count_tokens must be attached too: the real
-            # _act_tree_search imports it at router.py:334 OUTSIDE any
-            # try/except, so a stub without it aborts the test.
-            utils_entry = sys.modules.get("pageindex_mutil.utils")
-            if utils_entry is not None and not hasattr(utils_entry, "create_node_mapping"):
-                utils_entry.create_node_mapping = utils_mod.create_node_mapping
-            if utils_entry is not None and not hasattr(utils_entry, "count_tokens"):
-                utils_entry.count_tokens = utils_mod.count_tokens
 
-            client = _make_mock_client()
+        # Router: mock everything except the REAL _act_tree_search and
+        # _recall_nodes_for_doc, which form the chain under test.
+        # T6.4: _recall_nodes_for_doc 走 enhance_and_select（LLM 精挑）——
+        # model/retrieve_model 供 enhancer 构造，精挑 LLM 经 enhance 模块 patch。
+        router = MagicMock(spec=AgenticRouter)
+        router.model = "m"
+        router.retrieve_model = "m"
+        router.client = client
+        router.verifier = MagicMock()
+        router.verifier.verify.return_value = MagicMock(action="answer")
+        router._load_main_funcs.return_value = {
+            "spans_from_nodes": MagicMock(return_value={"pages": [1], "lines": []}),
+            "build_context_for_doc": MagicMock(
+                side_effect=lambda doc, selected, pages: "\n".join(
+                    n.get("text", "") for n in selected
+                )
+            ),
+            "generate_answer": MagicMock(return_value="e2e final answer"),
+        }
+        router._act_tree_search = types.MethodType(AgenticRouter._act_tree_search, router)
+        router._recall_nodes_for_doc = types.MethodType(AgenticRouter._recall_nodes_for_doc, router)
 
-            # Entity→document ids are DB integers; the mapper knows only 10→uuid.
-            db = client.db
-            db.search_entities.return_value = [{"id": 1, "name": "Alpha"}]
-            db.get_entity_relations.return_value = []
-            db.get_entity_documents.return_value = [{"id": 10, "pdf_name": "doc_A.pdf"}]
+        reasoner = MultiHopReasoner(model="m", retrieve_model="m")
 
-            # In-memory documents are keyed by UUID (as in PageIndexClient).
-            client._id_mapper = _FakeIdMapper({10: "uuid-doc-10"})
-            client.documents = {
-                "uuid-doc-10": {
-                    "doc_name": "doc_A.pdf",
-                    "type": "md",
-                    "structure": [{
-                        "node_id": "n1",
-                        "title": "Alpha",
-                        "text": "Alpha 实体内容 ENTITY_CONTENT_MARKER",
-                        "start_index": 0,
-                        "end_index": 0,
-                    }],
-                }
-            }
+        decompose = json.dumps({"decomposable": True, "sub_queries": ["Q1"]})
+        # Hop 1 extracts nothing new → loop ends after hop 1.
+        extract = json.dumps({"entities": [], "facts": [], "next_hop_hint": ""})
 
-            # Router: mock everything except the REAL _act_tree_search and
-            # _recall_nodes_for_doc, which form the chain under test.
-            # T6.4: _recall_nodes_for_doc 走 enhance_and_select（LLM 精挑）——
-            # model/retrieve_model 供 enhancer 构造，精挑 LLM 经 enhance 模块 patch。
-            router = MagicMock(spec=AgenticRouter)
-            router.model = "m"
-            router.retrieve_model = "m"
-            router.client = client
-            router.verifier = MagicMock()
-            router.verifier.verify.return_value = MagicMock(action="answer")
-            router._load_main_funcs.return_value = {
-                "spans_from_nodes": MagicMock(return_value={"pages": [1], "lines": []}),
-                "build_context_for_doc": MagicMock(
-                    side_effect=lambda doc, selected, pages: "\n".join(
-                        n.get("text", "") for n in selected
-                    )
-                ),
-                "generate_answer": MagicMock(return_value="e2e final answer"),
-            }
-            router._act_tree_search = types.MethodType(AgenticRouter._act_tree_search, router)
-            router._recall_nodes_for_doc = types.MethodType(AgenticRouter._recall_nodes_for_doc, router)
+        # enhance 精挑 LLM（调用时惰性导入 pageindex_mutil.agentic.enhance，
+        # sys.modules 解析 → patch 当前生效模块的属性即命中）
+        import importlib
+        enhance_mod_e2e = importlib.import_module("pageindex_mutil.agentic.enhance")
 
-            reasoner = MultiHopReasoner(model="m", retrieve_model="m")
+        with patch.object(
+            multi_hop_mod, "llm_acompletion",
+            side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract,
+        ), patch.object(
+            enhance_mod_e2e, "llm_completion",
+            return_value=json.dumps({
+                "selected_ids": ["n1"], "pool_concern": False, "concern_reason": "",
+            }),
+        ):
+            result = asyncio.run(reasoner.execute("Alpha 是什么?", router, db))
 
-            decompose = json.dumps({"decomposable": True, "sub_queries": ["Q1"]})
-            # Hop 1 extracts nothing new → loop ends after hop 1.
-            extract = json.dumps({"entities": [], "facts": [], "next_hop_hint": ""})
+            # 1) Candidate docs reached tree search as UUIDs, not stringified DB ids:
+            #    matched_docs is keyed by whatever _act_tree_search resolved.
+            matched_ids = [d["doc_id"] for d in result["matched_docs"]]
+            assert "uuid-doc-10" in matched_ids
+            assert "10" not in matched_ids
+            # T6.4: matched score = 节点召回覆盖度（1/1 候选 = 1.0），(0,1]
+            assert all(0 < d["score"] <= 1.0 for d in result["matched_docs"])
 
-            # enhance 精挑 LLM（调用时惰性导入 pageindex_mutil.agentic.enhance，
-            # sys.modules 解析 → patch 当前生效模块的属性即命中）
-            import importlib
-            enhance_mod_e2e = importlib.import_module("pageindex_mutil.agentic.enhance")
+            # 2) The UUID-resolved doc's entity content made it into hop context.
+            assert any("ENTITY_CONTENT_MARKER" in c for c in result["hop_contexts"])
 
-            with patch.object(
-                multi_hop_mod, "llm_acompletion",
-                side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract,
-            ), patch.object(
-                enhance_mod_e2e, "llm_completion",
-                return_value=json.dumps({
-                    "selected_ids": ["n1"], "pool_concern": False, "concern_reason": "",
-                }),
-            ):
-                result = asyncio.run(reasoner.execute("Alpha 是什么?", router, db))
+            # 3) Final answer generated and CRAG-verified.
+            assert result["answer"] == "e2e final answer"
+            assert result["confidence"] == "high"
+            assert result["hop_count"] == 1
 
-                # 1) Candidate docs reached tree search as UUIDs, not stringified DB ids:
-                #    matched_docs is keyed by whatever _act_tree_search resolved.
-                matched_ids = [d["doc_id"] for d in result["matched_docs"]]
-                assert "uuid-doc-10" in matched_ids
-                assert "10" not in matched_ids
-                # T6.4: matched score = 节点召回覆盖度（1/1 候选 = 1.0），(0,1]
-                assert all(0 < d["score"] <= 1.0 for d in result["matched_docs"])
-
-                # 2) The UUID-resolved doc's entity content made it into hop context.
-                assert any("ENTITY_CONTENT_MARKER" in c for c in result["hop_contexts"])
-
-                # 3) Final answer generated and CRAG-verified.
-                assert result["answer"] == "e2e final answer"
-                assert result["confidence"] == "high"
-                assert result["hop_count"] == 1
-
-                # 4) Chain proof: real recall succeeds for the UUID and returns None for
-                #    the old stringified DB id (which is what broke the link).
-                ok = asyncio.run(router._recall_nodes_for_doc("q", "uuid-doc-10"))
-                assert ok is not None
-                assert ok["doc_id"] == "uuid-doc-10"
-                broken = asyncio.run(router._recall_nodes_for_doc("q", "10"))
-                assert broken is None
-        finally:
-            for name in [n for n in sys.modules if n.startswith("pageindex_mutil")]:
-                if name not in _saved_modules:
-                    del sys.modules[name]
-            sys.modules.update(_saved_modules)
+            # 4) Chain proof: real recall succeeds for the UUID and returns None for
+            #    the old stringified DB id (which is what broke the link).
+            ok = asyncio.run(router._recall_nodes_for_doc("q", "uuid-doc-10"))
+            assert ok is not None
+            assert ok["doc_id"] == "uuid-doc-10"
+            broken = asyncio.run(router._recall_nodes_for_doc("q", "10"))
+            assert broken is None

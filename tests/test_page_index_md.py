@@ -5,34 +5,9 @@ from pathlib import Path
 
 import pytest
 
-# Preload pageindex_mutil.utils minimal stub so page_index_md's imports resolve.
-_mutil = Path(__file__).parent.parent / "pageindex_mutil"
-sys.path.insert(0, str(_mutil))
-
-utils_spec = importlib.util.spec_from_file_location("pageindex_mutil.utils", _mutil / "utils.py")
-utils_mod = importlib.util.module_from_spec(utils_spec)
-sys.modules["pageindex_mutil.utils"] = utils_mod
-utils_mod.count_tokens = lambda text, model=None: len(text or "") // 4
-# page_index_md 模块级 import 需要这些名字；仅 stub 掉真实实现，避免拉 heavy deps。
-utils_mod.structure_to_list = lambda s: []
-utils_mod.write_node_id = lambda *a, **k: None
-utils_mod.format_structure = lambda s, **k: s
-utils_mod.create_clean_structure_for_description = lambda s: s
-utils_mod.ConfigLoader = lambda *a, **k: None
-utils_mod.print_json = lambda *a, **k: None
-utils_mod.print_toc = lambda *a, **k: None
-utils_mod.generate_node_summary = lambda *a, **k: None
-utils_mod.generate_doc_description = lambda *a, **k: None
-utils_mod.llm_completion = lambda *a, **k: None
-async def _mock_llm_acompletion(*a, **k):
-    return None
-utils_mod.llm_acompletion = _mock_llm_acompletion
-utils_mod.extract_json = lambda text: json.loads(text) if text else None
-
-spec = importlib.util.spec_from_file_location("pageindex_mutil.page_index_md", _mutil / "page_index_md.py")
-mod = importlib.util.module_from_spec(spec)
-sys.modules["pageindex_mutil.page_index_md"] = mod
-spec.loader.exec_module(mod)
+# T32.1 真实 import（包 __init__ PEP 562 惰性化）：utils 桩 + page_index_md
+# spec 加载退役——被测纯函数（extract_nodes_from_markdown 等）不依赖桩行为。
+import pageindex_mutil.page_index_md as mod
 
 extract_nodes_from_markdown = mod.extract_nodes_from_markdown
 _normalize_line_breaks = mod._normalize_line_breaks
@@ -107,9 +82,12 @@ async def test_md_to_tree_falls_back_to_semantic_sections(tmp_path):
                       return_value=[{"title": "第一章", "line_num": 1},
                                     {"title": "第二章", "line_num": 4}]) as m, \
          patch.object(mod, "generate_summaries_for_structure_md", new=_noop):
+        # T32.1：历史 utils 桩的 identity format_structure 掩盖了缺
+        # if_add_node_text='yes'——真实实现按 'no' 剥 text（生产链 client.index
+        # 硬编码 'yes'）。补齐参数以匹配被测语义。
         result = await mod.md_to_tree(
             str(md), if_add_node_summary='yes', summary_token_threshold=200,
-            if_add_node_id='yes', model=None,
+            if_add_node_id='yes', if_add_node_text='yes', model=None,
         )
         m.assert_called_once()
         titles = [n.get("title") for n in result["structure"]]
@@ -254,9 +232,12 @@ async def test_single_line_md_gets_nonempty_node_text(tmp_path):
                                     {"title": "章节二", "line_num": 2},
                                     {"title": "章节三", "line_num": 3}]) as m, \
          patch.object(mod, "generate_summaries_for_structure_md", new=_noop):
+        # T32.1：历史 utils 桩的 identity format_structure 掩盖了缺
+        # if_add_node_text='yes'——真实实现按 'no' 剥 text（生产链 client.index
+        # 硬编码 'yes'）。补齐参数以匹配被测语义。
         result = await mod.md_to_tree(
             str(md), if_add_node_summary='yes', summary_token_threshold=200,
-            if_add_node_id='yes', model=None,
+            if_add_node_id='yes', if_add_node_text='yes', model=None,
         )
         m.assert_called_once()
         # Every node should have non-empty text

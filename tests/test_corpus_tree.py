@@ -18,42 +18,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest
 from db import PageIndexDB
 
-# Avoid triggering __init__.py imports that pull in heavy deps like PyPDF2.
-pkg_path = Path(__file__).parent.parent / "pageindex_mutil"
-sys.path.insert(0, str(pkg_path))
-
-import importlib.util
-
-# Load corpus_tree without triggering the heavy package __init__ (PyPDF2 etc.).
-# IMPORTANT (test isolation): only seed a stub ``pageindex_mutil.utils`` when the
-# real module is NOT already imported. In the full suite, test_config.py imports
-# the real utils first, and test_delete_path.py needs the real ``get_llm_config`` —
-# clobbering utils here would break its collection. corpus_tree.py binds
-# llm_completion/extract_json into its own namespace and we patch
-# ``corpus_tree_mod.llm_completion`` directly, so the stub is only needed to
-# satisfy the relative import on standalone runs.
-if "pageindex_mutil.utils" not in sys.modules:
-    utils_spec = importlib.util.spec_from_file_location("pageindex_mutil.utils", pkg_path / "utils.py")
-    utils_mod = importlib.util.module_from_spec(utils_spec)
-    sys.modules["pageindex_mutil.utils"] = utils_mod
-    utils_mod.llm_completion = lambda *a, **k: None
-
-    def _mock_extract_json(text):
-        try:
-            return json.loads(text)
-        except Exception:
-            return None
-
-    utils_mod.extract_json = _mock_extract_json
-
-if "pageindex_mutil.corpus_tree" in sys.modules:
-    # Full-suite run: the real module was already imported. Reuse it.
-    corpus_tree_mod = sys.modules["pageindex_mutil.corpus_tree"]
-else:
-    spec = importlib.util.spec_from_file_location("pageindex_mutil.corpus_tree", pkg_path / "corpus_tree.py")
-    corpus_tree_mod = importlib.util.module_from_spec(spec)
-    sys.modules["pageindex_mutil.corpus_tree"] = corpus_tree_mod
-    spec.loader.exec_module(corpus_tree_mod)
+# T32.1 真实 import（包 __init__ PEP 562 惰性化）：历史的 utils 条件桩 +
+# corpus_tree spec 加载退役。测试直接 patch corpus_tree_mod.llm_completion。
+import pageindex_mutil.corpus_tree as corpus_tree_mod
 
 # Prompt marker used to route the mocked LLM response for the single-tag
 # adjudication call (resolve_new_tag).

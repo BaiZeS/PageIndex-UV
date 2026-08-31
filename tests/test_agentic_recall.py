@@ -30,13 +30,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# 测试隔离守卫（与 test_search_single_enhanced 同理）：收集期清理其他测试文件
-# 预置的 pageindex_mutil.* stub，干净加载真实模块；运行期由 _real_modules
-# fixture 保证真实模块在场，断言/patch 一律经惰性访问器取当前生效模块对象。
-for _mod in list(sys.modules):
-    if _mod == "pageindex_mutil" or _mod.startswith("pageindex_mutil."):
-        del sys.modules[_mod]
-
+# T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
 import pageindex_mutil.agentic.router  # noqa: F401  首次干净加载
 from pageindex_mutil.agentic.verifier import VerifyResult
 from pageindex_mutil.agentic.planner import PlanResult
@@ -44,12 +38,7 @@ from pageindex_mutil.agentic.planner import PlanResult
 
 @pytest.fixture(autouse=True)
 def _real_modules():
-    for _m in list(sys.modules):
-        if _m == "pageindex_mutil" or _m.startswith("pageindex_mutil."):
-            del sys.modules[_m]
-    import pageindex_mutil.agentic.router  # noqa: F401
-    import pageindex_mutil.agentic.recall_loop  # noqa: F401
-    import pageindex_mutil.agentic.verifier  # noqa: F401
+    # T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
     yield
 
 

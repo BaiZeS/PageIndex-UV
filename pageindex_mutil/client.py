@@ -12,7 +12,7 @@ from pathlib import Path
 from .page_index import page_index
 from .page_index_md import md_to_tree
 from .retrieve import get_document, get_document_structure, get_page_content
-from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, configure_llm, llm_completion
+from .utils import ConfigLoader, remove_fields, create_clean_structure_for_description, structure_for_persistence, configure_llm, llm_completion
 from .closet_index import ClosetIndex
 from .super_tree import SuperTreeIndex, KeywordIndex
 from .page_index_liteparse import is_liteparse_format, liteparse_to_tree
@@ -552,10 +552,12 @@ class PageIndexClient:
                 )
                 self._id_mapper.register(doc_id, db_doc_id)
                 
-                # Save tree structure to database for persistence
+                # Save tree structure to database for persistence.
+                # structure_for_persistence（非 description 白名单）：保留 span 字段
+                # （line_num/end_line/span_kind/start_index/end_index）与 text，
+                # 否则热启动回载 tree_json 后 spans_from_nodes 全空 → 检索空（T32.1）。
                 if doc.get('structure'):
-                    from .utils import create_clean_structure_for_description
-                    tree_for_reasoning = create_clean_structure_for_description(doc['structure'])
+                    tree_for_reasoning = structure_for_persistence(doc['structure'])
                     self.db.update_document_tree(db_doc_id, json.dumps(tree_for_reasoning, ensure_ascii=False))
                 
                 if self.closet_index and doc.get('structure'):
@@ -824,8 +826,8 @@ class PageIndexClient:
         self._id_mapper.register(doc_id, db_doc_id)
 
         if doc.get('structure'):
-            from .utils import create_clean_structure_for_description
-            tree_for_reasoning = create_clean_structure_for_description(doc['structure'])
+            # 落库走 structure_for_persistence（保留 span/text，热启动契约）
+            tree_for_reasoning = structure_for_persistence(doc['structure'])
             self.db.update_document_tree(db_doc_id, json.dumps(tree_for_reasoning, ensure_ascii=False))
 
         if self.closet_index and doc.get('structure'):
@@ -1043,12 +1045,17 @@ class PageIndexClient:
                     pdf_name = db_doc.get('pdf_name', '')
                     pdf_path = db_doc.get('pdf_path', '')
                     
-                    # Try to find matching workspace document by pdf_name or pdf_path
+                    # Try to find matching workspace document by pdf_name or pdf_path.
+                    # 循环变量不得命名 `uuid`——会把模块级 `import uuid` 遮蔽成函数
+                    # 局部名：workspace 无 meta（评测缓存形态：仅 .md+db，无
+                    # _meta.json/doc json）时 documents 为空，db-only 分支
+                    # `str(uuid.uuid4())` 必抛 UnboundLocalError，被外层宽
+                    # except 吞成 warning → 热启动静默失败（T32.1 收尾定证）。
                     found_uuid = None
-                    for uuid, doc in self.documents.items():
+                    for ws_uuid, doc in self.documents.items():
                         if (doc.get('doc_name') == pdf_name or 
                             doc.get('path') == pdf_path):
-                            found_uuid = uuid
+                            found_uuid = ws_uuid
                             break
                     
                     if found_uuid:

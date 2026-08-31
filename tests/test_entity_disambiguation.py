@@ -25,15 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest
 from db import PageIndexDB
 
-# NOTE（测试隔离守卫，与 test_retrieve_model_wiring.py 同理）：test_corpus_tree /
-# test_router 等文件会在运行期清空并重建 sys.modules 中的 pageindex_mutil.* 模块
-# 对象，字符串路径 patch 可能落到与被测类引用不同的模块上。此处导入时清理可能被
-# 预置的 stub 并持有真实模块对象引用，patch 一律用 patch.object(module, ...)，
-# 保证命中被测类实际引用的模块。
-for _mod in list(sys.modules):
-    if _mod == "pageindex_mutil" or _mod.startswith("pageindex_mutil."):
-        del sys.modules[_mod]
-
+# T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
 import pageindex_mutil.entity_extractor as entity_extractor_mod
 from pageindex_mutil.entity_extractor import (
     EntityExtractor,

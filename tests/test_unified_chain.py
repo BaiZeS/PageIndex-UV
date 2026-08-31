@@ -11,11 +11,9 @@ router.search → _search_super_tree 全链：
 4. LLM 不可用降级：节点精挑 LLM 抛异常 → [7.7] 放行 union → 单链不崩、confidence=low、
    matched_docs 非空（证据束接地未丢）。
 
-sys.modules 污染陷阱（test_router.py / test_super_tree.py / test_agentic_recall.py
-收集/运行期会 clobber pageindex_mutil.* 为 stub 或重载为全新对象）：不按
-sys.modules[Cls.__module__] 反查打补丁，也不在模块层持有跨文件可能失效的引用——
-每次测试由 _fresh_modules() 干净重载真实模块并直接持有模块对象，patch.object
-打到类方法 globals 真正所属的模块上；client 也由同一批重载的模块构建，保证一致。
+T32.1（真实 import）：桩创建者迁移后各文件收集期真实 import、模块常驻
+sys.modules 单例，不再被 purge/换对象——`_fresh_modules()` 只持有模块对象引用，
+patch.object 打到类方法 globals 真正所属的模块上；client 也由同一批模块构建，保证一致。
 """
 import json
 import sys
@@ -34,10 +32,8 @@ NODE_TEXT = "浴血值可以通过完成日常任务获得。"
 
 
 def _fresh_modules():
-    """清理 pageindex_mutil.* stub 后干净重载真实模块，返回持有引用的命名空间。"""
-    for _m in list(sys.modules):
-        if _m == "pageindex_mutil" or _m.startswith("pageindex_mutil."):
-            del sys.modules[_m]
+    """返回真实模块持有引用的命名空间（sys.modules 单例，非重载）。"""
+    # T32.1：防御性 purge 退役——桩创建者已迁移真实 import，purge 反成新污染源。
     import pageindex_mutil.client as client_mod
     import pageindex_mutil.super_tree as super_tree_mod
     import pageindex_mutil.agentic.enhance as enhance_mod
@@ -56,7 +52,7 @@ def _fresh_modules():
 
 @pytest.fixture
 def env(tmp_path):
-    """真实 PageIndexClient(db) + 干净重载的真实模块（每测试独立，防 sys.modules 串味）。"""
+    """真实 PageIndexClient(db) + 真实模块引用（T32.1：模块为 sys.modules 常驻单例）。"""
     m = _fresh_modules()
     client = m.client_mod.PageIndexClient(
         db_path=str(tmp_path / "t.db"), search_backend="keyword",
