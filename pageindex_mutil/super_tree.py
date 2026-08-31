@@ -146,6 +146,14 @@ _REASON_FUNCS = None
 
 
 def _load_reason_funcs():
+    """T32.2 引擎侧 reasoning 惰性加载（模块级单例缓存）。
+
+    注意双缓存并存：搬移后引擎链读 `_REASON_FUNCS`（本函数），router 编排链仍读
+    实例 `self._main_funcs`。测试 stub `sys.modules['pageindex_mutil.reasoning']`
+    只覆盖一方——stub 引擎侧须同时 patch `_REASON_FUNCS`，stub 编排侧须同时
+    patch `router._main_funcs`（防后人踩坑，见 D6 快审 Minor-2）。失败不缓存
+    （返回空 dict、下次重试），防 sys.modules 临时 stub 粘住空缓存跨用例泄漏。
+    """
     global _REASON_FUNCS
     if _REASON_FUNCS is None:
         try:

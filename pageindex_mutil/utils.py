@@ -803,7 +803,7 @@ def structure_for_persistence(structure):
     - span_kind / line_num / end_line / start_index / end_index：server 重启 /
       评测缓存 HIT 后由 tree_json 回载 documents[...]['structure']，
       reasoning.spans_from_nodes 依赖 span 字段按 kind 分派页/行跨度；缺失则
-      router._recall_nodes_for_doc 报 "selected nodes yield no spans
+      SuperTreeIndex.recall_nodes_for_doc 报 "selected nodes yield no spans
       (legacy index?); dropped" → 检索为空。
     - text：检索链正文内容通道（agentic/enhance.enhance_and_select 候选携带
       text，query token 命中正文即准入 union）；落库丢失则热启动后通道关闭。

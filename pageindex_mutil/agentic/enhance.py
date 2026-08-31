@@ -44,7 +44,7 @@ _DEFAULT_EVIDENCE_MAX_CHARS = 6000
 # union 自然回池，该参数只抬高上限让延迟池节点重新可被 LLM 精挑。
 # 延迟分支与 force-all 全池分支共用该倍数：force-all 不放宽 cap 时，零信号候选
 # 会在全量准入后按分降序垫底、再次被截——全池重选退化为 pass-1，判据①救不到
-# 任何节点。多文档 _recall_nodes_for_doc 经 retry_on_pool_concern 使用
+# 任何节点。多文档 SuperTreeIndex.recall_nodes_for_doc 经 retry_on_pool_concern 使用
 # （语料树聚类构建已删，_navigate_level 不复存在）。
 POOL_CONCERN_RETRY_CAP_MULTIPLIER = 2
 
