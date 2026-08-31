@@ -9,7 +9,7 @@ expand 时按 verifier 点名（VerifyResult.need）补召回，直到能作答�
 - ① 轮 1 用调用方 top_k（轻量高精）；轮 ≥2 不再走融合序滑窗——改为只补
   verifier 点名（VerifyResult.need）的 doc_id 对象。删除 `_cut_candidates` 融合序
   滑窗与顺序回捞（回归 spec v3.2 [7.5]b "重新挑选必须 LLM 决策"原旨）；
-- ② 轮内并发（router._act_tree_search 内部 asyncio.gather），轮间串行；RRF 只用作
+- ② 轮内并发（super_tree_index.act_tree_search 内部 asyncio.gather，T32.2），轮间串行；RRF 只用作
   进入序（entry ordering），不引入新判据；
 - ③ LLM 判停复用 CRAGVerifier 的 answer/expand/refuse action，不自造判据；
 - ④ 增量去重：凡进入过某轮候选的文档都进 retrieved，后续轮不再召回；
@@ -59,7 +59,7 @@ class AgenticRecallLoop:
     """多轮召回循环。复用 AgenticRouter 机制做轮内并发召回与接地。
 
     每轮产出形状：{"ctx", "nodes", "src_docs", "cov_nodes",
-    "doc_pages_map", "pages_with_text"}（来自 router._act_tree_search）。
+    "doc_pages_map", "pages_with_text"}（来自 SuperTreeIndex.act_tree_search，T32.2）。
     返回形状与 router 搜索结果一致（query/mode/answer/confidence/matched_docs/
     selected_nodes/pages），仅附加 rounds_used / note 元数据（additive）。
     """
@@ -289,7 +289,7 @@ class AgenticRecallLoop:
                 continue
             # [Fix] verifier 的 _normalize_need 保留 doc_id 原样——LLM 可能回数字
             # （如 "doc_id": 5），若不强转字符串，int 永不命中 str 集合 `retrieved`
-            # → 已召回文档被重复拉取，且 int 流入 _act_tree_search（List[str]）。
+            # → 已召回文档被重复拉取，且 int 流入 act_tree_search（List[str]）。
             doc_id = str(doc_id)
             if not doc_id:
                 continue
@@ -302,7 +302,9 @@ class AgenticRecallLoop:
     async def _run_round(self, query: str, candidates: List[str], node_matches=None) -> Dict:
         """轮内 Act：树搜索 + 预算内上下文构建（替换语义——每轮整体重建）。"""
         ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = (
-            await self.router._act_tree_search(query, list(candidates), node_matches=node_matches)
+            await self.router.super_tree_index.act_tree_search(
+                query, list(candidates), node_matches=node_matches
+            )
         )
         return {
             "ctx": ctx,

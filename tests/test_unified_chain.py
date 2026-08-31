@@ -193,15 +193,17 @@ async def test_super_tree_expand_wires_recall_loop_named_fetch(env):
     async def _l1(model, prompt, **kw):
         return json.dumps({"doc_ids": ["d1"]})
 
-    # 记录 _act_tree_search 每轮的候选文档序列（保留真实生产 act）
-    real_act = router._act_tree_search
+    # 记录 act_tree_search 每轮的候选文档序列（保留真实生产 act；
+    # T32.2：act 实现已移入 SuperTreeIndex，recall_loop 经引擎公共名调用）
+    engine = client.super_tree_index
+    real_act = engine.act_tree_search
     act_calls = []
 
     async def recording_act(query, candidate_docs, **kwargs):
         act_calls.append(list(candidate_docs))
         return await real_act(query, candidate_docs, **kwargs)
 
-    router._act_tree_search = recording_act
+    engine.act_tree_search = recording_act
 
     with patch.object(env.super_tree_mod, "llm_acompletion", new=_l1), \
          patch.object(env.enhance_mod, "llm_completion",

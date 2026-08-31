@@ -32,6 +32,8 @@ import importlib.util
 # verifier/router/multi_hop 逐个 spec 加载）整体退役。
 import pageindex_mutil.agentic.router as router_mod
 import pageindex_mutil.agentic.multi_hop as multi_hop_mod
+import pageindex_mutil.super_tree as super_tree_mod
+from pageindex_mutil.super_tree import SuperTreeIndex
 
 MultiHopReasoner = multi_hop_mod.MultiHopReasoner
 
@@ -82,13 +84,14 @@ def _make_reasoner(model="test-model", retrieve_model="retrieve-model"):
     router._load_main_funcs.return_value = {
         "generate_answer": MagicMock(return_value="final answer"),
     }
-    router._act_tree_search = AsyncMock(
-        return_value=("context text", [], 1, 1, {"doc1": [1]}, [])
-    )
     router.verifier = MagicMock()
     router.verifier.verify.return_value = MagicMock(action="accept")
     router.client = client
     router.super_tree_index = client.super_tree_index
+    # T32.2: multi_hop 经 router.super_tree_index.act_tree_search 调检索引擎
+    router.super_tree_index.act_tree_search = AsyncMock(
+        return_value=("context text", [], 1, 1, {"doc1": [1]}, [])
+    )
 
     reasoner = MultiHopReasoner(
         model=model,
@@ -187,7 +190,7 @@ class TestMultiHopLoop:
             {"id": 10, "pdf_name": "doc_B.pdf", "confidence": 0.8},
         ]
 
-        router._act_tree_search = AsyncMock(
+        router.super_tree_index.act_tree_search = AsyncMock(
             return_value=("hop context", [], 1, 1, {}, [])
         )
 
@@ -209,7 +212,7 @@ class TestMultiHopLoop:
             ))
 
         # Should have navigated at least twice
-        assert router._act_tree_search.await_count >= 2
+        assert router.super_tree_index.act_tree_search.await_count >= 2
         assert result["answer"]
         assert result["confidence"] in ("high", "medium", "low")
 
@@ -268,7 +271,7 @@ class TestMultiHopLoop:
             {"id": 50, "pdf_name": "docs.pdf", "confidence": 0.7},
         ]
 
-        router._act_tree_search = AsyncMock(
+        router.super_tree_index.act_tree_search = AsyncMock(
             return_value=("context", [], 1, 1, {}, [])
         )
 
@@ -317,7 +320,7 @@ class TestMaxHopsLimit:
         ]
         client.db.get_entity_documents.return_value = [{"id": 1, "pdf_name": "d.pdf"}]
 
-        router._act_tree_search = AsyncMock(
+        router.super_tree_index.act_tree_search = AsyncMock(
             return_value=("ctx", [], 1, 1, {}, [])
         )
 
@@ -328,7 +331,7 @@ class TestMaxHopsLimit:
             ))
 
         # Should stop at max_hops=2 (not 3 or 4)
-        assert router._act_tree_search.await_count <= 2
+        assert router.super_tree_index.act_tree_search.await_count <= 2
         assert result["answer"]
 
 
@@ -350,7 +353,7 @@ class TestEarlyTermination:
             "next_hop_hint": "",
         })
 
-        router._act_tree_search = AsyncMock(
+        router.super_tree_index.act_tree_search = AsyncMock(
             return_value=("context", [], 1, 1, {}, [])
         )
 
@@ -361,7 +364,7 @@ class TestEarlyTermination:
             ))
 
         # Only 1 hop should execute (no next hop to follow)
-        assert router._act_tree_search.await_count == 1
+        assert router.super_tree_index.act_tree_search.await_count == 1
         assert result["answer"]
 
     def test_empty_context_stops_loop(self):
@@ -379,7 +382,7 @@ class TestEarlyTermination:
         })
 
         # Navigation returns empty context
-        router._act_tree_search = AsyncMock(
+        router.super_tree_index.act_tree_search = AsyncMock(
             return_value=("", [], 0, 0, {}, [])
         )
 
@@ -390,7 +393,7 @@ class TestEarlyTermination:
             ))
 
         # Empty context should trigger early termination
-        assert router._act_tree_search.await_count == 1
+        assert router.super_tree_index.act_tree_search.await_count == 1
 
 
 class TestRetrieveModelWiring:
@@ -416,7 +419,7 @@ class TestRetrieveModelWiring:
         decompose = json.dumps({"decomposable": True, "sub_queries": ["Q1"]})
         extract = json.dumps({"entities": [], "facts": [], "next_hop_hint": ""})
 
-        router._act_tree_search = AsyncMock(
+        router.super_tree_index.act_tree_search = AsyncMock(
             return_value=("ctx", [], 1, 1, {}, [])
         )
 
@@ -464,7 +467,7 @@ class TestTokenBudget:
 
         # Each hop returns a small context
         small_ctx = "x" * 100
-        router._act_tree_search = AsyncMock(
+        router.super_tree_index.act_tree_search = AsyncMock(
             return_value=(small_ctx, [], 1, 1, {}, [])
         )
 
@@ -494,7 +497,7 @@ class TestTokenBudget:
 
         # Return a large context that exceeds budget
         huge_ctx = "x" * 20000
-        router._act_tree_search = AsyncMock(
+        router.super_tree_index.act_tree_search = AsyncMock(
             return_value=(huge_ctx, [], 1, 1, {}, [])
         )
 
@@ -510,7 +513,7 @@ class TestTokenBudget:
             ))
 
         # Should have stopped after first hop due to budget
-        assert router._act_tree_search.await_count == 1
+        assert router.super_tree_index.act_tree_search.await_count == 1
         assert result["answer"]
 
 
@@ -568,7 +571,7 @@ class TestGraphGuidedNextHop:
             hop_count[0] += 1
             return (f"ctx_hop{hop_count[0]}", [], 1, 1, {}, [])
 
-        router._act_tree_search = AsyncMock(side_effect=mock_act_tree)
+        router.super_tree_index.act_tree_search = AsyncMock(side_effect=mock_act_tree)
 
         llm_calls = []
         def mock_acompletion(model, prompt, **kw):
@@ -619,7 +622,7 @@ class TestReasonerResultStructure:
             "next_hop_hint": "",
         })
 
-        router._act_tree_search = AsyncMock(
+        router.super_tree_index.act_tree_search = AsyncMock(
             return_value=("ctx", [], 1, 1, {}, [])
         )
 
@@ -689,7 +692,7 @@ class TestMatchedDocsPopulated:
                 scores["doc-uuid-2"] = 0.5
             return ("ctx2", [{"node_id": "n2"}], 1, 1, {"doc-uuid-2": [3]}, [])
 
-        router._act_tree_search = AsyncMock(side_effect=mock_act_tree)
+        router.super_tree_index.act_tree_search = AsyncMock(side_effect=mock_act_tree)
 
         llm_calls = [0]
         def mock_acompletion(model, prompt, **kw):
@@ -773,7 +776,7 @@ class TestMultiHopCRAGVerification:
     def _run_multi_hop(self, reasoner, router, client):
         decompose = json.dumps({"decomposable": True, "sub_queries": ["Q1"]})
         extract = json.dumps({"entities": [], "facts": [], "next_hop_hint": ""})
-        router._act_tree_search = AsyncMock(
+        router.super_tree_index.act_tree_search = AsyncMock(
             return_value=("hop ctx", [{"node_id": "n1"}, {"node_id": "n2"}],
                           1, 2, {"docX": [1]}, [])
         )
@@ -900,8 +903,23 @@ class TestMultiHopEntityToDocE2E:
             ),
             "generate_answer": MagicMock(return_value="e2e final answer"),
         }
-        router._act_tree_search = types.MethodType(AgenticRouter._act_tree_search, router)
-        router._recall_nodes_for_doc = types.MethodType(AgenticRouter._recall_nodes_for_doc, router)
+        # T32.2: 搬移后的 act/recall 经 super_tree._load_reason_funcs 取
+        # spans/build_ctx——同参数量在引擎模块面注入（router 面 stub 继续供
+        # multi_hop._generate_answer 消费，语义不分叉）。
+        _reason_funcs = {
+            "spans_from_nodes": MagicMock(return_value={"pages": [1], "lines": []}),
+            "build_context_for_doc": MagicMock(
+                side_effect=lambda doc, selected, pages: "\n".join(
+                    n.get("text", "") for n in selected
+                )
+            ),
+            "generate_answer": MagicMock(return_value="e2e final answer"),
+        }
+        # T32.2: act/recall 实现已属 SuperTreeIndex——挂生产同构真实引擎；
+        # 引擎体内函数级导入（super_tree.py 视角 .utils/.agentic.*）经 sys.modules
+        # 解析，与旧 router.py 内联导入同一生效机制。
+        sti = SuperTreeIndex(client.db, "m", client, retrieve_model="m")
+        router.super_tree_index = sti
 
         reasoner = MultiHopReasoner(model="m", retrieve_model="m")
 
@@ -917,6 +935,8 @@ class TestMultiHopEntityToDocE2E:
         with patch.object(
             multi_hop_mod, "llm_acompletion",
             side_effect=lambda m, p, **kw: decompose if "decomposable" in p or "可分解" in p else extract,
+        ), patch.object(
+            super_tree_mod, "_REASON_FUNCS", _reason_funcs
         ), patch.object(
             enhance_mod_e2e, "llm_completion",
             return_value=json.dumps({
@@ -943,8 +963,8 @@ class TestMultiHopEntityToDocE2E:
 
             # 4) Chain proof: real recall succeeds for the UUID and returns None for
             #    the old stringified DB id (which is what broke the link).
-            ok = asyncio.run(router._recall_nodes_for_doc("q", "uuid-doc-10"))
+            ok = asyncio.run(router.super_tree_index.recall_nodes_for_doc("q", "uuid-doc-10"))
             assert ok is not None
             assert ok["doc_id"] == "uuid-doc-10"
-            broken = asyncio.run(router._recall_nodes_for_doc("q", "10"))
+            broken = asyncio.run(router.super_tree_index.recall_nodes_for_doc("q", "10"))
             assert broken is None

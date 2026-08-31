@@ -68,7 +68,11 @@ def mock_client():
 
 @pytest.fixture
 def router(mock_client):
-    return _router_mod().AgenticRouter(mock_client, model="qwen-plus", retrieve_model="qwen-flash")
+    r = _router_mod().AgenticRouter(mock_client, model="qwen-plus", retrieve_model="qwen-flash")
+    # T32.2: act/recall 实现已移入 SuperTreeIndex——recall_loop 经
+    # router.super_tree_index.act_tree_search 调引擎；测试 patch 面挂引擎替身。
+    r.super_tree_index = MagicMock()
+    return r
 
 
 def _loop(router):
@@ -112,7 +116,7 @@ def _fused_pool(n=12):
 class TestRoundOneFastPath:
     @pytest.mark.asyncio
     async def test_answer_verdict_returns_after_one_round(self, router):
-        router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
+        router.super_tree_index.act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.9, "answer"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
@@ -124,7 +128,7 @@ class TestRoundOneFastPath:
         assert result["mode"] == "multi"
         assert BASE_KEYS <= set(result.keys())
         # 一次 Act + 一次校验 —— 无第二轮开销（独立 Route 已退役，轮 1 融合序由调用方提供）
-        assert router._act_tree_search.await_count == 1
+        assert router.super_tree_index.act_tree_search.await_count == 1
         router.verifier.verify.assert_called_once()
 
 
@@ -143,7 +147,7 @@ class TestExpandNamedFetch:
             act_calls.append(list(candidates))
             return _act_outcome(docs=candidates[:1])
 
-        router._act_tree_search = fake_act
+        router.super_tree_index.act_tree_search = fake_act
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.9, "answer"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
@@ -163,7 +167,7 @@ class TestExpandNamedFetch:
     @pytest.mark.asyncio
     async def test_expand_with_empty_need_stops_no_target(self, router):
         """[S8] need 为空 → 无点名对象 → no_target 终止进 best_effort（不再滑窗扩召）。"""
-        router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
+        router.super_tree_index.act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.5, "expand", need=[]))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
@@ -172,7 +176,7 @@ class TestExpandNamedFetch:
         assert result["confidence"] == "low"
         assert "尽力作答" in result["note"]
         assert result["rounds_used"] == 1  # 轮 2 未开：need 空 → no_target
-        assert router._act_tree_search.await_count == 1  # 仅轮 1；best_effort 复用轮 1 状态
+        assert router.super_tree_index.act_tree_search.await_count == 1  # 仅轮 1；best_effort 复用轮 1 状态
 
     @pytest.mark.asyncio
     async def test_expand_named_need_skips_already_retrieved(self, router):
@@ -183,7 +187,7 @@ class TestExpandNamedFetch:
             act_calls.append(list(candidates))
             return _act_outcome(docs=candidates[:1])
 
-        router._act_tree_search = fake_act
+        router.super_tree_index.act_tree_search = fake_act
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.5, "expand"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
@@ -202,7 +206,7 @@ class TestExpandNamedFetch:
 class TestRefuse:
     @pytest.mark.asyncio
     async def test_refuse_returns_immediately(self, router):
-        router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1"]))
+        router.super_tree_index.act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1"]))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.1, "refuse"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
@@ -210,7 +214,7 @@ class TestRefuse:
 
         assert result["answer"] == "I don't know."
         assert result["confidence"] == "low"
-        router._act_tree_search.assert_awaited_once()
+        router.super_tree_index.act_tree_search.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +231,7 @@ class TestRoundsExhaustedBestEffort:
             act_calls.append(list(candidates))
             return _act_outcome(ctx="ctx-" + ",".join(candidates), docs=candidates)
 
-        router._act_tree_search = fake_act
+        router.super_tree_index.act_tree_search = fake_act
         # 逐轮 need 点名：轮 2 补 d4-d6，轮 3 补 d7，轮 3 后 need 空 → 循环耗尽
         router.verifier.verify = MagicMock(side_effect=[
             VerifyResult(0.5, "expand", need=[{"doc_id": f"d{i}", "reason": "缺"} for i in range(4, 7)]),
@@ -258,7 +262,7 @@ class TestRoundsExhaustedBestEffort:
     @pytest.mark.asyncio
     async def test_max_rounds_one_expands_straight_to_best_effort(self, router):
         """max_rounds=1：轮 1 expand 判定但无处可扩 → 直接 best_effort。"""
-        router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
+        router.super_tree_index.act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.5, "expand"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
@@ -269,7 +273,7 @@ class TestRoundsExhaustedBestEffort:
         assert result["rounds_used"] == 1
         assert result["answer"] == "ANS"
         # 轮 2 未开；best_effort 走轮 1 状态快捷路径（未重跑 Act）
-        assert router._act_tree_search.await_count == 1
+        assert router.super_tree_index.act_tree_search.await_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +304,7 @@ class TestHonestRefusalOnEmptyPool:
 class TestLatencyBudget:
     @pytest.mark.asyncio
     async def test_tiny_latency_budget_stops_before_round2(self, router):
-        router._act_tree_search = AsyncMock(return_value=_act_outcome())
+        router.super_tree_index.act_tree_search = AsyncMock(return_value=_act_outcome())
         router._main_funcs = {"generate_answer": MagicMock(return_value="R1ANS")}
 
         loop = _loop(router)
@@ -314,7 +318,7 @@ class TestLatencyBudget:
         assert "尽力作答" in result["note"]
         assert result["rounds_used"] == 1
         assert result["answer"] == "R1ANS"  # 轮 1 状态直接兜底（未重跑 Act）
-        router._act_tree_search.assert_not_awaited()
+        router.super_tree_index.act_tree_search.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +333,7 @@ class TestRoundTimeout:
             await asyncio.sleep(5)
             return _act_outcome()
 
-        router._act_tree_search = hang
+        router.super_tree_index.act_tree_search = hang
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.9, "answer"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="R1ANS")}
 
@@ -358,7 +362,7 @@ class TestRoundTimeout:
 class TestTokenLedgerCap:
     @pytest.mark.asyncio
     async def test_over_budget_stops_before_next_round(self, router):
-        router._act_tree_search = AsyncMock(return_value=_act_outcome(
+        router.super_tree_index.act_tree_search = AsyncMock(return_value=_act_outcome(
             ctx="x" * 2000, docs=["d1", "d2", "d3"],
         ))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.5, "expand"))
@@ -371,7 +375,7 @@ class TestTokenLedgerCap:
         assert result["confidence"] == "low"
         assert "尽力作答" in result["note"]
         assert result["rounds_used"] == 1
-        assert router._act_tree_search.await_count == 1  # 轮 2 未开
+        assert router.super_tree_index.act_tree_search.await_count == 1  # 轮 2 未开
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +386,7 @@ class TestTokenLedgerCap:
 class TestComponentTolerance:
     @pytest.mark.asyncio
     async def test_verifier_error_degrades_to_best_effort(self, router):
-        router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1"]))
+        router.super_tree_index.act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1"]))
         router.verifier.verify = MagicMock(side_effect=RuntimeError("verifier exploded"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
@@ -395,7 +399,7 @@ class TestComponentTolerance:
     @pytest.mark.asyncio
     async def test_generator_exception_contained_to_best_effort(self, router):
         """回归：生成器抛错不得击穿 retrieve()——已有接地证据时降级为形态完整的 best_effort。"""
-        router._act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
+        router.super_tree_index.act_tree_search = AsyncMock(return_value=_act_outcome(docs=["d1", "d2", "d3"]))
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.9, "answer"))
         router._main_funcs = {
             "generate_answer": MagicMock(side_effect=RuntimeError("generator exploded"))
@@ -428,7 +432,7 @@ class TestNodeMatchesForwarding:
             seen_matches.append(dict(node_matches or {}))
             return _act_outcome(docs=candidates[:1])
 
-        router._act_tree_search = fake_act
+        router.super_tree_index.act_tree_search = fake_act
         router.verifier.verify = MagicMock(return_value=VerifyResult(0.9, "answer"))
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
@@ -461,7 +465,7 @@ class TestContinuationPoolReuse:
             act_calls.append(list(candidates))
             return _act_outcome(docs=candidates[:1])
 
-        router._act_tree_search = fake_act
+        router.super_tree_index.act_tree_search = fake_act
         # 独立模式已退役：retrieve 不得再自行 Plan
         router.planner.plan = AsyncMock(return_value=PlanResult(
             queries=["q"], weights={"metadata": 1.0}, query_type="factual"
@@ -553,7 +557,7 @@ class TestIndependentModeRetired:
     async def test_missing_first_round_fused_returns_graceful_empty(self, router):
         """[T13] 独立模式退役：retrieve 不再自行 Plan/Route，
         first_round_fused=None → 优雅空响应（不抛、不触 LLM）。"""
-        router._act_tree_search = AsyncMock(return_value=_act_outcome())
+        router.super_tree_index.act_tree_search = AsyncMock(return_value=_act_outcome())
         router._main_funcs = {"generate_answer": MagicMock(return_value="ANS")}
 
         result = await _loop(router).retrieve("q", top_k=3)
@@ -563,4 +567,4 @@ class TestIndependentModeRetired:
         assert result["matched_docs"] == []
         assert result["rounds_used"] == 0
         assert "独立模式已退役" in result["note"]
-        router._act_tree_search.assert_not_awaited()
+        router.super_tree_index.act_tree_search.assert_not_awaited()

@@ -42,7 +42,8 @@ class MultiHopReasoner:
 
         Args:
             query: The user query.
-            router: AgenticRouter instance (for _search_super_tree and _act_tree_search).
+            router: AgenticRouter instance (for _search_super_tree and
+                super_tree_index.act_tree_search — T32.2 后 act 实现属检索引擎).
             db: PageIndexDB instance (for entity graph queries).
             max_hops: Maximum number of hops (default 3).
             token_budget: Total token budget across all hops (default 16000).
@@ -70,7 +71,7 @@ class MultiHopReasoner:
         visited_entities = set()
 
         # entity→document ids from the graph are DB integers; downstream recall
-        # (_recall_nodes_for_doc) is keyed by UUID, so resolve them here.
+        # （recall_nodes_for_doc，T32.2 后属 SuperTreeIndex） is keyed by UUID, so resolve them here.
         id_mapper = getattr(getattr(router, "client", None), "_id_mapper", None)
         to_uuid = getattr(id_mapper, "to_uuid", None)
 
@@ -81,8 +82,15 @@ class MultiHopReasoner:
             hop_scores: Dict[str, float] = {}
             try:
                 candidate_docs = self._get_candidate_docs(db, current_query, visited_entities, to_uuid)
+                # T32.2: act 树搜索已移入 SuperTreeIndex（引擎公共 API）；无引擎的
+                # 旧式调用方（mock/裸 router）回退薄委托面，保持可编译。
+                engine = getattr(router, "super_tree_index", None)
+                act_tree_search = (
+                    engine.act_tree_search if engine is not None
+                    else router._act_tree_search
+                )
                 ctx, nodes, src_docs, cov_nodes, doc_pages_map, pages_with_text = (
-                    await router._act_tree_search(
+                    await act_tree_search(
                         current_query, candidate_docs, doc_scores_out=hop_scores
                     )
                 )
@@ -107,7 +115,7 @@ class MultiHopReasoner:
             all_selected_nodes.extend(nodes or [])
             all_pages.extend(pages_with_text or [])
             if doc_pages_map:
-                # score = 节点召回覆盖度（_act_tree_search 经 doc_scores_out 回填，
+                # score = 节点召回覆盖度（act_tree_search 经 doc_scores_out 回填，
                 # evidence-derived，(0,1]）；覆盖度缺失（防御场景）回退 1.0。
                 seen_docs = {d["doc_id"] for d in all_matched_docs}
                 all_matched_docs.extend(
@@ -322,7 +330,7 @@ class MultiHopReasoner:
         """Get candidate document UUIDs from entity graph for the current sub-query.
 
         Entity tables reference documents by DB integer id, but downstream tree
-        navigation (_recall_nodes_for_doc) is keyed by UUID. When a `to_uuid`
+        navigation （recall_nodes_for_doc，T32.2 后属 SuperTreeIndex） is keyed by UUID. When a `to_uuid`
         mapper is provided, DB ids are converted at this outlet; unmapped ids
         are dropped (they could never be retrieved anyway). Without a mapper,
         fall back to the legacy str(db_id) behavior.

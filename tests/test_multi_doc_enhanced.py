@@ -46,6 +46,11 @@ def _router_mod():
     return m
 
 
+def _super_tree_mod():
+    import pageindex_mutil.super_tree as m
+    return m
+
+
 def _multi_hop_mod():
     import pageindex_mutil.agentic.multi_hop as m
     return m
@@ -94,6 +99,14 @@ def _router_with_doc(structure, doc_id="doc1", model="m-model", retrieve_model="
     client.db = None
     client._uuid_to_db = {}
     router = AgenticRouter(client, model=model, retrieve_model=retrieve_model)
+    # T32.2: act/recall 实现已移入 SuperTreeIndex（检索引擎）。按生产同构挂一个
+    # 真实引擎（db=None：KeywordIndex/KBIdentity 仅存引用，config/backfill 有
+    # try-except 兜底），router._recall_nodes_for_doc/_act_tree_search 薄委托 →
+    # 引擎真实方法；测试在引擎实例属性上替换单步。
+    engine = _super_tree_mod().SuperTreeIndex(client.db, model, client,
+                                              retrieve_model=retrieve_model)
+    client.super_tree_index = engine
+    router.super_tree_index = engine
     return router, client
 
 
@@ -393,9 +406,10 @@ class TestSuperTreeMatchedScores:
         （derive_evidence_score，通道命中加权标量，[S6]#8）。"""
         router, client = _router_with_doc([_node("n0")])
 
-        mock_st = MagicMock()
+        # T32.2: 真实引擎已由 _router_with_doc 挂上（act/recall 在引擎上）；
+        # 仅 mock L1 选档返回，不再整体替换 super_tree_index。
+        mock_st = router.super_tree_index
         mock_st.select_documents = AsyncMock(return_value=(["doc1"], {}))
-        router.super_tree_index = mock_st
         router.planner.plan = AsyncMock(return_value=_plan_result())
         router.verifier.verify = MagicMock(return_value=MagicMock(action="answer"))
 
@@ -444,9 +458,10 @@ class TestSuperTreeMatchedScores:
         """LLM 精挑为空（无召回证据）的文档不进 matched（不虚报匹配）。"""
         router, client = _router_with_doc([_node("n0")])
 
-        mock_st = MagicMock()
+        # T32.2: 真实引擎已由 _router_with_doc 挂上（act/recall 在引擎上）；
+        # 仅 mock L1 选档返回，不再整体替换 super_tree_index。
+        mock_st = router.super_tree_index
         mock_st.select_documents = AsyncMock(return_value=(["doc1"], {}))
-        router.super_tree_index = mock_st
         router.planner.plan = AsyncMock(return_value=_plan_result())
         router.verifier.verify = MagicMock(return_value=MagicMock(action="answer"))
 
@@ -470,11 +485,12 @@ class TestSuperTreeMatchedScores:
         """Act 阶段异常 → 无证据接地 → matched 为空（不再带硬编码 1.0）。"""
         router, client = _router_with_doc([_node("n0")])
 
-        mock_st = MagicMock()
+        # T32.2: 真实引擎已由 _router_with_doc 挂上（act/recall 在引擎上）；
+        # 仅 mock L1 选档返回，不再整体替换 super_tree_index。
+        mock_st = router.super_tree_index
         mock_st.select_documents = AsyncMock(return_value=(["doc1"], {}))
-        router.super_tree_index = mock_st
         router.planner.plan = AsyncMock(return_value=_plan_result())
-        router._act_tree_search = AsyncMock(side_effect=RuntimeError("boom"))
+        router.super_tree_index.act_tree_search = AsyncMock(side_effect=RuntimeError("boom"))
 
         client.db = MagicMock()
         client._id_mapper = None
@@ -492,12 +508,12 @@ class TestActTreeSearchScoresOut:
     """doc_scores_out：证据派生分数回填（预算截断前全量记录）。"""
 
     @pytest.mark.asyncio
-    async def test_doc_scores_out_filled_for_all_recall_successes(self):
+    async def test_doc_scores_out_filled_for_all_recall_successes(self, monkeypatch):
         router, _ = _router_with_doc([_node("n0")])
-        router._main_funcs = {
+        monkeypatch.setattr(_super_tree_mod(), "_REASON_FUNCS", {
             "build_context_for_doc": lambda doc, selected, pages: "ctx",
             "spans_from_nodes": lambda n: [1],
-        }
+        })
 
         async def fake_recall(query, doc_id, matched_info=None):
             if doc_id == "d2":
@@ -511,19 +527,19 @@ class TestActTreeSearchScoresOut:
                 "relevance_score": 0.3333,
             }
 
-        router._recall_nodes_for_doc = fake_recall
+        router.super_tree_index.recall_nodes_for_doc = fake_recall
         scores = {}
         await router._act_tree_search("q", ["d1", "d2"], doc_scores_out=scores)
         assert scores == {"d1": 0.3333}
 
     @pytest.mark.asyncio
-    async def test_doc_scores_out_optional_backward_compatible(self):
+    async def test_doc_scores_out_optional_backward_compatible(self, monkeypatch):
         """不传 doc_scores_out 行为不变（recall_loop/multi_hop 旧式调用兼容）。"""
         router, _ = _router_with_doc([_node("n0")])
-        router._main_funcs = {
+        monkeypatch.setattr(_super_tree_mod(), "_REASON_FUNCS", {
             "build_context_for_doc": lambda doc, selected, pages: "ctx",
             "spans_from_nodes": lambda n: [1],
-        }
+        })
 
         async def fake_recall(query, doc_id, matched_info=None):
             return {
@@ -535,7 +551,7 @@ class TestActTreeSearchScoresOut:
                 "relevance_score": 1.0,
             }
 
-        router._recall_nodes_for_doc = fake_recall
+        router.super_tree_index.recall_nodes_for_doc = fake_recall
         ctx, nodes, src_docs, cov, dpm, pwt = await router._act_tree_search("q", ["d1"])
         assert src_docs == 1
 
@@ -572,7 +588,9 @@ class TestMultiHopMatchedScores:
         router._load_main_funcs.return_value = {
             "generate_answer": MagicMock(return_value="final"),
         }
-        router._act_tree_search = AsyncMock(side_effect=act_side_effect)
+        # T32.2: multi_hop 经 router.super_tree_index.act_tree_search 调引擎
+        router.super_tree_index = MagicMock()
+        router.super_tree_index.act_tree_search = AsyncMock(side_effect=act_side_effect)
         router.verifier = MagicMock()
         router.verifier.verify.return_value = MagicMock(action="answer")
 
@@ -627,7 +645,8 @@ class TestMultiHopMatchedScores:
         router._load_main_funcs.return_value = {
             "generate_answer": MagicMock(return_value="final"),
         }
-        router._act_tree_search = AsyncMock(side_effect=fake_act)
+        router.super_tree_index = MagicMock()
+        router.super_tree_index.act_tree_search = AsyncMock(side_effect=fake_act)
         router.verifier = None  # 走启发式 confidence，聚焦 matched 断言
 
         decompose = json.dumps({"decomposable": True})
@@ -724,9 +743,10 @@ class TestMdNodeRecallNoPagesGate:
             _md_node("n2", title="天气", text="今天天气不错。"),
         ])
 
-        mock_st = MagicMock()
+        # T32.2: 真实引擎已由 _router_with_doc 挂上（act/recall 在引擎上）；
+        # 仅 mock L1 选档返回，不再整体替换 super_tree_index。
+        mock_st = router.super_tree_index
         mock_st.select_documents = AsyncMock(return_value=(["doc1"], {}))
-        router.super_tree_index = mock_st
         router.planner.plan = AsyncMock(return_value=_plan_result())
         router.verifier.verify = MagicMock(return_value=MagicMock(action="answer"))
 
@@ -784,6 +804,11 @@ class TestNFR4RouterSite:
         mock_client.db = None
 
         router = AgenticRouter(mock_client, model="m", retrieve_model="r-model")
+        # T32.2: recall 实现属检索引擎——挂真实构造的 SuperTreeIndex（db=None，
+        # 构造兜底齐全），薄委托/NFR4 断言链保持生产形状。
+        engine = _super_tree_mod().SuperTreeIndex(mock_client.db, "m", mock_client,
+                                                  retrieve_model="r-model")
+        router.super_tree_index = engine
 
         def fake_llm(model, prompt, **kw):
             models.append(model)
@@ -829,14 +854,14 @@ class TestNodeEntitiesPassThrough:
         assert [n["node_id"] for n in result["selected"]] == ["n1"]
 
     @pytest.mark.asyncio
-    async def test_act_tree_search_aggregates_bundle_node_entities(self):
+    async def test_act_tree_search_aggregates_bundle_node_entities(self, monkeypatch):
         """[S7] _act_tree_search 从 evidence_bundle 按 doc 聚合 {node_id: 实体条目}
         透传 _recall_nodes_for_doc（db_id→uuid 反查）。"""
         router, client = _router_with_doc([_node("n0")])
-        router._main_funcs = {
+        monkeypatch.setattr(_super_tree_mod(), "_REASON_FUNCS", {
             "build_context_for_doc": lambda doc, selected, pages: "ctx",
             "spans_from_nodes": lambda n: [1],
-        }
+        })
 
         calls = []
 
@@ -851,7 +876,7 @@ class TestNodeEntitiesPassThrough:
                 "relevance_score": 1.0,
             }
 
-        router._recall_nodes_for_doc = fake_recall
+        router.super_tree_index.recall_nodes_for_doc = fake_recall
         from pageindex_mutil.client import DocIdMapper
         client._id_mapper = DocIdMapper()
         client._id_mapper.register("doc1", 7)

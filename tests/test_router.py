@@ -19,6 +19,7 @@ sys.path.insert(0, str(pageindex_path))
 # _ensure_utils_configloader 两套规避手法）整体退役——那套机器的存在前提是
 # `import pageindex_mutil` 触发重依赖链，现已不成立。
 import pageindex_mutil.agentic.router as router_mod
+import pageindex_mutil.super_tree as super_tree_mod
 from pageindex_mutil.agentic import evidence as evidence_module
 
 AgenticRouter = router_mod.AgenticRouter
@@ -27,6 +28,24 @@ AgenticRouter = router_mod.AgenticRouter
 def _bundle(entries):
     """构造证据束 + 空 ctx（build_evidence_bundle patch 返回值）。"""
     return (entries, {"tokens": [], "query_entities": []})
+
+
+def _mount_real_engine(router):
+    """T32.2：_act_tree_search/_recall_nodes_for_doc 实现已移入 SuperTreeIndex。
+    给 router 挂一个引擎宿主（client/model/retrieve_model 跟随 router，与
+    生产构造入参同名），绑定真实 act/recall——测试在引擎实例属性上替换单步
+    即可（act 体内 self.recall_nodes_for_doc 派发到同一宿主）。"""
+    import types as _types
+    from pageindex_mutil.super_tree import SuperTreeIndex
+    sti = _types.SimpleNamespace(
+        client=router.client,
+        model=router.model,
+        retrieve_model=router.retrieve_model,
+    )
+    sti.recall_nodes_for_doc = _types.MethodType(SuperTreeIndex.recall_nodes_for_doc, sti)
+    sti.act_tree_search = _types.MethodType(SuperTreeIndex.act_tree_search, sti)
+    router.super_tree_index = sti
+    return sti
 
 
 @pytest.fixture
@@ -107,7 +126,8 @@ class TestSearchSuperTree:
             1: {"channels": {"keyword": [], "tag": [], "entity": [], "vector": []}, "graph": {}},
         }
 
-        # Mock _act_tree_search to return context（T6.4：回填证据派生分数）
+        # Mock act_tree_search to return context（T6.4：回填证据派生分数；
+        # T32.2：_search_super_tree 经 super_tree_index.act_tree_search 调引擎）
         async def fake_act(query, docs, node_matches=None, doc_scores_out=None,
                            evidence_bundle=None, evidence_ctx=None):
             if doc_scores_out is not None:
@@ -122,7 +142,7 @@ class TestSearchSuperTree:
                 [{"doc_id": "uuid-1", "page": 1}],  # pages_with_text
             )
 
-        router._act_tree_search = AsyncMock(side_effect=fake_act)
+        mock_st.act_tree_search = AsyncMock(side_effect=fake_act)
 
         # Mock verifier
         mock_verify_result = MagicMock()
@@ -158,7 +178,7 @@ class TestSearchSuperTree:
             1: {"channels": {"keyword": [], "tag": [], "entity": [], "vector": []}, "graph": {}},
         }
 
-        router._act_tree_search = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_st.act_tree_search = AsyncMock(side_effect=RuntimeError("boom"))
 
         with patch.object(evidence_module, "build_evidence_bundle",
                           return_value=_bundle(bundle)):
@@ -180,7 +200,7 @@ class TestSearchSuperTree:
             1: {"channels": {"keyword": [], "tag": [], "entity": [], "vector": []}, "graph": {}},
         }
 
-        router._act_tree_search = AsyncMock(return_value=(
+        mock_st.act_tree_search = AsyncMock(return_value=(
             "some context",
             [{"node_id": "n1", "title": "Section 1"}],
             1, 1, {"uuid-1": [1]},
@@ -214,7 +234,7 @@ class TestSearchRouting:
             1: {"channels": {"keyword": [], "tag": [], "entity": [], "vector": []}, "graph": {}},
         }
 
-        router._act_tree_search = AsyncMock(return_value=(
+        mock_st.act_tree_search = AsyncMock(return_value=(
             "ctx", [{"node_id": "n1", "title": "T"}], 1, 1, {"uuid-1": [1]},
             [{"doc_id": "uuid-1", "page": 1}],
         ))
@@ -307,10 +327,10 @@ class TestActTreeSearchBudget:
         # 文件（此前被防御性 purge 掩盖，purge 退役后裸奔成顺序性污染源）。
         monkeypatch.setitem(sys.modules, "pageindex_mutil.reasoning", reasoning_stub)
 
-        router._main_funcs = {
+        monkeypatch.setattr(super_tree_mod, "_REASON_FUNCS", {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
             "spans_from_nodes": lambda n: [1],
-        }
+        })
 
         async def fake_recall(query, doc_id, matched_info=None):
             return {
@@ -322,7 +342,8 @@ class TestActTreeSearchBudget:
                 "relevance_score": 1.0,
             }
 
-        router._recall_nodes_for_doc = fake_recall
+        sti = _mount_real_engine(router)
+        sti.recall_nodes_for_doc = fake_recall
 
         _ctx, _nodes, src_docs, _cov, _dpm, _pwt = await router._act_tree_search(
             "q", ["d1", "d2", "d3"]
@@ -352,10 +373,10 @@ class TestActTreeSearchBudget:
             side_effect=lambda doc, selected, pages:
                 "x" * 800 if doc["doc_name"] == "d1" else "x" * 400
         )
-        router._main_funcs = {
+        monkeypatch.setattr(super_tree_mod, "_REASON_FUNCS", {
             "build_context_for_doc": build_ctx,
             "spans_from_nodes": lambda n: [1],
-        }
+        })
 
         async def fake_recall(query, doc_id, matched_info=None):
             return {
@@ -367,7 +388,8 @@ class TestActTreeSearchBudget:
                 "relevance_score": 1.0,
             }
 
-        router._recall_nodes_for_doc = fake_recall
+        sti = _mount_real_engine(router)
+        sti.recall_nodes_for_doc = fake_recall
 
         ctx, _nodes, src_docs, _cov, dpm, _pwt = await router._act_tree_search(
             "q", ["d1", "d2"]
@@ -393,10 +415,10 @@ class TestActTreeSearchBudget:
         # 文件（此前被防御性 purge 掩盖，purge 退役后裸奔成顺序性污染源）。
         monkeypatch.setitem(sys.modules, "pageindex_mutil.reasoning", reasoning_stub)
 
-        router._main_funcs = {
+        monkeypatch.setattr(super_tree_mod, "_REASON_FUNCS", {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
             "spans_from_nodes": lambda n: [1],
-        }
+        })
 
         async def fake_recall(query, doc_id, matched_info=None):
             return {
@@ -408,7 +430,8 @@ class TestActTreeSearchBudget:
                 "relevance_score": 1.0,
             }
 
-        router._recall_nodes_for_doc = fake_recall
+        sti = _mount_real_engine(router)
+        sti.recall_nodes_for_doc = fake_recall
 
         _ctx, _nodes, src_docs, _cov, _dpm, _pwt = await router._act_tree_search(
             "q", ["d1", "d2"]
@@ -432,10 +455,10 @@ class TestActTreeSearchBudget:
         monkeypatch.setitem(sys.modules, "pageindex_mutil.reasoning", reasoning_stub)
 
         # 单篇 400 字符 = 100 token → 余量仅 50 token
-        router._main_funcs = {
+        monkeypatch.setattr(super_tree_mod, "_REASON_FUNCS", {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
             "spans_from_nodes": lambda n: [1],
-        }
+        })
 
         async def fake_recall(query, doc_id, matched_info=None):
             return {
@@ -447,7 +470,8 @@ class TestActTreeSearchBudget:
                 "relevance_score": 1.0,
             }
 
-        router._recall_nodes_for_doc = fake_recall
+        sti = _mount_real_engine(router)
+        sti.recall_nodes_for_doc = fake_recall
 
         # 实体块 ≈ 350+ 字符 ≈ 88 token > 余量 50 → 不得追加
         mock_db = MagicMock()
@@ -479,10 +503,10 @@ class TestActTreeSearchBudget:
         # 文件（此前被防御性 purge 掩盖，purge 退役后裸奔成顺序性污染源）。
         monkeypatch.setitem(sys.modules, "pageindex_mutil.reasoning", reasoning_stub)
 
-        router._main_funcs = {
+        monkeypatch.setattr(super_tree_mod, "_REASON_FUNCS", {
             "build_context_for_doc": lambda doc, selected, pages: "x" * 400,
             "spans_from_nodes": lambda n: [1],
-        }
+        })
 
         async def fake_recall(query, doc_id, matched_info=None):
             return {
@@ -494,7 +518,8 @@ class TestActTreeSearchBudget:
                 "relevance_score": 1.0,
             }
 
-        router._recall_nodes_for_doc = fake_recall
+        sti = _mount_real_engine(router)
+        sti.recall_nodes_for_doc = fake_recall
 
         mock_db = MagicMock()
         mock_db.search_entities.return_value = [{"id": 1, "name": "实体甲"}]
@@ -514,7 +539,7 @@ class TestActTreeSearchDedup:
     """[S6] 软归属去重：同一文档经多个簇分支命中 → 召回/预算只计一次。"""
 
     @pytest.mark.asyncio
-    async def test_candidate_docs_deduped_before_recall(self, router):
+    async def test_candidate_docs_deduped_before_recall(self, router, monkeypatch):
         calls = []
 
         async def fake_recall(query, doc_id, matched_info=None):
@@ -528,11 +553,12 @@ class TestActTreeSearchDedup:
                 "relevance_score": 1.0,
             }
 
-        router._recall_nodes_for_doc = fake_recall
-        router._main_funcs = {
+        sti = _mount_real_engine(router)
+        sti.recall_nodes_for_doc = fake_recall
+        monkeypatch.setattr(super_tree_mod, "_REASON_FUNCS", {
             "build_context_for_doc": lambda doc, selected, pages: "ctx",
             "spans_from_nodes": lambda n: [1],
-        }
+        })
 
         _ctx, _nodes, src_docs, _cov, dpm, _pwt = await router._act_tree_search(
             "q", ["d1", "d1", "d2", "d1"]
@@ -547,11 +573,11 @@ class TestActTreeSearchEvidenceSort:
     """[S8] 上下文组装排序：证据分（derive_evidence_score）降序主键，平分按
     candidate_docs 裁定序（次键）——与 matched_docs 同口径。"""
 
-    def _setup_recall(self, router):
-        router._main_funcs = {
+    def _setup_recall(self, router, monkeypatch):
+        monkeypatch.setattr(super_tree_mod, "_REASON_FUNCS", {
             "build_context_for_doc": lambda doc, selected, pages: "ctx",
             "spans_from_nodes": lambda n: [1],
-        }
+        })
 
         async def fake_recall(query, doc_id, matched_info=None):
             return {
@@ -563,12 +589,13 @@ class TestActTreeSearchEvidenceSort:
                 "relevance_score": 1.0,
             }
 
-        router._recall_nodes_for_doc = fake_recall
+        sti = _mount_real_engine(router)
+        sti.recall_nodes_for_doc = fake_recall
 
     @pytest.mark.asyncio
-    async def test_sorts_by_evidence_score_desc(self, router):
+    async def test_sorts_by_evidence_score_desc(self, router, monkeypatch):
         """证据分不同 → 按证据分降序（覆盖度分/裁定序皆被证据分压过）。"""
-        self._setup_recall(router)
+        self._setup_recall(router, monkeypatch)
         router.client._id_mapper = {"docA": 101, "docB": 102}
         evidence_bundle = {
             101: {"channels": {"entity": [{"name": "甲"}], "tag": [], "keyword": []}},
@@ -581,9 +608,9 @@ class TestActTreeSearchEvidenceSort:
         assert list(dpm) == ["docA", "docB"]
 
     @pytest.mark.asyncio
-    async def test_tie_broken_by_candidate_docs_order(self, router):
+    async def test_tie_broken_by_candidate_docs_order(self, router, monkeypatch):
         """证据分平分 → 保持 candidate_docs（L1 裁定序）顺序。"""
-        self._setup_recall(router)
+        self._setup_recall(router, monkeypatch)
         router.client._id_mapper = {"docA": 101, "docB": 102}
         evidence_bundle = {
             101: {"channels": {"entity": [], "tag": [{"text": "x"}], "keyword": []}},
