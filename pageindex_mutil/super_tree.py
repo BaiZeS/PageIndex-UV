@@ -112,7 +112,7 @@ class KBIdentity:
 
 直接返回纯文本摘要，不要输出 JSON 或其他格式。"""
 
-        response = llm_completion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
+        response = llm_completion(self.retrieve_model or self.model, prompt, thinking_disabled=True)
         if response:
             cleaned = strip_markdown_fence(response)
             self.db.set_kb_identity(cleaned, len(docs))
@@ -457,7 +457,7 @@ class SuperTreeIndex:
 {{"doc_ids": ["uuid-1", "uuid-2"], "reasons": {{"uuid-1": "一句话选中理由"}}}}
 直接返回JSON，不要其他内容。"""
 
-        response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
+        response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=True)
         if not response:
             return [], {}
         data = extract_json(response)

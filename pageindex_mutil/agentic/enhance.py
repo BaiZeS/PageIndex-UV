@@ -586,7 +586,7 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
         try:
             response = await asyncio.to_thread(
                 llm_completion, self.retrieve_model or self.model, prompt,
-                thinking_disabled=False,
+                thinking_disabled=True,
             )
         except Exception as e:
             logging.warning("UnifiedNodeEnhancement LLM select failed: %s", e)

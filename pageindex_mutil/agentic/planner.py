@@ -39,7 +39,7 @@ class RetrievalPlanner:
 直接返回JSON，不要其他内容。
 """
         try:
-            response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=False)
+            response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=True)
             if not response:
                 return self._default_plan(query)
             data = extract_json(response)
