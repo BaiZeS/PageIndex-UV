@@ -1,7 +1,9 @@
 import logging
 from dataclasses import dataclass, field
 
-from ..utils import llm_completion, extract_json, count_tokens
+from ..utils import llm_completion, count_tokens
+# 检索链 LLM-JSON 解析钩子（qwen 输出加固）；索引链继续用 utils.extract_json。
+from ..json_repair import extract_json_robust
 
 
 @dataclass
@@ -145,7 +147,7 @@ class CRAGVerifier:
             if not response:
                 return VerifyResult(confidence=s_ret, action="answer")
 
-            data = extract_json(response)
+            data = extract_json_robust(response)
             # LLM 失败/空/坏 JSON → 纯启发式 s_ret 回退（保留既有行为）
             if not isinstance(data, dict) or not any(
                 k in data for k in ("based_on_context", "sufficient", "confidence")

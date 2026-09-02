@@ -130,7 +130,11 @@ class KBIdentity:
 
 import asyncio
 
-from .utils import llm_acompletion, count_tokens, extract_json
+from .utils import llm_acompletion, count_tokens
+
+# 检索链 LLM-JSON 解析钩子（qwen 输出加固；见 json_repair 模块 docstring）。
+# 不走 utils.extract_json —— 那是索引链在用的旧实现，且 utils.py 在索引缓存键清单内。
+from .json_repair import extract_json_robust
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +464,7 @@ class SuperTreeIndex:
         response = await llm_acompletion(self.retrieve_model or self.model, prompt, thinking_disabled=True)
         if not response:
             return [], {}
-        data = extract_json(response)
+        data = extract_json_robust(response)
         if not isinstance(data, dict):
             return [], {}
         picked = data.get("doc_ids", [])

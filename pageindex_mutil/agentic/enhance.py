@@ -18,7 +18,9 @@ import json
 import logging
 from bisect import bisect_left
 
-from ..utils import llm_completion, extract_json
+from ..utils import llm_completion
+# 检索链 LLM-JSON 解析钩子（qwen 输出加固）；索引链继续用 utils.extract_json。
+from ..json_repair import extract_json_robust
 from ..super_tree import KeywordIndex
 
 # [1.2]③ 多信号加权：w_e > w_t > w_k，累加；多信号同时命中 > 单档
@@ -592,7 +594,8 @@ selected_ids 只能取自上述候选节点的 node_id；直接返回JSON，不�
             logging.warning("UnifiedNodeEnhancement LLM select failed: %s", e)
             response = ""
 
-        data = extract_json(response) if isinstance(response, str) and response.strip() else {}
+        data = (extract_json_robust(response)
+                if isinstance(response, str) and response.strip() else {})
         if not isinstance(data, dict) or not isinstance(data.get("selected_ids"), list):
             # [7.7] 降级：不做启发式裁剪，放行证据（union 候选即选中）。
             # selection_fallback=False：这是 LLM 故障兜底（union 全放行），

@@ -6,12 +6,12 @@ client.py/router.py import from this module instead of importing main.py.
 """
 
 from .utils import (
-    extract_json,
     count_tokens,
     get_llm_client,
     get_llm_config,
     ConfigLoader,
 )
+from .json_repair import extract_json_robust
 
 # Lazy-loaded config values (avoid module-level side effects)
 _cfg_cache = None
@@ -67,7 +67,7 @@ def _call_llm_json(prompt, extract_key=None, expect_list=False):
         content = response.choices[0].message.content
         if not content:
             return []
-        result = extract_json(content)
+        result = extract_json_robust(content)
         if expect_list and isinstance(result, list):
             return result
         if extract_key and isinstance(result, dict) and isinstance(result.get(extract_key), list):
