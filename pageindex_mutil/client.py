@@ -1068,9 +1068,15 @@ class PageIndexClient:
                         # Document exists in DB but not in workspace - create entry
                         doc_id = str(uuid.uuid4())
                         self._id_mapper.register(doc_id, db_doc_id)
+                        # warm-load（cache-HIT 工作区 / db-only）没有 _meta.json，
+                        # type 只能从路径后缀推断（同 _parse_and_insert_doc 的 ext 判定）。
+                        # 硬编码 'pdf' 会把 .md 文档错标为 pdf，令
+                        # build_context_for_doc 走 doc['pages'] 分支（warm-load 无
+                        # pages）→ 空上下文 → router 拒答 'No relevant content found.'
+                        doc_type = 'md' if (pdf_path or '').lower().endswith('.md') else 'pdf'
                         self.documents[doc_id] = {
                             'id': doc_id,
-                            'type': 'pdf',
+                            'type': doc_type,
                             'doc_name': pdf_name,
                             'doc_description': db_doc.get('doc_description', ''),
                             'path': pdf_path,
