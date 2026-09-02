@@ -70,28 +70,23 @@ def build_evidence_bundle(client, db, query, topk=30, max_hop=None) -> tuple[dic
             except Exception as e:
                 logging.warning("evidence keyword provenance failed: %s", e)
 
-    # tag 通道（closet 语义标签，source=llm）：closet_index 命中 doc 后，回填真实标签文本
-    # （仅保留与 query token 子串匹配的标签，复用 UnifiedNodeEnhancement._tag_hits 语义）。
+    # tag 通道（closet 语义标签，source=llm）：查询期**子串**检索（A0 消融冒烟缺陷修复）。
+    # 旧路径 client.closet_index.search → db.match_closet_tags 以 `tag_token IN (词项…)`
+    # **整串精确匹配**索引期 _tokenize_tag 落库的「空格连接多词串」（设计形状，97.9% 多
+    # token）→ 真实数据查询期几乎恒零命中（mldr_zh#0: kw=40 ent=113 tag=0）。渲染侧
+    # UnifiedNodeEnhancement._tag_hits 一直是子串语义——搜索/渲染标准不一致即缺陷本质。
+    # 现改走 tag_search.search_tags：同一套 _tag_hits 子串标准 + 一次 SELECT 扫 llm 行，
+    # 命中标签文本随行直接带出（消掉旧 matched_docs × get_doc_tags 的 N+1 回填）。
     if getattr(client, "closet_index", None):
         try:
-            matched_docs = list(client.closet_index.search(query, top_k=topk))
+            from .tag_search import search_tags
+            matched_docs = list(search_tags(client, db, tokens, topk=topk, query=query))
         except Exception as e:
             logging.warning("evidence tag channel failed: %s", e)
             matched_docs = []
-        for doc_id, score in matched_docs:
-            texts = []
-            try:
-                tags = db.get_doc_tags(doc_id, source="llm")
-                from .enhance import UnifiedNodeEnhancement
-                hits = UnifiedNodeEnhancement._tag_hits(
-                    tokens, query.casefold(), [t["tag_text"] for t in tags])
-                hit_set = {h.casefold() for h in hits}
-                texts = [(t["tag_text"], t["confidence"])
-                         for t in tags if t["tag_text"].casefold() in hit_set]
-            except Exception as e:
-                logging.warning("evidence tag label lookup failed for doc %s: %s", doc_id, e)
-            if texts:
-                for tag_text, tag_conf in texts:
+        for doc_id, score, tag_hits in matched_docs:
+            if tag_hits:
+                for tag_text, tag_conf in tag_hits:
                     entry(doc_id)["channels"]["tag"].append(
                         {"text": tag_text, "confidence": float(tag_conf)})
             else:
